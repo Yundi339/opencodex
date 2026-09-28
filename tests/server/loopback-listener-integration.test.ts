@@ -790,7 +790,33 @@ describe("unauthenticated loopback listener", () => {
   // gap, because the next reader would believe the branch was defended.
 });
 
+describe("unauthenticated remote data listener", () => {
+  test("serves only data on the bound interface while the public listener stays authenticated", async () => {
+    const address = firstNonLoopbackIPv4();
+    if (!address) return;
+    const remotePort = await findAvailablePort(0, address);
+    const publicPort = await findAvailablePort(0, "0.0.0.0", { reservedPort: remotePort });
+    saveConfig({
+      ...baseConfig(null),
+      unauthenticatedRemoteListener: { enabled: true, host: address, port: remotePort },
+    });
+    const server = startServer(publicPort);
+    try {
+      expect((await fetch(`http://127.0.0.1:${publicPort}/v1/models`)).status).toBe(401);
+      expect((await fetch(`http://${address}:${remotePort}/v1/models`)).status).toBe(200);
+      expect((await fetch(`http://${address}:${remotePort}/api/config`)).status).toBe(404);
+      expect((await fetch(`http://${address}:${remotePort}/`)).status).toBe(404);
+      expect((await fetch(`http://${address}:${remotePort}/healthz`)).status).toBe(404);
+    } finally {
+      await server.stop(true);
+    }
+    const rebound = Bun.serve({ hostname: address, port: remotePort, fetch: () => new Response("ok") });
+    await rebound.stop(true);
+  }, SERVER_BUDGET_MS);
+});
+
 describe("composite listener shutdown", () => {
+
   test("starts socket-owner cleanup before waiting for a graceful listener drain", async () => {
     const ran: string[] = [];
     let release!: () => void;

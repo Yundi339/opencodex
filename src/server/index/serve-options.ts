@@ -203,7 +203,7 @@ import { readyProtocolMetadata } from "../../remote/protocol";
 import { modelCapabilityFields } from "../models-capabilities";
 import { createWebsocketHandler } from "./websocket-handler";
 
-export type ServerIngress = "public" | "unauthenticated-loopback" | "hub-management" | "claude-intercept" | "hub-link";
+export type ServerIngress = "public" | "unauthenticated-loopback" | "unauthenticated-remote" | "hub-management" | "claude-intercept" | "hub-link";
 
 export function trustedLoopbackForIngress(ingress: ServerIngress, hostname: string): boolean {
   return ingress === "unauthenticated-loopback"
@@ -257,6 +257,7 @@ export interface ServeOptionsContext {
   >;
   localAttestationSecret: string;
   loopbackPolicy: () => RequestPolicyView;
+  remotePolicy: () => RequestPolicyView;
   managementApiDeps: ManagementApiDeps;
   managementAuth: ManagementAuthState;
   managementSessionControl: ManagementSessionControl;
@@ -285,6 +286,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
     loadRemoteWorkspaceRuntime,
     localAttestationSecret,
     loopbackPolicy,
+    remotePolicy,
     managementApiDeps,
     managementAuth,
     managementSessionControl,
@@ -313,11 +315,17 @@ export function createServeOptions(ctx: ServeOptionsContext) {
       // The unauthenticated loopback listener (#1102) serves a fixed allowlist and nothing
       // else. Rejecting here, before any handler runs, is what keeps the surface from growing
       // silently when a route is added below.
-      if (ingress === "unauthenticated-loopback" && !loopbackRouteAllowed(codexCompatibleUrl(req.url), req)) {
+      const unauthenticatedRoute = codexCompatibleUrl(req.url);
+      const remoteDataOnlyDenied = ingress === "unauthenticated-remote"
+        && (unauthenticatedRoute.pathname.startsWith("/api/")
+          || unauthenticatedRoute.pathname === "/"
+          || !unauthenticatedRoute.pathname.startsWith("/v1/"));
+      if ((ingress === "unauthenticated-loopback" || ingress === "unauthenticated-remote")
+        && (remoteDataOnlyDenied || !loopbackRouteAllowed(unauthenticatedRoute, req))) {
         return withCors(
           formatErrorResponse(404, "not_found", `Unknown endpoint: ${req.method} ${new URL(req.url).pathname}`),
           req,
-          loopbackPolicy(),
+          ingress === "unauthenticated-remote" ? remotePolicy() : loopbackPolicy(),
         );
       }
       if (ingress === "hub-link" && !linkRouteAllowed(requestUrl, req)) {
@@ -353,7 +361,9 @@ export function createServeOptions(ctx: ServeOptionsContext) {
       // Anthropic credentials, not opencodex admission tokens — so it takes the loopback view too.
       const policy: RequestPolicyView = ingress === "hub-link"
         ? linkPolicyView!
-        : ingress === "unauthenticated-loopback" || ingress === "claude-intercept"
+        : ingress === "unauthenticated-remote"
+          ? remotePolicy()
+          : ingress === "unauthenticated-loopback" || ingress === "claude-intercept"
           ? loopbackPolicy()
           : config;
       if (ingress === "hub-link") {

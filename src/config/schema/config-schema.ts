@@ -158,6 +158,10 @@ export const configSchema = z.object({
     z.object({ enabled: z.literal(false) }),
     z.object({ enabled: z.literal(true), port: z.number().int().min(1).max(65535).optional() }),
   ]).optional().catch(undefined),
+  unauthenticatedRemoteListener: z.union([
+    z.object({ enabled: z.literal(false) }),
+    z.object({ enabled: z.literal(true), host: z.string().trim().min(1), port: z.number().int().min(1).max(65535) }),
+  ]).optional().catch(undefined),
   providers: z.record(z.string(), providerConfigSchema),
   modelPinnedEfforts: modelPinnedEffortsSchema.optional(),
   compactionRouting: compactionRoutingSchema.optional().catch(undefined),
