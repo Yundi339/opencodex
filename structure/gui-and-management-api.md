@@ -79,6 +79,13 @@ OpenCodex uses three mutually exclusive reusable admission credential classes:
 | Management plane | `OPENCODEX_ADMIN_AUTH_TOKEN` or the independent protected `admin-api-token` file | `/api/*` only |
 | GUI session | A short-lived token issued only with a legitimate same-origin local dashboard page | `/api/*` only, bound to the issuing origin |
 
+An enabled `unauthenticatedLoopbackListener` is the compatibility exception for an operator-owned
+machine: its kernel-loopback socket admits the local data plane, packaged GUI routes, session
+bootstrap, and `/api/*` as the local GUI principal. This keeps the browser workflow on
+`127.0.0.1:<port>` while the public non-loopback socket retains ordinary admission. The separate
+`unauthenticatedRemoteListener` never inherits this exception: it is data-plane-only and refuses
+`/api/*`, the GUI, health, and readiness before dispatch.
+
 The service token file remains a delivery mechanism for the data-plane environment token; it is not
 a fourth credential class. A management credential that equals any configured data-plane credential
 does not enable management access. The data plane may continue to start, but `/api/*` remains closed.
@@ -130,13 +137,15 @@ transport so environment HTTP proxies cannot observe or fabricate the exchange.
 
 > Decision record: [ADR-0073](decisions/ADR-0073-authentication-boundaries.md)
 
-Management authentication never has a loopback bypass. If no management credential is available, or
-management token creation, validation, or permission hardening fails, `/api/*` requests without a
-valid scoped capability return 503 while `/v1/*` and unauthenticated `/healthz` continue to operate.
+Outside the enabled loopback listener described above, management authentication has no loopback
+bypass. If no management credential is available, or management token creation, validation, or
+permission hardening fails, `/api/*` requests without a valid scoped capability return 503 while
+`/v1/*` and unauthenticated `/healthz` continue to operate.
 Windows ACL hardening results must be checked explicitly because an `icacls` timeout is a soft failure in the shared secret helper.
 
 Local dashboard page entry requires a loopback binding, a valid parseable loopback `Host`, and an
-exact request origin. A hub may additionally enable `hub.managementIngress`, a second management
+exact request origin. The optional `unauthenticatedLoopbackListener` may carry that local GUI and
+management surface beside the data plane. A hub may additionally enable `hub.managementIngress`, a second management
 surface bound exactly to `127.0.0.1` for a local Tailscale Serve or operator TLS frontend. That
 listener serves only packaged GUI/SPA routes, `GET`/`POST /opencodex-session`, and `/api/*`; all data,
 health, readiness, WebSocket, and unknown-static routes receive a JSON 404 before dispatch.

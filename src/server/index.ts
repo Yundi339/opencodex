@@ -377,7 +377,8 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
   void publicPolicy;
 
   /**
-   * Routes the unauthenticated loopback listener will serve. Everything else 404s.
+   * Routes the unauthenticated loopback listener will serve. Its data and management surfaces
+   * are allowlisted independently; health/readiness and every other route still 404.
    *
    * This is an allowlist rather than a filter applied to the public handler, because a filter
    * inverts the failure mode: a route added later would be reachable here by default. The
@@ -400,16 +401,16 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
    * leaving them off this list left every non-Codex local client pointed at a closed port.
    * Both handlers resolve their own admission from the RECEIVING listener's policy view — the
    * same resolver and the same loopback short-circuit `/v1/responses` already uses — so this
-   * adds a wire, not a trust level. `/api/*` is deliberately still absent: local management
-   * discovery goes to the authenticated management surface, never to this listener.
+   * adds a wire, not a trust level. The browser management surface also rides this kernel-loopback
+   * bind; headless management discovery still resolves the authenticated public surface itself.
    *
    * `POST /v1/messages/count_tokens` completes that Anthropic wire. It is admitted on a
    * narrower argument than the other two rather than on symmetry: it spends no provider quota,
    * reaches no stored credential, and returns a token count computed from the request body the
    * caller already holds. Withholding it bought no confinement — the same caller may POST the
    * whole conversation to `/v1/messages` on this socket — and cost Claude Code its server-side
-   * count, which it then silently replaces with a local estimate. `/api/*`, `/healthz`,
-   * `/readyz` and the GUI remain 404 here, which is the boundary that actually matters.
+   * count, which it then silently replaces with a local estimate. `/healthz` and `/readyz` remain
+   * 404 here, which keeps liveness discovery off the unauthenticated socket.
    *
    * `GET /v1/models` is on the list for a reason that is easy to miss. When catalog
    * materialization fails or finds no source, `syncCodex` warns and injects with
@@ -867,12 +868,14 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
       // The companion form is the intended one-port hub topology, not a surprise surface: the
       // public listener is already on a non-loopback address, so this line states where local
       // processes go rather than warning about a second port nobody asked for.
-      console.log(`🔁 Loopback companion active on http://127.0.0.1:${loopbackPort} — same port as the public listener; local processes need no credential`);
+      console.log(`🔁 Loopback companion active on http://127.0.0.1:${loopbackPort} — same port as the public listener`);
+      console.log("   Local /v1 calls, the GUI, and /api/* need no credential; health/readiness stay unavailable here");
     } else {
       console.warn(`⚠️  Unauthenticated loopback listener active on http://127.0.0.1:${loopbackPort}`);
       console.warn(`   Any local process can use it without a credential — it spends account`);
       console.warn(`   quota and paid provider credentials, and can starve authenticated`);
-      console.warn(`   remote clients. Not for shared or multi-tenant hosts.`);
+      console.warn(`   remote clients. It also exposes the local GUI and /api/* to every local`);
+      console.warn(`   process. Not for shared or multi-tenant hosts.`);
     }
   }
 

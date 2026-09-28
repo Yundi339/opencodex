@@ -1044,7 +1044,7 @@ describe("loopback companion listener", () => {
       // port: the operator chose this topology, and the ported form's warning misdescribes it.
       const startup = logs.join("\n");
       expect(startup).toContain(`Loopback companion active on http://127.0.0.1:${port}`);
-      expect(startup).toContain("same port as the public listener; local processes need no credential");
+      expect(startup).toContain("Local /v1 calls, the GUI, and /api/* need no credential");
       expect(startup).not.toContain("Unauthenticated loopback listener active");
     } finally {
       await server!.stop(true);
