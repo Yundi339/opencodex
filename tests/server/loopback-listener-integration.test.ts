@@ -291,8 +291,6 @@ describe("unauthenticated loopback listener", () => {
       // would 404 on method mismatch inside the handler, so the assertion would hold even if
       // the allowlist were widened to admit that route — the test would be watching nothing.
       const denied: Array<{ method: string; path: string; body?: string }> = [
-        { method: "GET", path: "/api/config" },
-        { method: "GET", path: "/" },
         { method: "GET", path: "/healthz" },
         { method: "GET", path: "/readyz" },
         { method: "GET", path: "/v1/opencodex/artifacts/x" },
@@ -323,6 +321,8 @@ describe("unauthenticated loopback listener", () => {
       // And an allowlisted route is genuinely reachable, so the rejections above are not
       // passing merely because nothing works on this listener.
       expect((await fetch(`${base}/v1/models`)).status).toBe(200);
+      expect((await fetch(`${base}/api/config`)).status).toBe(200);
+      expect((await fetch(`${base}/`)).status).toBe(200);
     } finally {
       await server.stop(true);
     }
@@ -498,7 +498,7 @@ describe("unauthenticated loopback listener", () => {
     }
   });
 
-  test("admits the local client inference wires, and still refuses /api/* (#4236)", async () => {
+  test("admits the local client inference wires and the local GUI management surface", async () => {
     // The hub's own local clients do not speak Responses: `ocx claude`, the system-env
     // injection and Claude Desktop speak the Anthropic wire, Cursor / the vision helper /
     // aside speak OpenAI chat. On a tailnet-bound hub this listener is their only local
@@ -534,13 +534,11 @@ describe("unauthenticated loopback listener", () => {
         expect({ path, status: viaLoopback.status }).not.toEqual({ path, status: 404 });
       }
 
-      // Management discovery is the OTHER destination contract and must not ride along: the
-      // CLI resolves `/api/*` through the authenticated surface with a management credential.
+      // The operator's local browser uses this same socket as the data plane. Management is
+      // still confined to the kernel loopback bind, while remote data listeners stay /v1-only.
       for (const path of ["/api/claude-code", "/api/config"]) {
-        const response = await fetch(`${base}${path}`, {
-          headers: { "x-opencodex-api-key": "admin-secret" },
-        });
-        expect({ path, status: response.status }).toEqual({ path, status: 404 });
+        const response = await fetch(`${base}${path}`);
+        expect({ path, status: response.status }).toEqual({ path, status: 200 });
       }
     } finally {
       await server.stop(true);
@@ -1053,7 +1051,7 @@ describe("loopback companion listener", () => {
     }
   }, SERVER_BUDGET_MS);
 
-  test("the route allowlist is unchanged: sharing a port widens no surface", async () => {
+  test("sharing a port keeps remote admission unchanged while serving the local GUI", async () => {
     const address = firstNonLoopbackIPv4();
     if (!address) {
       console.warn("[loopback-companion] no non-loopback IPv4 interface; allowlist check not run");
@@ -1063,10 +1061,13 @@ describe("loopback companion listener", () => {
     saveConfig(companionConfig(address));
     const server = startServer(port);
     try {
-      // Same socket semantics as the ported form, same default-deny. A companion is a bind
-      // address change, never an admission change — `/api/*`, health and the GUI stay
-      // unreachable here no matter which port the listener shares.
-      for (const path of ["/api/config", "/api/claude-code", "/healthz", "/readyz", "/"]) {
+      // A companion is a bind-address change for LOCAL callers: the GUI and its management
+      // API ride the loopback socket, while health/readiness remain data-plane-only.
+      for (const path of ["/api/config", "/api/claude-code", "/"]) {
+        const response = await fetch(`http://127.0.0.1:${port}${path}`);
+        expect({ path, status: response.status }).toEqual({ path, status: 200 });
+      }
+      for (const path of ["/healthz", "/readyz"]) {
         const response = await fetch(`http://127.0.0.1:${port}${path}`);
         expect({ path, status: response.status }).toEqual({ path, status: 404 });
       }

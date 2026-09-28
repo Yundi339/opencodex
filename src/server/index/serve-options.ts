@@ -676,12 +676,17 @@ export function createServeOptions(ctx: ServeOptionsContext) {
           pid: process.pid,
           port: ctx.boundPort ?? requestServer.port ?? listenPort,
         };
-        const apiAuthError = requireManagementAuth(req, managementAuth, config, localManagementAuth);
+        const localUnauthenticatedManagement = ingress === "unauthenticated-loopback";
+        const apiAuthError = localUnauthenticatedManagement
+          ? null
+          : requireManagementAuth(req, managementAuth, config, localManagementAuth);
         if (apiAuthError) return withManagementCors(apiAuthError, req, config);
         // Which credential passed the gate, resolved from the same session table the
         // gate used. Consent-bearing routes need this: request headers are forgeable
         // by anything holding the admin token, the credential is not.
-        const principal = managementPrincipal(req, managementAuth, config, localManagementAuth) ?? undefined;
+        const principal = localUnauthenticatedManagement
+          ? "gui-session" as const
+          : managementPrincipal(req, managementAuth, config, localManagementAuth) ?? undefined;
         if (url.pathname === GUI_PAIR_PATH) {
           if (req.method !== "POST" || principal !== "gui-pair-capability" || !managementAuth.available) {
             return withManagementCors(Response.json({ error: "GUI pairing capability required" }, { status: 403 }), req, config);
@@ -1860,6 +1865,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
         if (req.method === "GET") {
           const session = issueGuiSession(req, config, managementAuth, {
             trustedTailscaleIngress: ingress === "hub-management",
+            unauthenticatedLoopback: ingress === "unauthenticated-loopback",
           });
           return session
             ? withManagementCors(serveSessionBootstrap(session), req, config)
@@ -1919,6 +1925,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
       const guiSessionCandidate = req.method === "GET" && (url.pathname === "/" || !url.pathname.includes("."))
         ? issueGuiSession(req, config, managementAuth, {
           trustedTailscaleIngress: ingress === "hub-management",
+          unauthenticatedLoopback: ingress === "unauthenticated-loopback",
         })
         : null;
       const guiFile = serveGuiFile(

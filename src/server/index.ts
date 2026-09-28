@@ -419,6 +419,13 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
    */
   function loopbackRouteAllowed(url: URL, req: Request): boolean {
     const path = url.pathname;
+    if (path.startsWith("/api/")) return true;
+    if (path === "/opencodex-session") return req.method === "GET" || req.method === "POST";
+    if (req.method === "GET" || req.method === "HEAD") {
+      // The GUI's SPA fallback must not turn an unknown data or health path into index.html.
+      if ((path === "/" || serveGuiFile(path) !== null)
+        && path !== "/healthz" && path !== "/readyz" && !path.startsWith("/v1/")) return true;
+    }
     if (path === "/v1/responses") {
       return req.method === "POST" || req.headers.get("upgrade")?.toLowerCase() === "websocket";
     }
