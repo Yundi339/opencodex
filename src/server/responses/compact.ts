@@ -157,6 +157,7 @@ import { readBoundedResponseBytes } from "../../lib/bounded-body";
 import { resolveStallTimeoutMs } from "../../stall-timeout";
 import { isLocalUpstream } from "../../lib/local-upstream";
 import { isRateLimitOrQuotaFailureMessage } from "../../lib/errors";
+import { resolveClientRetryAfter } from "../../lib/retry-after";
 import { supportedLadderFor } from "../effort-policy";
 import {
   beginRequestAttempt,
@@ -1365,6 +1366,14 @@ export async function handleResponsesCompact(
       bodyInferredQuota ? 429 : replayRefused ? 502 : upstream.status,
       { retryAfter, resetAt },
     );
+    const clientRetryAfter = quotaFailure
+      ? resolveClientRetryAfter({
+        status: buffered.status === 402 ? 429 : buffered.status,
+        message: bufferedErrorText,
+        upstreamRetryAfter: retryAfter,
+        includeDefault: false,
+      })
+      : undefined;
     // Lift usage and response metadata from the buffered upstream JSON into the
     // request log; the routed branch gets the same through handleResponses. The
     // synthetic buffer errors are not upstream bodies and stay uninspected.
@@ -1401,7 +1410,16 @@ export async function handleResponsesCompact(
       }
     }
     // A native compact 404 falls back to a regular Responses compaction turn.
-    if (buffered.status !== 404) return buffered;
+    if (buffered.status !== 404) {
+      if (!clientRetryAfter) return buffered;
+      const headers = new Headers(buffered.headers);
+      headers.set("Retry-After", clientRetryAfter);
+      return new Response(buffered.body, {
+        status: buffered.status,
+        statusText: buffered.statusText,
+        headers,
+      });
+    }
     } finally {
       releaseUpstreamHostAdmission(compactHostAdmissionLease);
       releaseCodexAuthContextProbeLease(authCtx);
