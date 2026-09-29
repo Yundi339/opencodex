@@ -5,7 +5,12 @@ import { KEY_ACCOUNT_LOG_LABEL_RE } from "../codex/account-label";
 import { attemptAccountChanged, sealRequestAttemptIdentity } from "./request-log-account-rotation";
 export { sealRequestAttemptIdentity };
 import { readBoundedResponseBody } from "../lib/bounded-body";
-import { noteThreadOverloadVerdict, noteThreadRestrictionVerdict } from "./ws-thread-transport";
+import {
+  noteThreadOverloadVerdict,
+  noteThreadRestrictionVerdict,
+  noteThreadTurnDuration,
+  noteThreadUpstreamCut,
+} from "./ws-thread-transport";
 import type { ResponsesTerminalStatus } from "../bridge";
 import {
   classifyError,
@@ -1438,6 +1443,20 @@ export function addFinalRequestLog(
   const closeReason = effectiveStatus === 499
     ? "client_cancel"
     : meta?.closeReason;
+  // A turn the origin cut AFTER output had started: the user watched the answer and then the
+  // stream died ("stream disconnected before completion"). Nothing may be replayed at that point,
+  // so the useful response is to stop routing this conversation the same way -- the same re-roll an
+  // overload verdict arms, on the same ledger. effectiveStatus already folded a client cancel into
+  // 499, which is not a verdict about the route, so the guard excludes it by construction.
+  if (effectiveStatus >= 500 && logCtx.firstOutputMs !== undefined) {
+    noteThreadUpstreamCut(logCtx.conversationId, { status: effectiveStatus, midStream: true });
+  }
+  // Same seam, the other shape: this conversation is much slower than its OWN recent normal. Only
+  // successful turns feed both the baseline and the verdict -- a cancelled turn is the user
+  // leaving, and it would drag the yardstick down until every turn looked slow.
+  if (effectiveStatus < 400) {
+    noteThreadTurnDuration(logCtx.conversationId, Date.now() - start, logCtx.firstOutputMs);
+  }
   if (logCtx.activeAttempt) {
     finishRequestAttempt(
       logCtx.activeAttempt,

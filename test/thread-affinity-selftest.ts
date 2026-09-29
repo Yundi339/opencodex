@@ -14,7 +14,7 @@ import { join } from "node:path";
 // affinity state would otherwise decide the outcome of every check below.
 process.env.OPENCODEX_HOME = mkdtempSync(join(tmpdir(), "ocx-affinity-selftest-"));
 const PKG = fileURLToPath(new URL("../src/", import.meta.url)).replace(/[\\/]+$/, "").replace(/\\/g, "/");
-const { noteThreadOverloadVerdict, noteThreadRestrictionVerdict, sessionVerdictSummary, isRestrictionVerdictText, threadAffinityResetActive, threadTransportDemotedToHttp, clearThreadTransportLedgerForTests, clearManualAffinityArmCacheForTests } =
+const { noteThreadOverloadVerdict, noteThreadRestrictionVerdict, noteThreadUpstreamCut, noteThreadSlowHeaders, noteThreadTurnDuration, sessionVerdictSummary, isRestrictionVerdictText, threadAffinityResetActive, threadTransportDemotedToHttp, clearThreadTransportLedgerForTests, clearThreadTurnSamplesForTests, clearManualAffinityArmCacheForTests } =
   await import(PKG + "/server/ws-thread-transport.ts");
 
 let failures = 0;
@@ -75,6 +75,66 @@ check("the restriction hold is short, not the six-hour one",
   threadAffinityResetActive(key, t0 + 31 * 60_000) === false
   && threadAffinityResetActive(key, t0 + 5 * 60 * 60_000) === false);
 check("a transport demotion is still not triggered by a restriction", threadTransportDemotedToHttp(key, t0 + 3000) === false);
+
+// 2026-09-29: the two shapes the single-official-account deployment actually produces never armed
+// anything before this -- a response the origin CUT mid-stream (the user sees "stream disconnected
+// before completion") and a conversation whose HEADERS keep arriving slow. Both now arm the same
+// re-roll, with a shorter hold than the six-hour overload arm, and neither is a transport demotion.
+clearThreadTransportLedgerForTests();
+const cutKey = "9f2c1b7a4e6d8053";
+check("a pre-content failure is not a cut verdict", (() => {
+  noteThreadUpstreamCut(cutKey, { status: 502, midStream: false }, t0);
+  return threadAffinityResetActive(cutKey, t0 + 1000) === false;
+})());
+check("a 4xx mid-stream failure is not a routing verdict", (() => {
+  noteThreadUpstreamCut(cutKey, { status: 429, midStream: true }, t0 + 1000);
+  return threadAffinityResetActive(cutKey, t0 + 2000) === false;
+})());
+noteThreadUpstreamCut(cutKey, { status: 502, midStream: true }, t0 + 3000);
+check("one mid-stream cut arms the re-roll", threadAffinityResetActive(cutKey, t0 + 4000) === true);
+check("the cut hold is the short one, not six hours",
+  threadAffinityResetActive(cutKey, t0 + 2 * 60 * 60_000 + 60_000) === false);
+
+// Slow headers: one slow wait is a busy moment, two inside the window is how a conversation served
+// badly looks. The threshold is 20s and the sibling conversation must stay untouched.
+clearThreadTransportLedgerForTests();
+const slowKey = "5d81ff0c2ab34e77";
+noteThreadSlowHeaders(slowKey, 21_000, t0);
+check("one slow header wait is not enough", threadAffinityResetActive(slowKey, t0 + 1000) === false);
+noteThreadSlowHeaders(slowKey, 19_000, t0 + 2000);
+check("a header wait under the threshold does not count", threadAffinityResetActive(slowKey, t0 + 3000) === false);
+noteThreadSlowHeaders(slowKey, 24_000, t0 + 4000);
+check("two slow header waits arm the re-roll", threadAffinityResetActive(slowKey, t0 + 5000) === true);
+check("the slow-header arm is not a transport demotion", threadTransportDemotedToHttp(slowKey, t0 + 5000) === false);
+check("the slow-header hold is the short one",
+  threadAffinityResetActive(slowKey, t0 + 2 * 60 * 60_000 + 60_000) === false);
+
+// Relative slowness: judged against the conversation's OWN median, not an absolute number, because
+// a hard reasoning turn is legitimately long. Six samples establish the baseline, then two turns
+// at least twice that median arm the same short re-roll.
+clearThreadTransportLedgerForTests();
+clearThreadTurnSamplesForTests();
+const relKey = "3ab9c40d17e28f56";
+const relT0 = Date.now();
+for (let i = 0; i < 7; i++) noteThreadTurnDuration(relKey, 10_000, 3_000, relT0 + i * 1000);
+check("a conversation with no baseline yet is never armed", (() => {
+  noteThreadTurnDuration("fresh-thread", 60_000, 5_000, relT0);
+  return threadAffinityResetActive("fresh-thread", relT0 + 1000) === false;
+})());
+noteThreadTurnDuration(relKey, 22_000, 4_000, relT0 + 20_000);
+check("one turn at twice the median is not enough", threadAffinityResetActive(relKey, relT0 + 21_000) === false);
+check("a turn under the floor does not count", (() => {
+  // 10s median, so 16s is above 2x the floor... but 16s is under the 20s floor.
+  noteThreadTurnDuration("floor-thread", 1_000, 500, relT0);
+  for (let i = 0; i < 6; i++) noteThreadTurnDuration("floor-thread", 8_000, 2_000, relT0 + i * 1000);
+  noteThreadTurnDuration("floor-thread", 16_000, 3_000, relT0 + 20_000);
+  return threadAffinityResetActive("floor-thread", relT0 + 21_000) === false;
+})());
+noteThreadTurnDuration(relKey, 26_000, 5_000, relT0 + 40_000);
+check("two turns against its own median arm the re-roll", threadAffinityResetActive(relKey, relT0 + 41_000) === true);
+check("the relative arm is not a transport demotion", threadTransportDemotedToHttp(relKey, relT0 + 41_000) === false);
+check("the relative arm expires with the short hold",
+  threadAffinityResetActive(relKey, relT0 + 2 * 60 * 60_000 + 60_000) === false);
 
 console.log(failures === 0 ? "ALL THREAD AFFINITY CHECKS PASSED" : failures + " CHECK(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);
