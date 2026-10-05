@@ -64,6 +64,9 @@ const RETIRED_FLASH_TIERS: Record<string, string> = {
 
 const ANTIGRAVITY_WIRE_MODELS = [
   "gemini-3.7-flash-tiered",
+  "gemini-3-flash",
+  "gemini-3.5-flash-lite",
+  "gemini-3.1-flash-lite",
   "gemini-3.1-pro-low",
   "gemini-pro-agent",
   "gemini-3.1-flash-image",
@@ -284,6 +287,9 @@ export const ANTIGRAVITY_MODEL_ALIASES: Record<string, string> = {
 export const ANTIGRAVITY_MODELS = [
   GEMINI_FLASH_CURRENT,
   GEMINI_FLASH_PREVIOUS,
+  "gemini-3-flash",
+  "gemini-3.5-flash-lite",
+  "gemini-3.1-flash-lite",
   "gemini-3.1-pro",
   "gemini-3.1-flash-image",
   "claude-sonnet-4-6",
@@ -300,6 +306,9 @@ const ANTIGRAVITY_WIRE_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   "gemini-3.8-flash-low": 1_048_576,
   "gemini-3.8-flash-medium": 1_048_576,
   "gemini-3.8-flash-high": 1_048_576,
+  "gemini-3-flash": 1_048_576,
+  "gemini-3.5-flash-lite": 1_048_576,
+  "gemini-3.1-flash-lite": 1_048_576,
   "gemini-3.7-flash-tiered": 1_048_576,
   "gemini-3.1-pro-low": 1_048_576,
   "gemini-pro-agent": 1_048_576,
@@ -313,6 +322,9 @@ export const ANTIGRAVITY_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   // Collapsed base IDs — explicit entries for the picker.
   "gemini-3.8-flash": 1_048_576,
   "gemini-3.7-flash": 1_048_576,
+  "gemini-3-flash": 1_048_576,
+  "gemini-3.5-flash-lite": 1_048_576,
+  "gemini-3.1-flash-lite": 1_048_576,
   "gemini-3.1-pro": 1_048_576,
   // Wire IDs and aliases via derivation.
   ...ANTIGRAVITY_WIRE_MODEL_CONTEXT_WINDOWS,
@@ -331,6 +343,9 @@ export const ANTIGRAVITY_MODEL_INPUT_MODALITIES: Record<string, string[]> = {
   // the wire cannot carry would be a promise we break at request time.
   "gemini-3.8-flash": ["text", "image"],
   "gemini-3.7-flash": ["text", "image"],
+  "gemini-3-flash": ["text", "image"],
+  "gemini-3.5-flash-lite": ["text", "image"],
+  "gemini-3.1-flash-lite": ["text", "image"],
   "gemini-3.1-pro": ["text", "image"],
   "gemini-3.1-flash-image": ["text", "image"],
   "claude-sonnet-4-6": ["text", "image"],
