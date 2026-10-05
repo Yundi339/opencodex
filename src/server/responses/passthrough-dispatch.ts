@@ -1060,7 +1060,7 @@ export async function preparePassthroughExchange(
           // canonical forward row; the ladder's sends are additional to the budget and unlock only
           // on 502/503/504.
           retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
-          retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider), retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider),
+          retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider), retryRateLimitDeferralsMs: capacityAbsorbDelays(route.provider), retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider),
           onCapacityWait: waitMs => { absorbedWaitMs += waitMs; },
           // The OpenCode Go destination stalls-then-drops inference sends (ambiguous
           // pre-header resets surfacing as refused 429s); its subscription traffic is
@@ -1186,7 +1186,7 @@ export async function preparePassthroughExchange(
             // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
             // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
             retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
-            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider),
+            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider), retryRateLimitDeferralsMs: capacityAbsorbDelays(route.provider),
             retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider) },
         );
       } catch (err) {
@@ -1318,7 +1318,7 @@ export async function preparePassthroughExchange(
             // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
             // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
             retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
-            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider),
+            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider), retryRateLimitDeferralsMs: capacityAbsorbDelays(route.provider),
             retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider) },
         );
       } catch (err) {
@@ -1449,7 +1449,7 @@ export async function preparePassthroughExchange(
             // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
             // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
             retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
-            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider),
+            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider), retryRateLimitDeferralsMs: capacityAbsorbDelays(route.provider),
             retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider) },
         );
       } catch (err) {
@@ -1588,7 +1588,7 @@ export async function preparePassthroughExchange(
             // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
             // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
             retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
-            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider),
+            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider), retryRateLimitDeferralsMs: capacityAbsorbDelays(route.provider),
             retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider) },
         );
       } catch (err) {

@@ -726,3 +726,63 @@ describe("ambiguous reset safety through error formatting", () => {
     expect((await response.json()).error.code).toBe("cyber_policy");
   });
 });
+
+/**
+ * The plan limiter's 429 is a pre-execution verdict, so absorbing it cannot duplicate work.
+ *
+ * Measured 2026-10-05/06 on the official row: `rate_limit_exceeded`, headers-only, ~1s, five in
+ * nine hours on the two busiest conversations, and the turn after the ladder completed. Without an
+ * opt-in ladder a 429 stays exactly what it was -- a non-transient status the caller owns.
+ */
+describe("fetchWithTransientRetry: upstream 429 ladder", () => {
+  test("absorbs a rate-limit 429 and returns the next attempt", async () => {
+    silenceWarn();
+    const { calls, doFetch } = mockDoFetch([
+      new Response(null, { status: 429 }),
+      new Response("ok", { status: 200 }),
+    ]);
+    const res = await fetchWithTransientRetry(doFetch, { attempts: 1, retryRateLimitDeferralsMs: [1, 1] });
+    expect(res.status).toBe(200);
+    expect(calls.length).toBe(2);
+  });
+
+  test("honours an explicit Retry-After instead of the rung", async () => {
+    silenceWarn();
+    const { doFetch } = mockDoFetch([
+      new Response(null, { status: 429, headers: { "retry-after": "0" } }),
+      new Response("ok", { status: 200 }),
+    ]);
+    const res = await fetchWithTransientRetry(doFetch, { attempts: 1, retryRateLimitDeferralsMs: [60_000] });
+    expect(res.status).toBe(200);
+  });
+
+  test("hands the 429 back once the ladder is spent", async () => {
+    silenceWarn();
+    const { calls, doFetch } = mockDoFetch([new Response(null, { status: 429 })]);
+    const res = await fetchWithTransientRetry(doFetch, { attempts: 1, retryRateLimitDeferralsMs: [1] });
+    expect(res.status).toBe(429);
+    expect(calls.length).toBe(2);
+  });
+
+  test("a Retry-After past the ceiling is not slept through", async () => {
+    silenceWarn();
+    const { calls, doFetch } = mockDoFetch([
+      new Response(null, { status: 429, headers: { "retry-after": "600" } }),
+      new Response("ok", { status: 200 }),
+    ]);
+    const res = await fetchWithTransientRetry(doFetch, { attempts: 1, retryRateLimitDeferralsMs: [1] });
+    expect(res.status).toBe(429);
+    expect(calls.length).toBe(1);
+  });
+
+  test("without the opt-in a 429 is still handed straight back", async () => {
+    silenceWarn();
+    const { calls, doFetch } = mockDoFetch([
+      new Response(null, { status: 429 }),
+      new Response("ok", { status: 200 }),
+    ]);
+    const res = await fetchWithTransientRetry(doFetch, { attempts: 3 });
+    expect(res.status).toBe(429);
+    expect(calls.length).toBe(1);
+  });
+});
