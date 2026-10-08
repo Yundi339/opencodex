@@ -11,10 +11,13 @@ import { handleResponses } from "../../src/server/responses/core";
 import {
   adapterSpeaksResponsesWire,
   attemptOpaqueBlobRecovery,
+  isSelfIdentifiedOpaqueBlobRejection,
+  isUnverifiableEncryptedContentMessage,
   clearOpaqueBlobPreStripForTests,
   shouldAttemptOpaqueBlobRecovery,
   type OpaqueBlobRecoveryGuard,
 } from "../../src/server/responses/core-opaque-recovery";
+import { upstreamErrorMessageFromPayload } from "../../src/lib/errors";
 import type { RequestLogContext } from "../../src/server/request-log";
 import type { OcxConfig, OcxParsedRequest } from "../../src/types";
 import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
@@ -196,17 +199,46 @@ describe("the recovery gate follows the adapter's declared Responses contract", 
     expect(adapterSpeaksResponsesWire("not-a-registered-adapter")).toBe(false);
   });
 
-  test("azure-openai does not recover an ordinary 400, a 429, or a 5xx", () => {
+  test("azure-openai does not recover an ordinary 400, a 429, or a non-projection 5xx", () => {
     const azure = { ...base, adapterName: "azure-openai" };
     expect(shouldAttemptOpaqueBlobRecovery(azure)).toBe(true);
     expect(shouldAttemptOpaqueBlobRecovery({ ...azure, errorBody: UNRELATED_400 })).toBe(false);
     expect(shouldAttemptOpaqueBlobRecovery({ ...azure, status: 429, errorBody: RATE_LIMITED })).toBe(false);
-    for (const status of [500, 502, 503]) {
+    for (const status of [500, 503]) {
       expect({ status, recovers: shouldAttemptOpaqueBlobRecovery({ ...azure, status }) })
         .toEqual({ status, recovers: false });
     }
+    // 502 is the projection status the relay uses for a rejection that arrived INSIDE an
+    // already-200 stream, so a 502 whose body is a blob verdict recovers -- measured 2026-10-08,
+    // the leasebot rejection (a reasoning item's encrypted_content) reached the client that way.
+    // 500/503 stay transport faults, and a 502 with unrelated prose still recovers nothing.
+    expect(shouldAttemptOpaqueBlobRecovery({ ...azure, status: 502 })).toBe(true);
+    expect(shouldAttemptOpaqueBlobRecovery({ ...azure, status: 502, errorBody: UNRELATED_400 })).toBe(false);
     // The destination's answer to a surviving foreign id is not itself an opaque-state identity.
     expect(shouldAttemptOpaqueBlobRecovery({ ...azure, errorBody: FOREIGN_ITEM_NOT_FOUND })).toBe(false);
+  });
+
+  test("the streamed encrypted-content verdict is recognized outside the 4xx envelope", async () => {
+    // The identical sentence arrives as `response.failed` with the error under `response.error`,
+    // naming a reasoning item (`<uuid>-0`). Only the message identifies it there.
+    const streamed = {
+      type: "response.failed",
+      response: {
+        status: "failed",
+        error: {
+          type: "invalid_request_error",
+          message: "The encrypted content 4bb5...2c-0 could not be verified."
+            + " Reason: Encrypted content could not be decrypted or parsed.",
+        },
+      },
+    };
+    const message = upstreamErrorMessageFromPayload(streamed)!;
+    expect(isUnverifiableEncryptedContentMessage(message)).toBe(true);
+    // The 4xx envelope is still matched by the nested code-less check.
+    expect(isSelfIdentifiedOpaqueBlobRejection(JSON.stringify({
+      error: { type: "invalid_request_error", code: null, message },
+    }))).toBe(true);
+    expect(isUnverifiableEncryptedContentMessage("The encrypted content could not be verified.")).toBe(false);
   });
 
   test("the recovery path never rebuilds for those statuses, and the guard is single-shot", async () => {

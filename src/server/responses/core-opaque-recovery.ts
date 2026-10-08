@@ -133,6 +133,21 @@ export function isReasoningBlobCallerMismatchMessage(message: string): boolean {
   return message.includes("encrypted_content") || message.includes("reasoning");
 }
 
+/**
+ * The code-less "The encrypted content <id> could not be verified." identity, in any envelope.
+ *
+ * The 4xx form is matched inline in {@link isSelfIdentifiedOpaqueBlobRejection} (nested
+ * `error.type = invalid_request_error`, code null). Measured 2026-10-08 on the leasebot
+ * conversation, the SAME wording also arrives inside a streamed `response.failed` frame, where the
+ * error sits under `response.error` and the message is the only identity available -- and the item
+ * it names (`<uuid>-0`) is a reasoning item's encrypted_content, not a function output. Both
+ * envelopes name a blob the destination cannot decrypt, so both must reach the same recovery.
+ */
+export function isUnverifiableEncryptedContentMessage(message: string): boolean {
+  return message.startsWith("The encrypted content ")
+    && message.endsWith(" could not be verified. Reason: Encrypted content could not be decrypted or parsed.");
+}
+
 
 /**
  * Longest embedded payload this will parse. The wrapper is a short error envelope; anything
@@ -245,10 +260,7 @@ export function isSelfIdentifiedOpaqueBlobRejection(bodyText: string): boolean {
         if (
           (error.code === null || error.code === undefined)
           && typeof error.message === "string"
-          && error.message.startsWith("The encrypted content ")
-          && error.message.endsWith(
-            " could not be verified. Reason: Encrypted content could not be decrypted or parsed.",
-          )
+          && isUnverifiableEncryptedContentMessage(error.message)
         ) return true;
         // #4469: the caller-mismatch wording arrives without a dedicated code, so the
         // message itself is the identity. It is not gated on code being null — the upstream
@@ -293,11 +305,19 @@ export function shouldAttemptOpaqueBlobRecovery(args: {
   errorBody: string;
   alreadyAttempted: boolean;
 }): boolean {
+  // The 502 leg is the streamed shape: the rejection arrived inside an already-200 body and the
+  // relay projected it. It accepts a body carrying a FUNCTION OUTPUT blob, and -- since
+  // 2026-10-08 -- a body carrying any other opaque item (a reasoning item's encrypted_content,
+  // which is what the leasebot rejection named) together with a self-identified blob verdict.
   const acceptedStatus = (args.status >= 400 && args.status < 500)
     || (
       args.status === 502
-      && outboundResponsesBodyCarriesEncryptedFunctionOutput(args.outboundBody)
-      && isEncryptedFunctionOutputRejection(args.errorBody)
+      && (
+        (outboundResponsesBodyCarriesEncryptedFunctionOutput(args.outboundBody)
+          && isEncryptedFunctionOutputRejection(args.errorBody))
+        || (outboundResponsesBodyCarriesOpaqueBlob(args.outboundBody)
+          && isSelfIdentifiedOpaqueBlobRejection(args.errorBody))
+      )
     );
   return acceptedStatus
     && adapterSpeaksResponsesWire(args.adapterName)

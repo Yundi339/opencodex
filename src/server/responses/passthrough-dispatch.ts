@@ -154,8 +154,11 @@ import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } from "../../codex/catalog/native-m
 import {
   attemptOpaqueBlobRecovery,
   isEncryptedFunctionOutputRejection,
+  isSelfIdentifiedOpaqueBlobRejection,
+  isUnverifiableEncryptedContentMessage,
   noteOpaqueBlobRejectedThread,
   outboundResponsesBodyCarriesEncryptedFunctionOutput,
+  outboundResponsesBodyCarriesOpaqueBlob,
   prepareOpaqueBlobRecovery,
   resetStreamedOpaqueBlobLogContext,
   shouldPreStripOpaqueBlob,
@@ -1747,7 +1750,9 @@ export async function preparePassthroughExchange(
       && (recoveryContentType.includes("text/event-stream") || (!recoveryContentType && parsed.stream))
       && !opaqueBlobRecoveryGuard.attempted
       && !configuredTransientSendBudgetExhausted()
-      && outboundResponsesBodyCarriesEncryptedFunctionOutput(request.body);
+      // Any opaque item can be the one the destination refuses, not only a function output:
+      // measured 2026-10-08, the leasebot rejection named a reasoning item's encrypted_content.
+      && outboundResponsesBodyCarriesOpaqueBlob(request.body);
     if (streamedFunctionOutputCandidate) {
       const preflightLog: RequestLogContext = { model: logCtx.model, provider: logCtx.provider };
       const preflight = await preflightComboStreamResponse(upstreamResponse, preflightLog,
@@ -1755,7 +1760,8 @@ export async function preparePassthroughExchange(
           if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
           const type = (payload as { type?: unknown }).type;
           const decryptRejection = (type === "error" || type === "response.failed" || type === "response.incomplete")
-            && isEncryptedFunctionOutputRejection(JSON.stringify(payload));
+            && (isSelfIdentifiedOpaqueBlobRejection(JSON.stringify(payload))
+              || isUnverifiableEncryptedContentMessage(upstreamErrorMessageFromPayload(payload) ?? ""));
           // `detail` is a real WebSocket error shape but the generic preflight failure projector
           // intentionally understands only Responses error/message fields. Preserve only this
           // exact identity so the projected 502 can enter the existing single-shot recovery.
