@@ -140,7 +140,6 @@
 84	tests/ci-workflows/docs-provider-billing-claims.test.ts
 121	tests/ci-workflows/docs-provider-discovery-limits.test.ts
 98	tests/ci-workflows/docs-provider-preset-counts.test.ts
-112	tests/ci-workflows/docs-readme-translation-parity.test.ts
 202	tests/ci-workflows/docs-remote-hub-claims.test.ts
 181	tests/ci-workflows/dsh-path-contract.test.ts
 352	tests/ci-workflows/dsh-rc6-compat-script.test.ts

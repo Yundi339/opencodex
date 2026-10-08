@@ -94,11 +94,12 @@ function isLocalFenceMessage(message: string | undefined): boolean {
 /**
  * Ceiling for a target cooldown, INCLUDING a tripped breaker's open window.
  *
- * Short on purpose: a relay recovers on its own, and the tiered picker already keeps a tripped
- * row out of the healthy set, so a long lock would only delay the recovery the operator asked
- * for ("use it the moment it works again").
+ * Ten minutes: upstream 2.80 raised it from the fork's two, and the exhaustion/permanent-failure
+ * suites encode it. A spent account window or an unpaid credential does not turn over in a
+ * minute, and the tiered picker already keeps a tripped row out of the healthy set, so this
+ * ceiling is what the ladder's "stop paying for a doomed send" arm actually waits.
  */
-const MAX_COOLDOWN_MS = 2 * 60_000;
+const MAX_COOLDOWN_MS = 10 * 60_000;
 
 /** Ceiling for an explicit upstream delay (Retry-After or a quota reset): one day, never longer. */
 const MAX_SERVER_DELAY_MS = 24 * 60 * 60_000;
