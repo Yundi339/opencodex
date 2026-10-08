@@ -1,3 +1,4 @@
+import { codexAccountModelRefusal, codexAccountModelRefusalPayload, hasConflictingCodexModelRefusalEnvelopes, type CodexAccountModelRefusal } from "../../combos/failover";
 import type { ResponsesTerminalStatus } from "../../bridge";
 import { comboFailureDecision } from "../../combos";
 import { httpStatusFromTerminalError } from "../../lib/errors";
@@ -19,9 +20,6 @@ const PRE_OUTPUT_CONTROL_EVENTS = new Set([
   "response.in_progress",
   "response.queued",
   "response.heartbeat",
-  "response.metadata",
-  "codex.rate_limits",
-  "codex.response.metadata",
 ]);
 
 const TERMINAL_EVENTS = new Set([
@@ -71,6 +69,26 @@ function bareErrorStatus(payload: unknown): number | undefined {
   });
 }
 
+/** Match the selected SSE error envelope before projection drops competing fields. */
+function terminalModelRefusal(status: number, event: Record<string, unknown>): CodexAccountModelRefusal {
+  if (hasConflictingCodexModelRefusalEnvelopes(status, event)) return "ambiguous";
+  const outer = codexAccountModelRefusalPayload(status, event);
+  if (outer === "ambiguous") return outer;
+  const nested = event.response;
+  if (event.type !== "error" && nested && typeof nested === "object" && !Array.isArray(nested)) {
+    const nestedKind = codexAccountModelRefusalPayload(status, nested);
+    if (nestedKind === "ambiguous") return nestedKind;
+    const nestedError = (nested as Record<string, unknown>).error;
+    if (nestedError && typeof nestedError === "object" && !Array.isArray(nestedError)) {
+      return nestedKind;
+    }
+  }
+  if (event.type === "error" && !Object.hasOwn(event, "error") && typeof event.message === "string") {
+    return codexAccountModelRefusal(status, event.message, { allowNestedResponse: false });
+  }
+  return outer;
+}
+
 function bareErrorIsRetryable(payload: unknown): boolean {
   const status = bareErrorStatus(payload);
   if (status === undefined || !payload || typeof payload !== "object" || Array.isArray(payload)) {
@@ -87,7 +105,9 @@ function bareErrorIsRetryable(payload: unknown): boolean {
   const message = typeof error.message === "string"
     ? error.message
     : typeof event.message === "string" ? event.message : "";
-  return comboFailureDecision(status, message, { code }) === "hop";
+  return comboFailureDecision(status, message, {
+    code, codexModelRefusal: terminalModelRefusal(status, event),
+  }) === "hop";
 }
 
 function retryableZeroOutputTerminal(payload: unknown): boolean {
@@ -229,7 +249,7 @@ function failedTerminalResponse(
 
 export type ComboStreamPreflightResult =
   | { kind: "accepted"; response: Response }
-  | { kind: "failed"; response: Response }
+  | { kind: "failed"; response: Response; codexModelRefusal?: CodexAccountModelRefusal }
   /**
    * The body errored mid-stream and `replayReadErrors` asked for the prefix back rather than
    * a rethrow. `stage` is how far the inspection actually got; whether that permits a
@@ -250,23 +270,7 @@ export async function preflightComboStreamResponse(
   response: Response,
   logCtx: RequestLogContext,
   retryableTerminal: (payload: unknown) => boolean = retryableZeroOutputTerminal,
-  options?: {
-    allowMissingContentType?: boolean;
-    replayReadErrors?: boolean;
-    /**
-     * Absolute time by which the child has to produce a client-visible event.
-     *
-     * The per-attempt first-byte deadline in the combo ladder is spent as soon as the response
-     * OBJECT arrives, and a relay that answers with SSE headers and then nothing settles that
-     * promise immediately: the ladder would then wait on this preflight for as long as the relay
-     * keeps the socket quiet. That silence is what makes a combo look frozen and lets one target
-     * eat the whole ladder budget. Expiring here abandons the attempt while nothing has been
-     * relayed, so the failure is still replayable on the next target.
-     */
-    zeroOutputDeadlineAt?: number;
-    /** Failure response handed back when {@link zeroOutputDeadlineAt} expires. */
-    onZeroOutputDeadline?: () => Response;
-  },
+  options?: { allowMissingContentType?: boolean; replayReadErrors?: boolean },
 ): Promise<ComboStreamPreflightResult> {
   const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
   const isEventStream = contentType.includes("text/event-stream")
@@ -303,26 +307,11 @@ export async function preflightComboStreamResponse(
     onTerminal: status => { terminalStatus = status; },
   });
 
-  // Armed only while no output has been committed: the loop below returns `accepted` the moment a
-  // client-visible event lands, so this timer can never cut a target that already produced text.
-  let zeroOutputTimer: ReturnType<typeof setTimeout> | undefined;
-  const zeroOutputDeadlineAt = options?.zeroOutputDeadlineAt;
-  const zeroOutputDeadline = typeof zeroOutputDeadlineAt === "number"
-      && Number.isFinite(zeroOutputDeadlineAt)
-    ? new Promise<"zero-output-deadline">(resolve => {
-      zeroOutputTimer = setTimeout(
-        () => resolve("zero-output-deadline"),
-        Math.max(0, zeroOutputDeadlineAt - Date.now()),
-      );
-    })
-    : undefined;
-
   try {
     for (;;) {
-      let next: Awaited<ReturnType<typeof reader.read>> | "zero-output-deadline";
+      let next: Awaited<ReturnType<typeof reader.read>>;
       try {
-        const read = reader.read();
-        next = zeroOutputDeadline ? await Promise.race([read, zeroOutputDeadline]) : await read;
+        next = await reader.read();
       } catch (error) {
         if (!options?.replayReadErrors) throw error;
         // The native relay still owns post-header transport failures. Preserve
@@ -331,15 +320,6 @@ export async function preflightComboStreamResponse(
         const replay = replayBufferedResponse(response, reader, buffered);
         const stage = observedResponsesStage({ outputCommitted, terminalStatus, responseCreated });
         return { kind: "read-error", response: replay, error, stage };
-      }
-      if (next === "zero-output-deadline") {
-        // Nothing reached the client, so this attempt is still replayable: report the target as
-        // failed (the caller cools it down and hops) instead of holding the ladder hostage.
-        await reader.cancel("combo zero-output deadline").catch(() => undefined);
-        return {
-          kind: "failed",
-          response: options?.onZeroOutputDeadline?.() ?? new Response(null, { status: 504 }),
-        };
       }
       if (next.done) {
         inspector.finish();
@@ -365,7 +345,10 @@ export async function preflightComboStreamResponse(
         || retryableTerminalPayload?.type === "error")
         && !outputCommitted && retryableTerminalPayload) {
         await reader.cancel("retrying zero-output combo stream terminal").catch(() => undefined);
-        return { kind: "failed", response: failedTerminalResponse(response, retryableTerminalPayload, logCtx) };
+        const failed = failedTerminalResponse(response, retryableTerminalPayload, logCtx);
+        return { kind: "failed", response: failed,
+          ...(failed.status === 400
+            ? { codexModelRefusal: terminalModelRefusal(failed.status, retryableTerminalPayload) } : {}) };
       }
       if (next.done || terminalStatus !== undefined || outputCommitted
         || bufferedBytes >= COMBO_STREAM_PREFLIGHT_MAX_BYTES
@@ -374,7 +357,6 @@ export async function preflightComboStreamResponse(
       }
     }
   } finally {
-    if (zeroOutputTimer !== undefined) clearTimeout(zeroOutputTimer);
     inspector.dispose();
   }
 }

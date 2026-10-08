@@ -59,7 +59,56 @@ it from the tray or launch the app again.
 Use the tray's **Open dashboard** or **Open in browser** action to move between the
 embedded dashboard and your normal browser. The tray also provides update checks.
 
+On Windows, approving **Take over** allows up to 90 seconds of startup work for the existing
+runtime to stop safely, ownership to transfer, and the bundled runtime to start. Time spent
+deciding at the prompt does not count toward this limit. Keep the app open while it finishes;
+if it fails, use **Retry** to resolve the current runtime again.
+
 On macOS, closing the dashboard keeps the app running in the menu bar. Open OpenCodex again from Dock or Finder to restore the dashboard without restarting the proxy.
+
+On Windows, **Start at Login** quotes the executable path in the current-user startup
+registration, including installations under `Program Files`. Previously enabled
+registrations are updated once on launch. Startup entries you disabled in the tray
+or Task Manager remain disabled.
+
+## Startup safety on macOS and Linux
+
+Startup safety reports **Desktop app** protection when OpenCodex's recorded ownership,
+**Start at Login** registration, and live supervision of its bundled proxy all match.
+On Linux, the pinned autostart backend writes the login entry to
+`~/.config/autostart/OpenCodex.desktop`, even when `$XDG_CONFIG_HOME` is set. Startup
+safety reads that entry and the desktop install-id under `~/.config`. When
+`$XDG_CONFIG_HOME` points elsewhere, the login session searches a different autostart
+directory, so startup safety stays **At risk** instead of crediting the entry.
+The entry counts only while it is not marked `Hidden=true` or
+`X-GNOME-Autostart-enabled=false`, and has no `OnlyShowIn`, `NotShowIn`, or `TryExec`
+condition. Its `Exec` must be an unquoted absolute path to `opencodex-desktop`, without
+spaces, escapes, or field codes, followed by exactly `--autostart`. The resolved
+executable must still be named `opencodex-desktop`, with its bundled `ocx` beside it.
+Startup safety reads the full evidence chain twice and grants protection only when
+both reads agree.
+
+AppImage installations remain **At risk**: the autostart backend registers the outer
+AppImage path, while the live desktop process runs inside its mount. Startup safety
+cannot verify that relationship and does not credit AppImage protection.
+A missing or stale check remains **At risk**. If the desktop app owns the proxy but
+protection cannot be verified, reopen OpenCodex and check **Start at Login**. Service
+and launcher installation or repair stays disabled while that ownership remains;
+`ocx restore` is still available to undo Codex routing.
+
+Normal desktop updates replace the bundled CLI with the fixed startup probe. No local
+patch needs to be preserved across an update.
+
+## Zoom
+
+On macOS and Linux, Cmd (macOS) or Ctrl (Linux) with `+`, `-` and `0`, or Ctrl with the mouse wheel,
+zooms the window between 50% and 300% in 10% steps, and `0` returns to 100%. The sidebar shows the
+same level next to the theme switch, as `-`, the current percentage and `+`; clicking the
+percentage returns to 100%. The level is
+remembered and applied again the next time the app starts. The dashboard comes from the proxy the
+app is attached to, so an app attached to an older proxy keeps the earlier behaviour (20% steps, not
+remembered, no sidebar control) until that proxy is updated. Windows uses the browser engine's own
+zoom, which is not remembered.
 
 ## Keeping the proxy running
 

@@ -15,6 +15,7 @@ import {
   type ProviderRequestSlot,
 } from "../../providers/request-pacing";
 import { withUpstreamHttpVersion } from "../../lib/upstream-http-version";
+import { providerTlsFetch } from "../../lib/provider-tls-profile";
 import type { CodexWsQuotaObserver } from "./codex-ws-metadata";
 import { configuredOutboundFetch } from "../../lib/proxy-env";
 import { isLoopbackUrl, rewriteUpstream } from "../../plugins/upstream-hooks";
@@ -191,8 +192,17 @@ export function sendWithConnectionPolicy(
   const egressInit = redirectedToLoopback
     ? { proxy: false as const }
     : decide ? providerEgressSendInit(egress, physicalFetch, input) : {};
+  // Bun can reset large native Codex string uploads before receiving headers while
+  // the identical UTF-8 buffer succeeds. Convert only at the final HTTP send so
+  // WebSocket selection still sees the serialized string and no retry is added.
+  const target = input instanceof Request ? input.url : String(input);
+  const body = init?.body;
+  const largeCodexBody = typeof body === "string"
+    && /^https:\/\/chatgpt\.com\/backend-api\/codex\/responses(?:\/compact)?$/.test(target)
+    && Buffer.byteLength(body, "utf8") >= 1024 * 1024;
   return physicalFetch(input, {
     ...init,
+    ...(largeCodexBody ? { body: Buffer.from(body, "utf8") } : {}),
     headers,
     redirect: "manual",
     ...(fresh ? { keepalive: false } : {}),
@@ -252,8 +262,10 @@ export function providerFetch(
     { preconnect: globalThis.fetch.preconnect?.bind(globalThis.fetch) },
   ) as typeof globalThis.fetch);
   const base = customExecutor ?? configuredFetch;
+  const transport = options.providerName ? providerTlsFetch(options.providerName, provider, base) : base;
   const preconnect = (...args: Parameters<typeof globalThis.fetch.preconnect>): void => {
-    base.preconnect?.(...args);
+    // A TLS profile owns the handshake; a Bun preconnect would open a differently fingerprinted one.
+    if (transport === base) base.preconnect?.(...args);
   };
   // Rebuilt dispatches must use the same physical-send boundary as ordinary HTTP sends.
   // Return the original 3xx so the response owner retains its retry/health/relay contract.
@@ -266,7 +278,7 @@ export function providerFetch(
   // that decided for itself has already marked the init and this pass defers to that decision.
   const dispatch = markEgressTransparentExecutor(Object.assign(
     (input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) =>
-      sendWithConnectionPolicy(base, input, init, egressBinding),
+      sendWithConnectionPolicy(transport, input, init, egressBinding),
     { preconnect },
   ) as typeof globalThis.fetch);
   const httpFetch = Object.assign(
@@ -281,7 +293,7 @@ export function providerFetch(
       // the override may rebuild against a different host and select a different transport, and
       // refusing on this destination would reject a request whose real route is fine.
       if (options.dispatchOverride) egressFor(input);
-      else providerEgressSendInit(egressBinding, base, input);
+      else providerEgressSendInit(egressBinding, transport, input);
       // The hook inspects the outgoing headers and refuses the send by throwing; it is not a
       // mutator, and the copy it receives is deliberately not threaded onward. `Connection`
       // is decided inside `dispatch`, which runs after this, so the fresh-connection policy
@@ -302,12 +314,6 @@ export function providerFetch(
   const unpaced = async (input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
     const upstreamWebsocket = provider.upstreamWebsocket;
     if (!options.httpOnly && typeof input === "string" && init
-      // Explicit operator opt-out: `upstreamWebsocket: false` also closes the first-party
-      // ChatGPT lane, which otherwise rides WS unconditionally because it is measurably faster.
-      // Diagnostic value: when one conversation is being shed upstream while its siblings are
-      // fine, switching THAT lane's transport is the only client-side lever that can tell a
-      // transport-scoped refusal apart from a conversation-scoped one.
-      && provider.upstreamWebsocket !== false
       && shouldUseCodexWsUpstream(input, init, runtime, upstreamWebsocket)) {
       if (options.providerName && requestPacingMaxConcurrentRequests(provider, options.modelId) > 0) {
         if (!pacingWebsocketDowngradeWarned.has(providerName)

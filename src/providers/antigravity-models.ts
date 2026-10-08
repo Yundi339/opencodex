@@ -1,5 +1,7 @@
 import { isValidModelDiscoveryModelId, MODEL_DISCOVERY_MAX_MODELS } from "./model-discovery-limits";
-import { isModelCacheGenerationCurrent } from "../codex/model-cache";
+import { captureModelCacheGeneration, isModelCacheGenerationCurrent } from "../codex/model-cache";
+import { getConfigDir } from "../config/paths";
+import { readAntigravityWireSnapshot, writeAntigravityWireSnapshot, type AntigravitySuffixMap } from "./antigravity-wire-snapshot";
 
 // Google Antigravity (Cloud Code Assist) bundled model list.
 //
@@ -7,8 +9,8 @@ import { isModelCacheGenerationCurrent } from "../codex/model-cache";
 // CLI resolves labels against. The ids below separate CCA wire ids, collapsed picker entries,
 // and hidden compatibility aliases for saved selections. The CCA envelope's `model` field must
 // receive the wire id (for example "Gemini 3.1 Pro (High)" => gemini-pro-agent), while the
-// picker exposes collapsed known base models only when CCA returns every known tier; unknown
-// returned wire ids remain visible so they stay directly routable.
+// picker collapses complete low/medium/high families discovered by CCA, including new versions.
+// Partial families remain wire-addressable rather than advertising an invented effort ladder.
 
 // ── Wire IDs (what CCA :fetchAvailableModels returns) ──
 
@@ -64,9 +66,6 @@ const RETIRED_FLASH_TIERS: Record<string, string> = {
 
 const ANTIGRAVITY_WIRE_MODELS = [
   "gemini-3.7-flash-tiered",
-  "gemini-3-flash",
-  "gemini-3.5-flash-lite",
-  "gemini-3.1-flash-lite",
   "gemini-3.1-pro-low",
   "gemini-pro-agent",
   "gemini-3.1-flash-image",
@@ -124,10 +123,12 @@ function pickerModelIdForDiscoveredWireId(
   const effortMatch = /^(.*)-(low|medium|high)$/.exec(wireId);
   if (effortMatch) {
     const baseId = effortMatch[1]!;
-    if (isKnownAntigravityPickerModelId(baseId)
+    if (isValidModelDiscoveryModelId(baseId)
       && ANTIGRAVITY_DISCOVERY_EFFORTS.every(effort => available.has(`${baseId}-${effort}`))) {
       return baseId;
     }
+    // A shared display label must not collapse an incomplete family or rename its wire tier.
+    return wireId;
   }
 
   // Display labels are a LAST resort, never a first one. CCA labels a tier row
@@ -203,12 +204,13 @@ function completeDiscoveredEffortWireModelIds(
   pickerId: string,
   available: ReadonlyMap<string, Record<string, unknown>>,
 ): AntigravityEffortWireModelIds | undefined {
-  const explicitEffortMap = ANTIGRAVITY_EFFORT_WIRE_MAP[pickerId];
+  const explicitEffortMap = Object.hasOwn(ANTIGRAVITY_EFFORT_WIRE_MAP, pickerId)
+    ? ANTIGRAVITY_EFFORT_WIRE_MAP[pickerId] : undefined;
   if (explicitEffortMap && Object.values(explicitEffortMap).every(wireId => available.has(wireId))) {
     return { ...explicitEffortMap };
   }
 
-  if (!isKnownAntigravityPickerModelId(pickerId)) return undefined;
+  if (!isValidModelDiscoveryModelId(pickerId)) return undefined;
   const suffixEffortMap: AntigravityEffortWireModelIds = {};
   for (const effort of ANTIGRAVITY_DISCOVERY_EFFORTS) {
     const wireId = `${pickerId}-${effort}`;
@@ -287,9 +289,6 @@ export const ANTIGRAVITY_MODEL_ALIASES: Record<string, string> = {
 export const ANTIGRAVITY_MODELS = [
   GEMINI_FLASH_CURRENT,
   GEMINI_FLASH_PREVIOUS,
-  "gemini-3-flash",
-  "gemini-3.5-flash-lite",
-  "gemini-3.1-flash-lite",
   "gemini-3.1-pro",
   "gemini-3.1-flash-image",
   "claude-sonnet-4-6",
@@ -306,9 +305,6 @@ const ANTIGRAVITY_WIRE_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   "gemini-3.8-flash-low": 1_048_576,
   "gemini-3.8-flash-medium": 1_048_576,
   "gemini-3.8-flash-high": 1_048_576,
-  "gemini-3-flash": 1_048_576,
-  "gemini-3.5-flash-lite": 1_048_576,
-  "gemini-3.1-flash-lite": 1_048_576,
   "gemini-3.7-flash-tiered": 1_048_576,
   "gemini-3.1-pro-low": 1_048_576,
   "gemini-pro-agent": 1_048_576,
@@ -322,9 +318,6 @@ export const ANTIGRAVITY_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   // Collapsed base IDs — explicit entries for the picker.
   "gemini-3.8-flash": 1_048_576,
   "gemini-3.7-flash": 1_048_576,
-  "gemini-3-flash": 1_048_576,
-  "gemini-3.5-flash-lite": 1_048_576,
-  "gemini-3.1-flash-lite": 1_048_576,
   "gemini-3.1-pro": 1_048_576,
   // Wire IDs and aliases via derivation.
   ...ANTIGRAVITY_WIRE_MODEL_CONTEXT_WINDOWS,
@@ -343,9 +336,6 @@ export const ANTIGRAVITY_MODEL_INPUT_MODALITIES: Record<string, string[]> = {
   // the wire cannot carry would be a promise we break at request time.
   "gemini-3.8-flash": ["text", "image"],
   "gemini-3.7-flash": ["text", "image"],
-  "gemini-3-flash": ["text", "image"],
-  "gemini-3.5-flash-lite": ["text", "image"],
-  "gemini-3.1-flash-lite": ["text", "image"],
   "gemini-3.1-pro": ["text", "image"],
   "gemini-3.1-flash-image": ["text", "image"],
   "claude-sonnet-4-6": ["text", "image"],
@@ -379,7 +369,7 @@ interface DiscoveredWireModelMapping {
   readonly generation?: { provider: string; cacheGeneration: string };
 }
 
-const discoveredWireModelsByBaseUrl = new Map<string, DiscoveredWireModelMapping>();
+const discoveredWireModelsByBaseUrl = new Map<string, DiscoveredWireModelMapping | null>();
 
 /**
  * Strip trailing slashes without a backtracking regex.
@@ -402,9 +392,9 @@ function antigravityBaseUrlKey(baseUrl: string | undefined): string | undefined 
     const url = new URL(trimmed);
     url.hash = "";
     url.search = "";
-    return stripTrailingSlashes(url.toString()).toLowerCase();
+    return stripTrailingSlashes(url.toString());
   } catch {
-    return trimmed.toLowerCase();
+    return trimmed;
   }
 }
 
@@ -416,13 +406,23 @@ export function registerAntigravityDiscoveredWireModels(
 ): void {
   const key = antigravityBaseUrlKey(baseUrl);
   if (!key) return;
+  if (generation) {
+    if (!isModelCacheGenerationCurrent(generation.provider, generation.cacheGeneration)) return;
+    const families: Record<string, AntigravitySuffixMap> = Object.create(null);
+    for (const model of models) {
+      if (ANTIGRAVITY_DISCOVERY_EFFORTS.every(effort => model.effortWireModelIds?.[effort] === `${model.id}-${effort}`)) {
+        families[model.id] = { low: `${model.id}-low`, medium: `${model.id}-medium`, high: `${model.id}-high` };
+      }
+    }
+    writeAntigravityWireSnapshot(key, { version: 1, provider: generation.provider, families });
+  }
   const wireModels = new Map<string, string>();
   const effortModels = new Map<string, AntigravityEffortWireModelIds>();
   for (const model of models) {
     wireModels.set(model.id, model.wireModelId);
     if (model.effortWireModelIds) effortModels.set(model.id, { ...model.effortWireModelIds });
   }
-  discoveredWireModelsByBaseUrl.set(key, {
+  discoveredWireModelsByBaseUrl.set(`${getConfigDir()}\0${key}`, {
     models: wireModels,
     effortModels,
     ...(generation ? { generation } : {}),
@@ -434,11 +434,21 @@ function discoveredAntigravityMapping(
 ): DiscoveredWireModelMapping | undefined {
   const key = antigravityBaseUrlKey(baseUrl);
   if (!key) return undefined;
-  const mapping = discoveredWireModelsByBaseUrl.get(key);
+  const scopedKey = `${getConfigDir()}\0${key}`;
+  if (!discoveredWireModelsByBaseUrl.has(scopedKey)) {
+    const saved = readAntigravityWireSnapshot(key);
+    discoveredWireModelsByBaseUrl.set(scopedKey, saved ? {
+      models: new Map(Object.entries(saved.families).map(([id, map]) => [id, map.medium])),
+      effortModels: new Map(Object.entries(saved.families)),
+      generation: { provider: saved.provider, cacheGeneration: captureModelCacheGeneration(saved.provider) },
+    } : null);
+  }
+  const mapping = discoveredWireModelsByBaseUrl.get(scopedKey);
   if (!mapping) return undefined;
   if (mapping.generation
     && !isModelCacheGenerationCurrent(mapping.generation.provider, mapping.generation.cacheGeneration)) {
-    discoveredWireModelsByBaseUrl.delete(key);
+    // Keep a tombstone: clearing account/cache authority must not reload old disk evidence.
+    discoveredWireModelsByBaseUrl.set(scopedKey, null);
     return undefined;
   }
   return mapping;
@@ -465,7 +475,8 @@ function discoveredAntigravityEffortWireModelId(
   }
 
   const defaultEffort = ANTIGRAVITY_DEFAULT_EFFORT[modelId]
-    ?? ANTIGRAVITY_THINKING_LEVEL_MODELS[modelId];
+    ?? ANTIGRAVITY_THINKING_LEVEL_MODELS[modelId]
+    ?? "medium";
   if (defaultEffort && isAntigravityDiscoveryEffort(defaultEffort) && effortMap[defaultEffort]) {
     return effortMap[defaultEffort];
   }
@@ -588,20 +599,27 @@ export function parseAntigravityAvailableModels(
     if (seen.has(id)) continue;
     seen.add(id);
     const effortWireModelIds = completeDiscoveredEffortWireModelIds(id, available);
+    const tierInfo = effortWireModelIds
+      ? Object.values(effortWireModelIds).map(wire => available.get(wire)!) : [info];
+    const windows = tierInfo.map(tier => antigravityPositiveInteger(tier.maxTokens));
+    const contextWindow = windows.every((window): window is number => window !== undefined)
+      ? Math.min(...windows) : undefined;
+    const supportsImages = tierInfo.every(tier => tier.supportsImages === true) ? true
+      : tierInfo.some(tier => tier.supportsImages === false) ? false : undefined;
     out.push({
       id,
       wireModelId: wireId,
       ...(effortWireModelIds ? { effortWireModelIds } : {}),
-      ...(antigravityPositiveInteger(info.maxTokens) ? { contextWindow: antigravityPositiveInteger(info.maxTokens) } : {}),
+      ...(contextWindow ? { contextWindow } : {}),
       // Tri-state, deliberately not a ternary: `true` asserts image support,
       // `false` asserts against it, and ABSENT is unknown. Collapsing absent into
       // `["text"]` let routing read it as a confident `image: false` (#1796). The
       // strict catalog still receives its `["text"]` compatibility default
       // downstream via ensureStrictCatalogFields; only the routing-evidence
       // channel stays honest about what was never asserted.
-      ...(info.supportsImages === true
+      ...(supportsImages === true
         ? { inputModalities: ["text", "image"] as string[] }
-        : info.supportsImages === false
+        : supportsImages === false
           ? { inputModalities: ["text"] as string[] }
           : {}),
     });
@@ -752,6 +770,11 @@ const ANTIGRAVITY_USAGE_BASE_BY_ID: Record<string, string> = (() => {
   // onto a model that did not exist then, and away from the 3.6 price row that still
   // prices it correctly. Retirement changes what we CALL, not what we RECORD.
   for (const retired of Object.keys(RETIRED_FLASH_TIERS)) rev[retired] = retired;
+  // Usage identity is stable even before discovery; routing keeps its own live evidence.
+  for (const base of ["claude-sonnet-5-5", "claude-opus-5-5"]) {
+    rev[base] = base;
+    for (const effort of ANTIGRAVITY_DISCOVERY_EFFORTS) rev[`${base}-${effort}`] = base;
+  }
   // Visible aliases that only appear in ANTIGRAVITY_VISIBLE_MODEL_ALIASES are already
   // included via ANTIGRAVITY_MODEL_ALIASES. Identity bases without effort maps remain.
   return rev;

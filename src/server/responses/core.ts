@@ -43,10 +43,12 @@ export async function handleResponses(
 ): Promise<Response> {
   const ownsBudget = options.translatorBudget === undefined;
   const translatorBudget = options.translatorBudget ?? createTranslatorBudget();
-  const accountLoad = { lease: null as import("../../oauth/kiro-account-load").AccountLease | null };
   const abortSignal = options.abortSignal ?? req.signal;
-  const release = () => { accountLoad.lease?.release(); accountLoad.lease = null; abortSignal.removeEventListener("abort", release); };
-  abortSignal.addEventListener("abort", release, { once: true });
+  const accountLoad = { lease: null as import("../../oauth/kiro-account-load").AccountLease | null,
+    cancelled: abortSignal.aborted };
+  function release() { accountLoad.lease?.release(); accountLoad.lease = null; abortSignal.removeEventListener("abort", cancel); }
+  function cancel() { accountLoad.cancelled = true; release(); }
+  abortSignal.addEventListener("abort", cancel, { once: true });
   try {
     const response = await runWithCompactionRecovery(req, config, logCtx, {
       ...options,
@@ -64,15 +66,7 @@ export async function handleResponses(
       // Once at ingress, spend observer included: a combo child inherits the parent's holder.
       sendBudget: options.sendBudget ?? createInferenceSendBudget(req, logCtx),
     }, handleResponsesInner);
-    const finalResponse = ownsBudget
-      ? finalizeOwnedTranslatorBudget(response, translatorBudget, {
-        provider: logCtx.provider,
-        model: logCtx.model,
-        comboId: logCtx.comboId,
-        direction: "response",
-        transport: "http",
-      })
-      : response;
+    const finalResponse = ownsBudget ? finalizeOwnedTranslatorBudget(response, translatorBudget) : response;
     if (!accountLoad.lease) { release(); return finalResponse; }
     return finalizeAccountLease(finalResponse, release);
   } catch (error) {

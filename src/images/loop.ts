@@ -335,6 +335,7 @@ export interface ImageBridgeDeps {
     retryAfterHeader: string | null,
     responseHeaders?: Headers,
     retryParsed?: OcxParsedRequest,
+    // A 403 requires this complete response; status-only callbacks retain 429 semantics.
     originalResponse?: Response,
   ) =>
     | { adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind }
@@ -514,6 +515,7 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
         deps.onAttemptSend?.();
         void adapter.runTurn(iterParsed, {
           headers: deps.forwardHeaders ? new Headers(deps.forwardHeaders) : new Headers(),
+          ...(deps.incomingMeta.providerName ? { providerName: deps.incomingMeta.providerName } : {}),
           abortSignal: signal,
           translatorBudget,
           pacingSlot,
@@ -591,6 +593,7 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
         } else {
           request = await requestAdapter.buildRequest(iterParsed, {
             headers: deps.forwardHeaders ? new Headers(deps.forwardHeaders) : new Headers(),
+            ...(deps.incomingMeta.providerName ? { providerName: deps.incomingMeta.providerName } : {}),
             abortSignal: headerDeadline.signal,
             translatorBudget,
           });
@@ -685,6 +688,7 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
       }
       // 429 key-failover parity with web-search / normal routed path.
       while ((prepared.response.status === 429
+        || (prepared.response.status === 403 && deps.incomingMeta?.providerName === "anthropic")
         || (iterParsed._kiroAuthContext && (prepared.response.status === 400 || prepared.response.status === 403))) && deps.on429) {
         const rotated = await deps.on429(prepared.response.headers.get("retry-after"), prepared.response.headers,
           iterParsed, prepared.response);
@@ -1064,6 +1068,7 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
       replayCacheScope: parsed._reasoningReplayScope,
       ...(deps.forceEmptyResponseId ? { responseId: "" } : {}),
       hideThinkingSummary: parsed.options.hideThinkingSummary,
+      hideRawReasoning: parsed.options.hideRawReasoning,
       stallTimeoutSec: deps.stallTimeoutSec,
       ...(deps.onFirstOutput ? { onFirstOutput: deps.onFirstOutput } : {}),
       ...(deps.onUsage ? {

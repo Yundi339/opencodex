@@ -28,7 +28,7 @@ Shared parsing and streaming follow the [request-copy](../transports/byte-accoun
 
 Human-readable connect and sync-refresh diagnostics follow the [terminal rendering contract](../runtime.md#cli-readiness-diagnostics), with regression coverage for both paths in `tests/cli/cli-connect-readiness.test.ts`.
 
-`tests/cli/cli-config-show-client.test.ts` covers the separate read-only config annotation path:
+`tests/cli/cli-config-default-show.test.ts` covers optional-show parsing, offline display and explicit-action preservation; `tests/cli/cli-config-show-client.test.ts` covers the separate read-only config annotation path:
 `src/cli/config-command.ts` derives token ownership without importing the connect command or
 triggering catalog, lifecycle, or ACL-hardening work.
 
@@ -40,7 +40,7 @@ The Codex restart command follows the [CLI restart scope contract](../runtime.md
 
 The account reference documents the [Orca source-owned import](../codex-home.md#orca-source-owned-account-import).
 Its local-only command is declared in `src/cli/capabilities.ts`, and the generated skill surface
-lists its required source/registry paths and preview/apply flags.
+lists its required source/registry paths and preview/apply flags. The index and domain chapters follow the [CLI reference generation contract](../cli-management.md#generated-operating-reference).
 
 Local validation follows [the contributor test policy](../../AGENTS.md#commands): run the
 suite by default, with a documented resource exception requiring focused regression tests.
@@ -86,7 +86,7 @@ Manual navigation is defined in `docs-site/astro.config.mjs`. When adding a publ
 sidebar and either add localized copies or intentionally accept Starlight fallback behavior.
 
 Provider preset totals are recounted from the current registry when a preset lands. The
-documented split is 99 total: 82 key-based, 13 OAuth, three local, and one default
+documented split is 102 total: 84 key-based, 14 OAuth, three local, and one default
 ChatGPT-forward preset. The English provider guide, all seven translated copies, and all eight
 quickstarts carry the same counts.
 
@@ -185,6 +185,21 @@ Those controls still have no owner, so there is no image-publish workflow or off
 The scheduler wrapper retries child exits, including zero, after five seconds. Only the
 opt-in CLI stay-out code ends it successfully; missing Bun/CLI paths still exit with
 installation error 3. Explicit service stop terminates the wrapper itself.
+Before launching, the wrapper applies the bundled-Bun size gate (`REAL_BUN_MIN_BYTES`). An
+in-place npm install extracts `bun/bin/bun.exe` as a small placeholder and replaces it only when
+bun's postinstall runs later; executing the placeholder exits 216 and, interactively, raises a
+modal 16-bit dialog. A Bun file below the gate, or one whose size cannot be read because it
+vanished after the exist check, logs `bundled Bun is not ready` and is re-checked every five
+seconds without being executed, so the service starts once the postinstall lands. A Bun path
+that is already missing at the exist check keeps the unchanged `bun_missing` path: backup
+restore, then installation error 3. If the postinstall never runs (scripts blocked), the
+wrapper keeps waiting and logging; reinstalling with `--allow-scripts=bun` (or running the
+package's `bun/install.js`) is the recovery, and the next pass starts without a service repair.
+Timestamp expansion in the scheduler wrapper stays outside parenthesized batch
+blocks so locale dates containing parentheses cannot abort prelaunch checks or
+transactional-backup recovery. Delayed expansion stays disabled to preserve
+exclamation marks in paths. Recovery logs a fixed success message without expanding
+the filesystem-derived backup directory name into a command.
 `src/service/windows-wrapper-exit.ts` defines the opt-in contract: new wrappers set
 `OCX_WINDOWS_WRAPPER_PROTOCOL=1`, and all three CLI live-owner exits return 42 in that
 service context. The wrapper translates 42 into a successful exit; legacy service
@@ -193,6 +208,11 @@ contexts retain exit 0.
 > Decision record: [ADR-0082](../decisions/ADR-0082-windows-service-wrapper-and-incomplete-updates.md)
 
 ## GitHub workflow map
+
+The PR-target resolver accepts commit-index candidates only when their base repository's
+owner and name match the workflow repository. Foreign or incomplete fork-network entries
+cannot supply a write-job PR number. If no unique local current-head candidate remains,
+the existing repository-scoped open-PR lookup runs; absent or ambiguous matches emit no identity.
 
 | Workflow | Trigger | Purpose |
 | --- | --- | --- |
@@ -215,7 +235,7 @@ it is promoted, so those files follow the promotion model rather than ordinary i
 
 `scripts/test.ts` owns `SERIAL_FULL_SUITE_FILES`, the shared process-isolation roster. Local
 full-suite runs, both macOS paths, and `scripts/ci/run-bun-test-batches.sh` execute those files
-alone with fresh process homes. Hosted batches assign shard membership by the per-file durations
+alone with fresh process homes, including launchd repair and standalone home/lease cases. Hosted batches assign shard membership by the per-file durations
 in `scripts/ci/test-durations.tsv` (sorted round-robin when nothing is recorded), run each shard's
 files in sorted order and split only process boundaries; every selected file still runs once.
 Ordinary macOS shards select 1/2 and 2/2 from the full file list; macOS control selects 1/1. Both
@@ -326,6 +346,8 @@ Invariants:
 - `bin/ocx.mjs` resolves the bundled binary via `require.resolve("bun/package.json")` and a size gate
   (`>= 1 MB`) that rejects the ~450-byte placeholder stub left by `--ignore-scripts`/pnpm; it then
   lazy-runs `install.js` and execs `src/cli/index.ts` under Bun, propagating exit code and signal.
+  The Windows service wrapper applies the same gate before each launch and waits on a placeholder
+  instead of executing it ([Windows service wrapper](#windows-service-wrapper-and-incomplete-updates)).
 - `package.json` carries `"trustedDependencies": ["bun"]` so `bun install` runs the dependency's
   postinstall, and `"engines": { "node": ">=18" }` (Bun is no longer a user prerequisite).
 - The plain-Node launcher owns `OPENCODEX_BUN_PATH` selection before Bun can load project dotenv and
@@ -344,7 +366,7 @@ observed at startup. Replacing that manifest under a live process fences `/healt
 stability timer; if the same new manifest identity remains readable and distinct, the timer enters the existing
 drain-and-restart handoff without waiting for another request. A temporarily unreadable manifest
 is polled until readable and then receives a fresh full stability interval, while a return to the
-startup identity cancels the pending restart. Failed restart admission retries after the same
+startup identity cancels the pending restart. The replacement spawns `process.execPath`, which an in-place npm install leaves as the `bun` package's small placeholder until its postinstall runs, so while that path fails the `REAL_BUN_MIN_BYTES` gate the restart waits the same way and then debounces afresh; meanwhile `installedVersion` stays unreported, so a manual restart is refused as unsettled. Failed restart admission retries after the same
 bounded delay. Stopping the server before the accepted restart begins vetoes it, and a service child
 restarts only while it still owns the service home. Source checkouts and standalone binaries remain outside this fence.
 
@@ -398,7 +420,11 @@ working tree and pins that wiring.
 
 The `package-standalone` job in `.github/workflows/release.yml` also builds Bun compiled
 `ocx` archives for Linux, macOS, and Windows, bundles `gui/dist`, smoke-tests `/healthz`, and
-publishes SHA-256 sidecars for the attach job.
+publishes SHA-256 sidecars for the attach job. Each archive also carries the target-matching
+`@napi-rs/keyring` native addon under `keyring/`; the macOS release installs both optional Darwin
+packages so its separate arm64 and x64 builds cannot silently reuse the hosted runner's
+architecture. Desktop preparation copies those same pinned assets into Tauri resources. The loader
+and packaged-app proof are owned by the [desktop keyring contract](../desktop-shell.md#packaged-native-keyring-binding).
 
 Opening a release starts with the `dev` pre-move. Dispatch
 `.github/workflows/dev-version-bump.yml` with the intended version, merge the pull request it opens,
@@ -570,3 +596,5 @@ Linux release bundling enables Tauri verbosity on the primary attempt so linuxde
 
 Universal macOS release builds install both aarch64-apple-darwin and x86_64-apple-darwin Rust targets. Windows builds consume the private JSON override generated by `desktop/scripts/windows-installer-config.ts`: only WiX ProductVersion uses the validated numeric public version core. Public package/application versions, tags, asset names and updater manifests retain full SemVer. The pinned Tauri MSI template permits equal-core replacement; manual MSI installation does not enforce same-core preview/stable downgrade prevention.
 The existing `codex-routing`, `codex-auth-context` and `codex-quota-prime` tests cover [priority failback](../providers/openai-accounts.md#ongoing-priority-failback), including cache-default retention, stale evidence, main fencing and failed-attempt cadence.
+
+Automatic account exhaustion and recovery use the [spendable Codex credit evidence contract](../providers/openai-tiers.md#spendable-codex-credits), including independent freshness, upstream refusal, and reset-ticket separation.

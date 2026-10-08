@@ -3,11 +3,12 @@ import { nameRoutedIdentity, repairIdentityInResponsesBody, stripRoutedIdentity 
 import { stripBracketedModelSuffix } from "../openai-chat";
 import { normalizeOpenCodeGoAdditionalTools } from "../opencode-go-additional-tools";
 import { isXaiResponsesDestination } from "../../providers/xai-transport";
+import { applyGithubCopilotContextTier } from "../../providers/github-copilot-context";
 import { Buffer } from "node:buffer";
 import type { IncomingMeta, ProviderAdapter } from "../base";
 import { namespacedToolName, type AdapterEvent, type OcxParsedRequest, type OcxProviderConfig, type OcxUsage, type TierDecision } from "../../types";
 import { applyCodexRoutingHint, CODEX_RESPONSES_LITE_HEADER, CODEX_ROUTING_HINT_HEADER } from "../../codex/forward-transport-headers";
-import { COMPACT_PROMPT, compactionItemToText, decodeCompactionSummary, isCompactionItemType } from "../../responses/compaction";
+import { COMPACT_PROMPT, compactionItemToText, decodeCompactionSummary, isCompactionItemType, transferCompactionCiphertextLease } from "../../responses/compaction";
 import { decodeServerSentEvents } from "../../lib/sse-decoder";
 import {
   CODEX_FORWARD_BASE_URL,
@@ -23,7 +24,6 @@ import { repairLegacyDottedToolCallNames } from "../../responses/legacy-dotted-t
 import { preparePlaintextV2AgentMessages } from "../../responses/plaintext-v2-agent-messages";
 import { isMetaAiResponsesDestination, rewriteMuseToolNamesForUpstream } from "../../responses/muse-tool-name-alias";
 import { openaiResponsesUrl } from "../openai-responses-url";
-import { conversationKeyFromHeaders, threadAffinityResetActive } from "../../server/ws-thread-transport";
 import { normalizeResponsesCodeMode } from "../responses-code-mode";
 import { injectXaiResponsesXSearch, normalizeXaiResponsesWebSearch } from "../xai-web-search";
 import {
@@ -33,8 +33,9 @@ import {
 } from "../xai-tool-schema";
 import {
   createAdapterTierMetadata,
+  emittedFastWire,
 } from "../../providers/fastwire";
-import { dropResponsesReasoningInputItems, mapRoutedResponsesReasoningEffort, normalizeConfiguredReasoningSummaryDelivery, sanitizeReasoningInputContent, stripDisabledReasoningSummaries, stripDisabledVerbosity, stripUnsupportedReasoningSummaryDelivery } from "./reasoning";
+import { dropResponsesReasoningInputItems, mapRoutedResponsesReasoningEffort, normalizeConfiguredReasoningSummaryDelivery, sanitizeReasoningInputContent, stripDisabledReasoningSummaries, stripDisabledVerbosity, stripNoneReasoningSummary, stripUnsupportedReasoningSummaryDelivery } from "./reasoning";
 import { scrubOcxCompactionItems, stripCanonicalOnlyToolFields, stripCanonicalOnlyTopLevelFields, stripInternalChatMessageMetadataPassthrough, stripInvalidItemIds, stripItemIdsWhenUnstored, stripRejectedSamplingParams } from "./request-strips";
 import { stripCanonicalForwardPromptCacheOptions, stripDeprecatedPromptCacheRetention } from "./prompt-cache";
 import { isPlainObject } from "./internal";
@@ -45,6 +46,7 @@ import { applyTierDecisionToResponsesBody, normalizeCanonicalForwardContinuation
 import { normalizeImageGenClientTools, preferConfiguredHostedTools } from "./image-gen";
 import { stripMuseSparkUnsupportedWebSearchFields, stripOpenAiOnlyWebSearchFields } from "./web-search";
 import { observeOutbound } from "../../usage/cache-diagnostic";
+import { normalizeForwardedClientHeaderName } from "../../lib/provider-client-headers";
 import { normalizeMuseToolChoice } from "./muse-tool-choice";
 
 /**
@@ -91,6 +93,22 @@ function applyCallerUserAgentFallback(
   if (Object.keys(headers).some(name => name.toLowerCase() === "user-agent")) return;
   const userAgent = incoming.headers.get("user-agent");
   if (userAgent) headers["User-Agent"] = userAgent;
+}
+
+/** Copy only explicitly opted-in caller metadata; provider-owned headers remain authoritative. */
+function applyConfiguredClientHeaderForwarding(
+  headers: Record<string, string>,
+  incoming: IncomingMeta,
+  provider: OcxProviderConfig,
+): void {
+  if (!Array.isArray(provider.forwardClientHeaders)) return;
+  for (const rawName of provider.forwardClientHeaders.slice(0, 64)) {
+    const name = normalizeForwardedClientHeaderName(rawName);
+    if (name === null) continue;
+    if (Object.keys(headers).some(existing => existing.toLowerCase() === name)) continue;
+    const value = incoming.headers.get(name);
+    if (value) headers[name] = value;
+  }
 }
 
 /** Replace every `input_image` part under a routed-compaction body with a short marker. */
@@ -234,19 +252,6 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
               headers[h] = v; // …so genuine forwarded fields win.
             }
           }
-          // A conversation the backend keeps serving slowly and shedding gets its routing identity
-          // re-rolled. Both per-conversation hints go: the client's window id AND the server-issued
-          // turn state (a token the backend handed back for this conversation, which the next
-          // request normally echoes). Dropping only the window id moved that conversation from
-          // 14-22s to 8.1-8.3s for about ten minutes and then it drifted back, so the second hint
-          // is dropped as well. Content, model, credential and cache prefix are untouched.
-          const affinityKey = conversationKeyFromHeaders(incoming?.headers);
-          if (affinityKey && threadAffinityResetActive(affinityKey)) {
-            for (const name of Object.keys(headers)) {
-              const lower = name.toLowerCase();
-              if (lower === "x-codex-window-id" || lower === "x-codex-turn-state") delete headers[name];
-            }
-          }
         }
         const override = runtimeProvider._codexAccountOverride;
         if (override && mayForwardCallerCredentials) {
@@ -264,8 +269,9 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
         if (provider.headers) Object.assign(headers, provider.headers);
       }
       // Some Responses-compatible gateways select their Codex compatibility path from the real
-      // client fingerprint. This is a single non-credential fallback, not broader caller-header
-      // forwarding. Static provider headers remain authoritative in either auth mode.
+      // client fingerprint. Additional caller metadata is opt-in; static provider headers remain
+      // authoritative in either auth mode.
+      applyConfiguredClientHeaderForwarding(headers, incoming, provider);
       applyCallerUserAgentFallback(headers, incoming);
 
       const forward = provider.authMode === "forward";
@@ -365,6 +371,7 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
         outBody = repairOversizedReplayCallIds(outBody);
       }
       outBody = stripUnsupportedReasoningSummaryDelivery(outBody, parsed.modelId);
+      outBody = stripNoneReasoningSummary(outBody);
       // #4587: on a bridged provider, hand the destination back the search call and result the
       // proxy executed on its behalf, in place of the hosted cell the caller replays. Scoped to
       // its exact conversation and serving identity and recorded by the bridge itself, so a
@@ -385,7 +392,9 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
       // OpenAI model inheriting history a routed provider had damaged.
       outBody = repairLegacyDottedToolCallNames(outBody);
       if (!isCanonicalOpenAiForwardProvider(provider)) {
-        outBody = stripInternalChatMessageMetadataPassthrough(outBody);
+        if (provider.preserveResponsesMessageMetadata !== true) {
+          outBody = stripInternalChatMessageMetadataPassthrough(outBody);
+        }
         // The same class of private field, one level up, but keyed on the DESTINATION rather than
         // on the canonical surface alone. `src/server/responses/compact.ts` spreads the caller's
         // raw body into the native `/responses/compact` request without passing through this
@@ -497,6 +506,7 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
             ),
           ),
           isXaiResponsesDestination(provider),
+          provider.preserveResponsesInputItemIds === true,
         ),
         isXaiSchemaTarget(provider),
       );
@@ -522,6 +532,16 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
         const originalChoice = isPlainObject(parsed._rawBody) ? parsed._rawBody.tool_choice : undefined;
         finalBody = normalizeMuseToolChoice(finalBody, originalChoice);
       }
+      // The canonical ChatGPT Codex endpoint is SSE-only even though the public Responses surface
+      // permits an omitted/false `stream`. Keep the client's delivery preference on `parsed.stream`
+      // and coerce only this final upstream copy; passthrough delivery folds the terminal stream
+      // back into JSON for that client. `store` is intentionally untouched here because explicit
+      // caller storage semantics are independent of the transport required by the destination.
+      if (isCanonicalOpenAiForwardProvider(provider)
+        && isPlainObject(finalBody)
+        && finalBody.stream !== true) {
+        finalBody = { ...finalBody, stream: true };
+      }
       if (isCanonicalOpenAiForwardProvider(provider)) {
         const routingHeaders = new Headers(headers);
         applyCodexRoutingHint(routingHeaders, finalBody);
@@ -533,14 +553,10 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
         const hint = routingHeaders.get(CODEX_ROUTING_HINT_HEADER);
         if (hint !== null) headers[CODEX_ROUTING_HINT_HEADER] = hint;
       }
-      const actualServiceTier = isPlainObject(finalBody) && typeof finalBody.service_tier === "string"
-        ? finalBody.service_tier
-        : null;
       const tierLog = createAdapterTierMetadata(
         parsed.options?.tierObservation,
         parsed.options?.tierDecision,
-        actualServiceTier === null ? null : "service-tier",
-        actualServiceTier,
+        ...emittedFastWire(parsed, finalBody),
       );
       // The Responses adapter is passthrough: it forwards `parsed._rawBody` rather than
       // rebuilding the body from `parsed.modelId`, and the router writes the routed id into
@@ -552,7 +568,7 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
       if (!isCanonicalOpenAiForwardProvider(provider)) {
         validateFinalCustomToolCompatibility(finalBody, provider.supportsResponsesCustomTools);
       }
-      const body = JSON.stringify(finalBody);
+      const body = JSON.stringify(applyGithubCopilotContextTier(finalBody, provider, parsed.modelId, incoming.providerName));
       const releaseBodyObservation = translatorBudget.observeExternallyCapped(
         "passthrough_serialization",
         Buffer.byteLength(body, "utf8"),
@@ -595,112 +611,121 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
       let compactionEncryptedContent: string | undefined;
       let compactionEncryptedContentBytes = 0;
       let completedSeen = false;
-      for await (const event of decodeServerSentEvents(response.body, { translatorBudget: budget })) {
-        let payload: unknown;
-        try { payload = JSON.parse(event.data); } catch { continue; }
-        if (!isPlainObject(payload)) continue;
-        switch (payload.type) {
-          case "response.output_text.delta":
-            if (typeof payload.delta === "string") {
-              const next = deltas + payload.delta;
-              const nextBytes = appendedUtf8Bytes(deltasBytes, deltasLastCodeUnit, payload.delta);
-              const reservation = budget.reserveTransient(nextBytes, { kind: "retained_collectors" });
-              deltas = next;
-              reservation.commitRetained();
-              budget.releaseRetained(deltasBytes, { kind: "retained_collectors" });
-              deltasBytes = nextBytes;
-              if (payload.delta.length > 0) deltasLastCodeUnit = payload.delta.charCodeAt(payload.delta.length - 1);
-            }
-            break;
-          case "response.output_text.done":
-            if (typeof payload.text === "string") {
-              const next = doneText + payload.text;
-              const nextBytes = appendedUtf8Bytes(doneTextBytes, doneTextLastCodeUnit, payload.text);
-              const reservation = budget.reserveTransient(nextBytes, { kind: "retained_collectors" });
-              doneText = next;
-              reservation.commitRetained();
-              budget.releaseRetained(doneTextBytes, { kind: "retained_collectors" });
-              doneTextBytes = nextBytes;
-              if (payload.text.length > 0) doneTextLastCodeUnit = payload.text.charCodeAt(payload.text.length - 1);
-            }
-            break;
-          case "response.failed":
-          case "error":
-            yield { type: "error", message: responsesErrorMessage(payload.response ?? payload) };
-            return;
-          case "response.incomplete":
-            yield { type: "incomplete", reason: responsesErrorMessage(payload.response ?? payload) };
-            return;
-          case "response.completed":
-            {
-              completedSeen = true;
-              const responsePayload = isPlainObject(payload.response) ? payload.response : undefined;
-              const output = Array.isArray(responsePayload?.output) ? responsePayload.output : [];
-              const compaction = output.find(item => isPlainObject(item) && item.type === "compaction");
-              if (isPlainObject(compaction) && typeof compaction.encrypted_content === "string") {
-                const nextEncryptedContent = compaction.encrypted_content;
-                const nextEncryptedContentBytes = Buffer.byteLength(nextEncryptedContent, "utf8");
-                const reservation = budget.reserveTransient(nextEncryptedContentBytes, { kind: "retained_collectors" });
-                compactionEncryptedContent = nextEncryptedContent;
+      let ciphertextTransferred = false;
+      try {
+        for await (const event of decodeServerSentEvents(response.body, { translatorBudget: budget })) {
+          let payload: unknown;
+          try { payload = JSON.parse(event.data); } catch { continue; }
+          if (!isPlainObject(payload)) continue;
+          switch (payload.type) {
+            case "response.output_text.delta":
+              if (typeof payload.delta === "string") {
+                const next = deltas + payload.delta;
+                const nextBytes = appendedUtf8Bytes(deltasBytes, deltasLastCodeUnit, payload.delta);
+                const reservation = budget.reserveTransient(nextBytes, { kind: "retained_collectors" });
+                deltas = next;
                 reservation.commitRetained();
-                budget.releaseRetained(compactionEncryptedContentBytes, { kind: "retained_collectors" });
-                compactionEncryptedContentBytes = nextEncryptedContentBytes;
+                budget.releaseRetained(deltasBytes, { kind: "retained_collectors" });
+                deltasBytes = nextBytes;
+                if (payload.delta.length > 0) deltasLastCodeUnit = payload.delta.charCodeAt(payload.delta.length - 1);
               }
-              const next = responsesPayloadText(payload.response);
-              const nextBytes = Buffer.byteLength(next, "utf8");
-              const reservation = budget.reserveTransient(nextBytes, { kind: "retained_collectors" });
-              snapshot = next;
-              reservation.commitRetained();
-              budget.releaseRetained(snapshotBytes, { kind: "retained_collectors" });
-              snapshotBytes = nextBytes;
-            }
-            {
-              const nextUsage = usageFromResponsesPayload(payload.response);
-              // The attached raw usage object can be event-sized (unknown keys carry arbitrary
-              // values); it stays reachable until the terminal yields, so charge it like the
-              // adjacent retained collectors or it would defeat the per-request memory cap.
-              const nextRawBytes = nextUsage?.rawUsage === undefined ? 0
-                : Buffer.byteLength(JSON.stringify(nextUsage.rawUsage), "utf8");
-              if (nextRawBytes > 0) {
-                const reservation = budget.reserveTransient(nextRawBytes, { kind: "retained_collectors" });
-                usage = nextUsage;
+              break;
+            case "response.output_text.done":
+              if (typeof payload.text === "string") {
+                const next = doneText + payload.text;
+                const nextBytes = appendedUtf8Bytes(doneTextBytes, doneTextLastCodeUnit, payload.text);
+                const reservation = budget.reserveTransient(nextBytes, { kind: "retained_collectors" });
+                doneText = next;
                 reservation.commitRetained();
-              } else {
-                usage = nextUsage;
+                budget.releaseRetained(doneTextBytes, { kind: "retained_collectors" });
+                doneTextBytes = nextBytes;
+                if (payload.text.length > 0) doneTextLastCodeUnit = payload.text.charCodeAt(payload.text.length - 1);
               }
-              if (usageRawBytes > 0) {
-                budget.releaseRetained(usageRawBytes, { kind: "retained_collectors" });
+              break;
+            case "response.failed":
+            case "error":
+              yield { type: "error", message: responsesErrorMessage(payload.response ?? payload) };
+              return;
+            case "response.incomplete":
+              yield { type: "incomplete", reason: responsesErrorMessage(payload.response ?? payload) };
+              return;
+            case "response.completed":
+              {
+                completedSeen = true;
+                const responsePayload = isPlainObject(payload.response) ? payload.response : undefined;
+                const output = Array.isArray(responsePayload?.output) ? responsePayload.output : [];
+                const compaction = output.find(item => isPlainObject(item) && item.type === "compaction");
+                if (isPlainObject(compaction) && typeof compaction.encrypted_content === "string") {
+                  const nextEncryptedContent = compaction.encrypted_content;
+                  const nextEncryptedContentBytes = Buffer.byteLength(nextEncryptedContent, "utf8");
+                  const reservation = budget.reserveTransient(nextEncryptedContentBytes, { kind: "retained_collectors" });
+                  compactionEncryptedContent = nextEncryptedContent;
+                  reservation.commitRetained();
+                  budget.releaseRetained(compactionEncryptedContentBytes, { kind: "retained_collectors" });
+                  compactionEncryptedContentBytes = nextEncryptedContentBytes;
+                }
+                const next = responsesPayloadText(payload.response);
+                const nextBytes = Buffer.byteLength(next, "utf8");
+                const reservation = budget.reserveTransient(nextBytes, { kind: "retained_collectors" });
+                snapshot = next;
+                reservation.commitRetained();
+                budget.releaseRetained(snapshotBytes, { kind: "retained_collectors" });
+                snapshotBytes = nextBytes;
               }
-              usageRawBytes = nextRawBytes;
-            }
-            break;
+              {
+                const nextUsage = usageFromResponsesPayload(payload.response);
+                // The attached raw usage object can be event-sized (unknown keys carry arbitrary
+                // values); it stays reachable until the terminal yields, so charge it like the
+                // adjacent retained collectors or it would defeat the per-request memory cap.
+                const nextRawBytes = nextUsage?.rawUsage === undefined ? 0
+                  : Buffer.byteLength(JSON.stringify(nextUsage.rawUsage), "utf8");
+                if (nextRawBytes > 0) {
+                  const reservation = budget.reserveTransient(nextRawBytes, { kind: "retained_collectors" });
+                  usage = nextUsage;
+                  reservation.commitRetained();
+                } else {
+                  usage = nextUsage;
+                }
+                if (usageRawBytes > 0) {
+                  budget.releaseRetained(usageRawBytes, { kind: "retained_collectors" });
+                }
+                usageRawBytes = nextRawBytes;
+              }
+              break;
+          }
+          // Buffered text is still upstream progress, but gateway keepalives are not.
+          // Yield after accounting, directly to the consumer: no progress queue or content leak.
+          if (
+            !completedSeen
+            && (payload.type === "response.output_text.delta"
+              || payload.type === "response.reasoning_summary_text.delta"
+              || payload.type === "response.reasoning_text.delta")
+            && typeof payload.delta === "string"
+            && payload.delta.length > 0
+          ) {
+            yield { type: "heartbeat" };
+          }
         }
-        // Buffered text is still upstream progress, but gateway keepalives are not.
-        // Yield after accounting, directly to the consumer: no progress queue or content leak.
-        if (
-          !completedSeen
-          && (payload.type === "response.output_text.delta"
-            || payload.type === "response.reasoning_summary_text.delta"
-            || payload.type === "response.reasoning_text.delta")
-          && typeof payload.delta === "string"
-          && payload.delta.length > 0
-        ) {
-          yield { type: "heartbeat" };
-        }
+        // Gateways differ in which of these they emit; prefer the authoritative
+        // completed snapshot so text is never double-counted.
+        const text = snapshot || doneText || deltas;
+        if (text) yield { type: "text_delta", text };
+        const done: AdapterEvent = {
+          type: "done",
+          ...(usage ? { usage } : {}),
+          ...(compactionEncryptedContent ? { compactionEncryptedContent } : {}),
+        };
+        // Exact event ownership survives buffered collection without charging a second copy.
+        transferCompactionCiphertextLease(done, budget, compactionEncryptedContentBytes);
+        ciphertextTransferred = true;
+        yield done;
+      } finally {
+        budget.releaseRetained(
+          deltasBytes + doneTextBytes + snapshotBytes + usageRawBytes
+            + (ciphertextTransferred ? 0 : compactionEncryptedContentBytes),
+          { kind: "retained_collectors" },
+        );
       }
-      // Gateways differ in which of these they emit; prefer the authoritative
-      // completed snapshot so text is never double-counted.
-      const text = snapshot || doneText || deltas;
-      if (text) yield { type: "text_delta", text };
-      budget.releaseRetained(
-        deltasBytes + doneTextBytes + snapshotBytes + usageRawBytes,
-        { kind: "retained_collectors" },
-      );
-      yield {
-        type: "done",
-        ...(usage ? { usage } : {}),
-        ...(compactionEncryptedContent ? { compactionEncryptedContent } : {}),
-      };
     },
 
     async parseResponse(response: Response, budget: TranslatorBudget): Promise<AdapterEvent[]> {

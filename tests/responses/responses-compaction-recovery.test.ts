@@ -4,6 +4,8 @@ import { getDefaultConfig } from "../../src/config";
 import { handleResponses, handleResponsesCompact } from "../../src/server/responses";
 import { runWithCompactionRecovery } from "../../src/server/responses/compaction-recovery";
 import { decodeCompactionSummary } from "../../src/responses/compaction";
+import { COMPACTION_IMAGE_NOTE } from "../../src/responses/compaction-images";
+import * as visionModule from "../../src/vision";
 import { createRequestExecutionBudget } from "../../src/lib/request-execution-budget";
 import { createTranslatorBudget } from "../../src/lib/translator-budget";
 import { jsonUtf8Bytes } from "../../src/lib/json-byte-size";
@@ -97,6 +99,64 @@ afterEach(() => {
 });
 
 describe("routed compaction emergency integration", () => {
+  test("text-only compaction projects historical images before the strip step", async () => {
+    sourceEvents = [{ type: "text_delta", text: "Keep the chart result." }, { type: "done" }];
+    const config = settings();
+    config.providers.source!.noVisionModels = ["swe-2"];
+    const oldImage = "data:image/png;base64,OLD_STRIP_FIXTURE";
+    const pendingImage = "data:image/png;base64,PENDING_STRIP_FIXTURE";
+    const payload = { ...body(), input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "Original chart" }, { type: "input_image", image_url: oldImage }] },
+      { type: "message", role: "assistant", phase: "final_answer", content: [{ type: "output_text", text: "Chart total: 42." }] },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "New chart" }, { type: "input_image", image_url: pendingImage }] },
+      { type: "compaction_trigger" },
+    ] };
+    const originalStrip = visionModule.stripImagesInPlace;
+    const atStrip: Array<{ messages: string; raw: string }> = [];
+    const strip = spyOn(visionModule, "stripImagesInPlace").mockImplementation((parsed, budget) => {
+      atStrip.push({ messages: JSON.stringify(parsed.context.messages), raw: JSON.stringify(parsed._rawBody) });
+      return originalStrip(parsed, budget);
+    });
+    try {
+      const response = await handleResponses(request(payload), config, { model: "", provider: "" });
+      expect(response.ok).toBe(true);
+      await response.text();
+      expect(atStrip).toHaveLength(1);
+      expect(atStrip[0]!.messages).not.toContain(oldImage);
+      expect(atStrip[0]!.messages).toContain(COMPACTION_IMAGE_NOTE);
+      expect(atStrip[0]!.messages).toContain(pendingImage);
+      expect(atStrip[0]!.raw).toContain(oldImage);
+      expect(JSON.stringify(payload)).toContain(oldImage);
+      expect(JSON.stringify(calls[0]!.parsed.context.messages)).toContain(COMPACTION_IMAGE_NOTE);
+    } finally {
+      strip.mockRestore();
+    }
+  });
+
+  test.each(["v1", "v2", "normal"])("historical image projection is compact-only (%s)", async mode => {
+    sourceEvents = [{ type: "text_delta", text: "Preserve chart total 42 and source references." }, { type: "done" }];
+    const oldImage = "data:image/png;base64,OLD_FIXTURE";
+    const pendingImage = "data:image/png;base64,PENDING_FIXTURE";
+    const payload = { ...body(false, mode === "v2"), input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "Source /fixtures/chart.png" }, { type: "input_image", image_url: oldImage }] },
+      { type: "message", role: "assistant", phase: "final_answer", content: [{ type: "output_text", text: "Chart total: 42." }] },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "Pending image /fixtures/new.png" }, { type: "input_image", image_url: pendingImage }] },
+      ...(mode === "v2" ? [{ type: "compaction_trigger" }] : []),
+    ] };
+    const response = mode === "v1"
+      ? await handleResponsesCompact(request(payload, "responses/compact"), settings(), { model: "", provider: "" })
+      : await handleResponses(request(payload), settings(), { model: "", provider: "" });
+    expect(response.ok).toBe(true);
+    await response.text();
+    expect(calls).toHaveLength(1);
+    const sent = JSON.stringify(calls[0]!.parsed.context.messages);
+    expect(sent.includes(oldImage)).toBe(mode === "normal");
+    expect(sent).toContain(pendingImage);
+    expect(sent).toContain("Chart total: 42.");
+    expect(sent).toContain("Source /fixtures/chart.png");
+    expect(JSON.stringify(calls[0]!.parsed._rawBody)).toContain(oldImage);
+  });
+
   test("source success and ordinary requests never use the emergency model", async () => {
     sourceEvents = [{ type: "text_delta", text: "Source summary" }, { type: "done" }];
     for (const compact of [true, false]) {
@@ -368,5 +428,37 @@ describe("routed compaction emergency integration", () => {
     await response.text();
     expect(urls).toEqual(["https://api.openai.com/v1/responses/compact"]);
     expect(calls).toHaveLength(0);
+  });
+});
+
+
+describe("emergency compaction provider allowance matrix", () => {
+  // Independent expected counts: attempts 1/2/3 across shared caps 2/3/4.
+  test.each([
+    [1, 2, false, 1], [1, 3, false, 1], [1, 4, false, 1],
+    [2, 2, false, 1], [2, 3, false, 2], [2, 4, false, 2],
+    [3, 2, false, 1], [3, 3, false, 2], [3, 4, false, 3],
+    [1, 2, true, 1], [1, 3, true, 1], [1, 4, true, 1],
+    [2, 2, true, 1], [2, 3, true, 2], [2, 4, true, 2],
+    [3, 2, true, 1], [3, 3, true, 2], [3, 4, true, 3],
+  ] as const)("attempts=%s shared cap=%s reset policy=%s allows %s emergency sends", async (attempts, sharedCap, resetPolicy, expectedEmergencySends) => {
+    const config = settings();
+    config.providers.emergency = {
+      adapter: "openai-chat", authMode: "key", apiKey: "fixture-only", baseUrl: "https://emergency.example/v1",
+      transientRetryOn5xx: { attempts }, ...(resetPolicy ? { retryOnReset: {} } : {}),
+    };
+    let emergencyRequests = 0;
+    globalThis.fetch = (async () => {
+      emergencyRequests++;
+      return Response.json({ error: { code: "server_error", message: "Emergency unavailable" } }, { status: 500 });
+    }) as typeof fetch;
+    const budget = createRequestExecutionBudget({ maxTotalModelSends: sharedCap, baseSendAllowance: sharedCap, finalRecoveryAllowance: 0, maxAlternateTargetSends: 1, maxTargetTransitions: 1 });
+    const response = await handleResponses(request(), config, { model: "", provider: "" }, { sendBudget: budget });
+    expect(response.status).toBe(400);
+    expect(await response.text()).toContain("Source rejected compact fixture");
+    expect(calls.map(call => call.model)).toEqual(["swe-2"]);
+    expect(emergencyRequests).toBe(expectedEmergencySends);
+    expect(budget.used).toBe(1 + emergencyRequests);
+    expect(budget.used).toBeLessThanOrEqual(sharedCap);
   });
 });

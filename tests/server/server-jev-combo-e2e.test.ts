@@ -9,7 +9,10 @@ import { createTranslatorBudget } from "../../src/lib/translator-budget";
 import { executeComboResponses } from "../../src/server/responses/core-combo";
 import type { ResponsesDispatchers } from "../../src/server/responses/core-options";
 import type { RequestLogContext } from "../../src/server/request-log";
+import { handleManagementAPI } from "../../src/server/management-api";
 import type { OcxConfig, OcxProviderConfig } from "../../src/types";
+import { catalogConvergenceFactory } from "../helpers/catalog-convergence";
+import { ManagementRequest } from "../helpers/management-auth";
 
 const JEV_URL = "https://api.typesafe.ai/v1/systemone";
 const targetRows = [
@@ -175,9 +178,82 @@ describe("JEV Combo runtime", () => {
       selected: { provider: "sol", model: "gpt-5.6-sol", effort: "high" },
       gate: "apply",
       latencyMs: expect.any(Number),
+      backend: "typesafe",
       confidence: 0.8,
       usage: { inputTokens: 11, outputTokens: 2, totalTokens: 13 },
     });
+  });
+
+  test.each(["xhigh", "low", "high"])("records caller high and JEV's forced %s on the request and attempt", async forced => {
+    const config = makeConfig({ jevFetch: choiceFetch(`sol/gpt-5.6-sol:${forced}`) });
+    const parentLog: RequestLogContext = { model: "", provider: "" };
+    const childBodies: Record<string, unknown>[] = [];
+
+    const response = await execute(config, (body, childLog) => {
+      childBodies.push(body);
+      childLog.requestedEffort = (body.reasoning as { effort: string }).effort;
+      return success(String(body.model));
+    }, { reasoning: { effort: "high", summary: "auto" } }, undefined, parentLog);
+
+    expect(response.status).toBe(200);
+    expect(childBodies).toEqual([expect.objectContaining({ reasoning: { effort: forced, summary: "auto" } })]);
+    const expected = forced === "high" ? "high" : `high->${forced}`;
+    expect(parentLog.requestedEffort).toBe(expected);
+    expect(parentLog.attempts).toHaveLength(1);
+    expect(parentLog.attempts![0]!.requestedEffort).toBe(expected);
+  });
+
+  test("preserves a later child effort transition after JEV's forced effort", async () => {
+    const config = makeConfig({ jevFetch: choiceFetch("sol/gpt-5.6-sol:xhigh") });
+    const parentLog: RequestLogContext = { model: "", provider: "" };
+
+    const response = await execute(config, (body, childLog) => {
+      expect(body.reasoning).toMatchObject({ effort: "xhigh" });
+      childLog.requestedEffort = "xhigh->medium->low";
+      return success(String(body.model));
+    }, { reasoning: { effort: "high" } }, undefined, parentLog);
+
+    expect(response.status).toBe(200);
+    expect(parentLog.requestedEffort).toBe("high->xhigh->medium->low");
+    expect(parentLog.attempts![0]!.requestedEffort).toBe("high->xhigh->medium->low");
+  });
+
+  test("keeps JEV's forced effort on the failed attempt without leaking it into fallback", async () => {
+    const config = makeConfig({ jevFetch: choiceFetch("sol/gpt-5.6-sol:low") });
+    const parentLog: RequestLogContext = { model: "", provider: "" };
+    const efforts: string[] = [];
+
+    const response = await execute(config, (body, childLog) => {
+      const effort = (body.reasoning as { effort: string }).effort;
+      efforts.push(effort);
+      childLog.requestedEffort = effort;
+      return String(body.model).startsWith("sol/")
+        ? Response.json({ error: { message: "temporary outage" } }, { status: 503 })
+        : success(String(body.model));
+    }, { reasoning: { effort: "high" } }, undefined, parentLog);
+
+    expect(response.status).toBe(200);
+    expect(efforts).toEqual(["low", "high"]);
+    expect(parentLog.requestedEffort).toBe("high");
+    expect(parentLog.attempts?.map(attempt => attempt.requestedEffort)).toEqual(["high->low", "high"]);
+  });
+
+  test("retains today's label when the JEV target has no effort control", async () => {
+    const config = makeConfig({
+      jevFetch: choiceFetch("sol/gpt-5.6-sol:none"),
+      providerOverrides: { sol: { modelReasoningEfforts: { "gpt-5.6-sol": [] } } },
+    });
+    const parentLog: RequestLogContext = { model: "", provider: "" };
+
+    const response = await execute(config, (body, childLog) => {
+      expect(body.reasoning).toEqual({ summary: "auto" });
+      childLog.requestedEffort = undefined;
+      return success(String(body.model));
+    }, { reasoning: { effort: "high", summary: "auto" } }, undefined, parentLog);
+
+    expect(response.status).toBe(200);
+    expect(parentLog.requestedEffort).toBe("high");
+    expect(parentLog.attempts![0]!.requestedEffort).toBe("high");
   });
 
   test("routes the initial call to JEV's allowlisted target and keeps direct/catalog rows", async () => {
@@ -491,6 +567,92 @@ describe("JEV Combo runtime", () => {
     expect(childBodies[0]).not.toHaveProperty("reasoning_effort");
     expect(childBodies[0]).not.toHaveProperty("thinking_budget");
     expect(childBodies[0]).not.toHaveProperty("thinking");
+  });
+
+  test("routes through a self-hosted decision service on loopback without any TypeSafe credential", async () => {
+    process.env.TYPESAFE_API_KEY = "env-typesafe-secret";
+    process.env.JEV_API_KEY = "env-jev-secret";
+    const seen: Array<{ path: string; authorization: string | null; body: Record<string, unknown> }> = [];
+    const decisionServer = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        const body = await request.json() as Record<string, unknown>;
+        seen.push({ path: new URL(request.url).pathname, authorization: request.headers.get("authorization"), body });
+        const criteria = (body.questions as { route: { criteria: Record<string, unknown> } }).route.criteria;
+        const choice = Object.keys(criteria).includes("luna/gpt-5.6-luna:low") ? "luna/gpt-5.6-luna:low" : Object.keys(criteria)[0]!;
+        const probabilities = Object.fromEntries(Object.keys(criteria).map(key => [key, key === choice ? 1 : 0]));
+        return Response.json({
+          model: body.model,
+          answers: { route: { type: "choice", choice, probabilities, confidence: 0.9 } },
+          usage: { input_tokens: 444, output_tokens: 1 },
+        });
+      },
+    });
+    try {
+      const config = makeConfig();
+      config.providers["ollama-tev1"] = {
+        adapter: "jev-decision",
+        baseUrl: `http://127.0.0.1:${decisionServer.port}/v1/systemone`,
+        allowPrivateNetwork: true,
+        defaultModel: "tev1:4b",
+        liveModels: false,
+      };
+      config.combos!.auto!.decisionProvider = "ollama-tev1";
+      const childBodies: Record<string, unknown>[] = [];
+      const parentLogCtx: RequestLogContext = { model: "", provider: "" };
+
+      const response = await execute(config, body => {
+        childBodies.push(body);
+        return success(String(body.model));
+      }, {}, undefined, parentLogCtx);
+
+      expect(response.status).toBe(200);
+      expect(childBodies).toEqual([expect.objectContaining({
+        model: "luna/gpt-5.6-luna",
+        reasoning: expect.objectContaining({ effort: "low" }),
+      })]);
+      expect(parentLogCtx.jevDecision).toMatchObject({
+        selected: { provider: "luna", model: "gpt-5.6-luna", effort: "low" },
+        gate: "apply",
+        chosenProbability: 1,
+      });
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.path).toBe("/v1/systemone");
+      expect(seen[0]!.authorization).toBeNull();
+      expect(seen[0]!.body.model).toBe("tev1:4b");
+      const criteria = (seen[0]!.body.questions as { route: { criteria: Record<string, unknown> } }).route.criteria;
+      expect(Object.values(criteria).every(value => typeof value === "string")).toBeTrue();
+      expect(JSON.stringify(seen)).not.toContain("secret");
+
+      // The management connection test uses the same row and reports it without TypeSafe wording.
+      const probeRequest = new ManagementRequest("http://localhost/api/providers/test?name=ollama-tev1", { method: "POST" });
+      const probe = await handleManagementAPI(probeRequest, new URL(probeRequest.url), config, {
+        createManagementConvergeCodex: catalogConvergenceFactory(),
+      });
+      expect(await probe!.json()).toEqual({
+        ok: true,
+        latencyMs: expect.any(Number),
+        message: "Connected. JEV decision service answered a decision probe.",
+      });
+      expect(seen).toHaveLength(2);
+
+      // Without its own private-network opt-in the loopback row is refused before any send.
+      config.providers["ollama-tev1"]!.allowPrivateNetwork = false;
+      const refusedLogCtx: RequestLogContext = { model: "", provider: "" };
+      const refused = await execute(config, body => success(String(body.model)), {}, undefined, refusedLogCtx);
+      expect(refused.status).toBe(200);
+      expect(refusedLogCtx.jevDecision).toMatchObject({ selected: { provider: "astra" }, gate: "network" });
+      expect(seen).toHaveLength(2);
+
+      // A decision service is never published as a routable catalog model.
+      config.providers["ollama-tev1"]!.allowPrivateNetwork = true;
+      const models = await gatherRoutedModels(config);
+      expect(models.some(model => model.provider === "ollama-tev1")).toBeFalse();
+      expect(seen).toHaveLength(2);
+    } finally {
+      decisionServer.stop(true);
+    }
   });
 
   test("returns 499 without dispatching a model when the caller aborts during JEV", async () => {

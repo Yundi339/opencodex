@@ -1,9 +1,7 @@
-import { modelCapabilitiesConfigError, mergeModelCapabilities } from "../../config/provider-validation";
+import { contextTierRecordConfigError, modelCapabilitiesConfigError, mergeModelCapabilities } from "../../config/provider-validation";
 import { DECLARABLE_HOSTED_TOOL_TYPES } from "../../responses/hosted-tool-policy";
 import { randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import type { CatalogModel } from "../../codex/catalog";
 import { catalogModelSlug, invalidateCodexModelsCache, nativeModelRows, uniqueCatalogModelsForPublicList } from "../../codex/catalog";
@@ -76,9 +74,8 @@ import { clearAccountQuotaCache, clearProviderQuotaCache, fetchProviderQuotaRepo
 import { getCachedProviderRoutingQuota } from "../../providers/quota-routing-cache";
 import { PROVIDER_QUOTA_MAX_AGE_MS, type ProviderRoutingQuota } from "../../providers/quota-types";
 import { cachedProviderQuotaIsExhausted } from "../../combos/resolve";
-import { resolveJevDecision } from "../../combos/jev";
-import { providerCapacityHold } from "../../combos/failover";
-import { getConfigDir } from "../../config/paths";
+import { probeJevDecisionProvider } from "../../combos/jev";
+import { comboDependsOnProviderRoute } from "./decision-model-validation";
 import { clearKeyCooldowns, forgetApiKeyRotationCursor } from "../../providers/key-failover";
 import { providerRequestPacingStatus } from "../../providers/request-pacing";
 import { CODEX_FORWARD_BASE_URL, isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
@@ -141,6 +138,7 @@ import { isPlainRecord, parseDebugLogQuery, tokPerSecondResult, unavailableCostR
 import type { MetricUnavailableReason, TokPerSecondResult, CostEstimateReason, CostResult, MetricSource } from "./shared";
 import type { ManagementContext } from "./context";
 import { readManagementJsonBody, rethrowManagementBodyTooLarge } from "./body";
+import { providerTlsProfileDiagnostic } from "../../lib/provider-tls-profile";
 
 type ProviderPatchApplication =
   | { error: string }
@@ -249,7 +247,7 @@ function providerEditorCandidate(
 
   for (const name of removedProviders) {
     const dependentCombos = Object.entries(persisted.combos ?? {})
-      .filter(([, combo]) => combo.targets.some(target => target.provider === name))
+      .filter(([, combo]) => comboDependsOnProviderRoute(persisted, combo, name))
       .map(([id]) => id)
       .sort((a, b) => a.localeCompare(b));
     if (dependentCombos.length > 0) {
@@ -532,6 +530,13 @@ function applyProviderPatchFields(
     const capabilities = mergeModelCapabilities(next.modelCapabilities, rawBody.modelCapabilities);
     if (capabilities === undefined) delete next.modelCapabilities;
     else next.modelCapabilities = capabilities;
+    touched = true;
+  }
+  if (Object.hasOwn(rawBody, "modelContextTiers")) {
+    const error = contextTierRecordConfigError(rawBody.modelContextTiers, true);
+    if (error) return { error };
+    if (rawBody.modelContextTiers === null) delete next.modelContextTiers;
+    else next.modelContextTiers = Object.assign(Object.create(null), next.modelContextTiers ?? {}, rawBody.modelContextTiers);
     touched = true;
   }
   if (Object.hasOwn(rawBody, "modelContextWindows")) {
@@ -859,158 +864,6 @@ function canonicalOpenAiBudgetPatchError(
     ?? providerEmptyToolOutputConfigError("openai", applied.next);
 }
 
-const PANEL_QUOTA_SOURCE_PREFIX = "panel:";
-
-/**
- * How old the exported panel file may be before its rows are hidden, and when to re-run it.
- *
- * Routing keeps the strict 30-minute window (see quota-routing-cache); DISPLAY does not, because
- * hiding the entire panel -- availability, plan windows, multipliers -- just because nobody ran a
- * 20-second exporter in the last half hour reads as "the feature disappeared". Rows are shown with
- * their age, and a stale file is refreshed in the background on the next look.
- */
-const PANEL_QUOTA_DISPLAY_MAX_AGE_MS = 6 * 60 * 60_000;
-const PANEL_QUOTA_REFRESH_AFTER_MS = 15 * 60_000;
-
-/** The panel exporter, run when the operator presses "refresh all quotas". */
-const PANEL_QUOTA_EXPORT_TIMEOUT_MS = 90_000;
-let panelQuotaExportFlight: Promise<PanelQuotaRefresh> | null = null;
-
-interface PanelQuotaRefresh {
-  ok: boolean;
-  ms: number;
-  error?: string;
-}
-
-/**
- * Re-run the panel exporter so the refresh button refreshes THESE rows too.
- *
- * The rows come from a file rather than from a probe, so without this the button would only
- * refresh the Codex pool and leave the panel numbers (and their 30-minute freshness window)
- * frozen. Concurrent refreshes share one flight; a failure keeps the previous file, and the
- * outcome is reported back so the operator sees why nothing moved.
- */
-function refreshPanelQuotaRows(): Promise<PanelQuotaRefresh> {
-  if (panelQuotaExportFlight) return panelQuotaExportFlight;
-  const started = Date.now();
-  const script = join(getConfigDir(), "tools", "quota-report.py");
-  if (!existsSync(script)) {
-    return Promise.resolve({ ok: false, ms: 0, error: "未找到 " + script });
-  }
-  const python = process.env["OCX_PANEL_QUOTA_PYTHON"]?.trim() || "python3";
-  panelQuotaExportFlight = new Promise<PanelQuotaRefresh>(resolve => {
-    execFile(python, [script, "--export"], { timeout: PANEL_QUOTA_EXPORT_TIMEOUT_MS }, error => {
-      const outcome: PanelQuotaRefresh = { ok: !error, ms: Date.now() - started };
-      if (error) outcome.error = String(error.message || error).slice(0, 200);
-      resolve(outcome);
-    });
-  }).finally(() => { panelQuotaExportFlight = null; });
-  return panelQuotaExportFlight;
-}
-
-/**
- * Quota rows derived from relay panels, written by `ocxquota --export`.
- *
- * The probe pipeline only understands the Codex account pool, so the plan state of the relay
- * sites that actually serve these combos never appeared in the report. Their numbers are merged
- * in as their own rows. Note the deliberate boundary: a panel window that stops service is a
- * BILLING rule, shown for the operator to act on -- it is NOT fed into the routing cache, so the
- * panel informs routing without silently gating it.
- */
-function panelQuotaRows(config: OcxConfig, now: number): Array<Record<string, unknown>> {
-  let payload: unknown;
-  try {
-    payload = JSON.parse(readFileSync(join(getConfigDir(), "provider-quota.json"), "utf8"));
-  } catch {
-    return [];
-  }
-  if (!payload || typeof payload !== "object") return [];
-  const generatedAt = (payload as { generatedAt?: unknown }).generatedAt;
-  if (typeof generatedAt !== "number") return [];
-  const ageMs = now - generatedAt;
-  if (ageMs > PANEL_QUOTA_DISPLAY_MAX_AGE_MS) return [];
-  if (ageMs > PANEL_QUOTA_REFRESH_AFTER_MS) void refreshPanelQuotaRows();
-  const providers = (payload as { providers?: unknown }).providers;
-  if (!providers || typeof providers !== "object") return [];
-  const rows: Array<Record<string, unknown>> = [];
-  for (const [name, entry] of Object.entries(providers as Record<string, unknown>)) {
-    if (!hasOwnProvider(config.providers, name) || !entry || typeof entry !== "object") continue;
-    const quotas = ((entry as { quotas?: unknown }).quotas ?? {}) as Record<string, unknown>;
-    // `opencodex` is the ready-to-route shape (named windows + custom windows such as 日限);
-    // `quotas` is the older percent-only view and still works for files written before it.
-    const source = ((entry as { opencodex?: unknown }).opencodex ?? quotas) as Record<string, unknown>;
-    const quota: Record<string, unknown> = { updatedAt: generatedAt };
-    for (const key of ["fiveHourPercent", "fiveHourResetAt", "weeklyPercent", "weeklyResetAt",
-      "monthlyPercent", "monthlyResetAt"] as const) {
-      const value = source[key];
-      if (typeof value === "number" && Number.isFinite(value)) quota[key] = value;
-    }
-    if (Array.isArray(source.customWindows)) {
-      quota.customWindows = source.customWindows;
-    }
-    const hasWindow = ["fiveHourPercent", "weeklyPercent", "monthlyPercent"]
-      .some(key => typeof quota[key] === "number" && Number.isFinite(quota[key] as number))
-      || Array.isArray(quota.customWindows);
-    if (!hasWindow) continue;
-    const site = (entry as { site?: unknown }).site;
-    const account = (entry as { account?: unknown }).account;
-    const exportedLabel = (entry as { label?: unknown }).label;
-    const label: string[] = [];
-    if (typeof exportedLabel === "string" && exportedLabel.trim()) label.push(exportedLabel.trim());
-    else {
-      label.push("面板 " + String(site ?? "?"));
-      if (account) label.push(String(account));
-      const official = ((entry as { official?: unknown }).official ?? {}) as Record<string, unknown>;
-      if (official.state) label.push("官方 " + String(official.state));
-    }
-    if (ageMs > 5 * 60_000) label.push(`数据 ${Math.round(ageMs / 60_000)} 分钟前`);
-    rows.push({
-      provider: name,
-      label: label.join(" · "),
-      source: PANEL_QUOTA_SOURCE_PREFIX + String(site ?? "unknown"),
-      quota,
-      updatedAt: generatedAt,
-    });
-  }
-  return rows;
-}
-
-/** State and validity for a panel row: the same >=100% rule the probe rows use, no cache lookup. */
-function panelRoutingQuota(quota: Record<string, unknown>, now: number): ProviderRoutingQuota {
-  const hasWindow = ["fiveHourPercent", "weeklyPercent", "monthlyPercent"]
-    .some(key => typeof quota[key] === "number" && Number.isFinite(quota[key] as number))
-    // A relay whose only windows are custom (a daily cap, or a daily window the panel resets
-    // itself) still has a verdict -- reading only the named fields reports it as unknown.
-    || (Array.isArray(quota.customWindows) && quota.customWindows.length > 0);
-  if (!hasWindow) return { state: "unknown" };
-  // The panel reports epoch SECONDS while the shared predicate compares against a millisecond
-  // `now`; without this a reset that is days away reads as long past and the window never looks
-  // exhausted.
-  const normalized: Record<string, unknown> = { ...quota };
-  for (const key of ["fiveHourResetAt", "weeklyResetAt", "monthlyResetAt"]) {
-    const value = normalized[key];
-    if (typeof value === "number" && Number.isFinite(value) && value < 1e12) normalized[key] = value * 1000;
-  }
-  if (Array.isArray(normalized.customWindows)) {
-    normalized.customWindows = (normalized.customWindows as Array<Record<string, unknown>>).map(window => (
-      typeof window.resetAt === "number" && Number.isFinite(window.resetAt) && window.resetAt < 1e12
-        ? { ...window, resetAt: window.resetAt * 1000 }
-        : window));
-  }
-  const exhausted = cachedProviderQuotaIsExhausted(
-    normalized as unknown as Parameters<typeof cachedProviderQuotaIsExhausted>[0], now);
-  const resets = ["fiveHourResetAt", "weeklyResetAt", "monthlyResetAt"]
-    .map(key => normalized[key])
-    .concat((normalized.customWindows as Array<{ resetAt?: number }> | undefined ?? [])
-      .map(window => window.resetAt))
-    .filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > now);
-  return {
-    state: exhausted ? "exhausted" : "available",
-    updatedAt: typeof quota.updatedAt === "number" ? quota.updatedAt : now,
-    validUntil: resets.length ? Math.min(...resets) : now + PROVIDER_QUOTA_MAX_AGE_MS,
-  };
-}
-
 function providerRoutingQuota(config: OcxConfig, name: string, now: number): ProviderRoutingQuota {
   const provider = hasOwnProvider(config.providers, name) ? config.providers[name] : undefined;
   const quota = getCachedProviderRoutingQuota(name, provider, now);
@@ -1052,26 +905,12 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
     const forceRefresh = url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true";
     const snapshot = await fetchProviderQuotaReports(config, forceRefresh);
     const now = Date.now();
-    // The refresh button has to move these rows too: they are file-backed, not probed.
-    const panelRefresh = forceRefresh ? await refreshPanelQuotaRows() : undefined;
-    const external = panelQuotaRows(config, Date.now());
     return jsonResponse({
       ...snapshot,
-      ...(panelRefresh ? { panelRefresh } : {}),
-      reports: [...snapshot.reports, ...external].map(report => {
-        const source = typeof report.source === "string" ? report.source : "";
-        const provider = typeof report.provider === "string" ? report.provider : "";
-        const capacityHold = providerCapacityHold(provider, now);
-        return {
-          ...report,
-          routingQuota: source.startsWith(PANEL_QUOTA_SOURCE_PREFIX)
-            ? panelRoutingQuota(report.quota as Record<string, unknown>, now)
-            : providerRoutingQuota(config, provider, now),
-          // A capacity / soft-risk-control verdict parks the whole provider; surfacing it here is
-          // the only place the operator can see why a healthy-looking provider is being skipped.
-          ...(capacityHold ? { capacityHold } : {}),
-        };
-      }),
+      reports: snapshot.reports.map(report => ({
+        ...report,
+        routingQuota: providerRoutingQuota(config, report.provider, now),
+      })),
     });
   }
 
@@ -1093,8 +932,7 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
 
   if (url.pathname === "/api/providers" && req.method === "GET") {
     return jsonResponse(Object.entries(config.providers).map(([name, p]) => ({
-      name, adapter: p.adapter, baseUrl: publicProviderBaseUrl(p.baseUrl), defaultModel: p.defaultModel,
-      hasApiKey: !!p.apiKey,
+      name, adapter: p.adapter, baseUrl: publicProviderBaseUrl(p.baseUrl), defaultModel: p.defaultModel, hasApiKey: !!p.apiKey,
       // Presence only (#959 review): header names and values never leave the process.
       hasHeaders: !!p.headers && Object.keys(p.headers).length > 0,
       allowPrivateNetwork: p.allowPrivateNetwork === true,
@@ -1103,6 +941,7 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
       models: p.models ?? [],
       contextWindow: p.contextWindow,
       modelContextWindows: p.modelContextWindows,
+      modelContextTiers: p.modelContextTiers,
       modelCapabilities: p.modelCapabilities,
       pinnedReasoningEffort: p.pinnedReasoningEffort,
       modelPinnedReasoningEfforts: p.modelPinnedReasoningEfforts,
@@ -1124,7 +963,7 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
       ...(name === "xai" ? { xaiResponsesOptInState: xaiResponsesOptInState(p) } : {}),
       // Only opt-in Fast lanes (Anthropic fast mode bills usage credits) get a dashboard switch.
       ...(getProviderRegistryEntry(name)?.fastOptIn === true ? { fastOptIn: { enabled: p.fastEnabled === true } } : {}),
-      discovery: p.liveModels === false ? undefined : getProviderDiscoveryStatus(name),
+      discovery: p.liveModels === false ? undefined : getProviderDiscoveryStatus(name), ...providerTlsProfileDiagnostic(name, p),
       ...(name === "openai" && isCanonicalOpenAiForwardProvider(p)
         ? { entitlement: getCodexModelEntitlementStatus(config) }
         : {}),
@@ -1383,6 +1222,7 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
     // call can never fire.
     const submittedContextWindow = Object.hasOwn(prov, "contextWindow");
     const submittedModelContextWindows = Object.hasOwn(prov, "modelContextWindows");
+    const submittedModelContextTiers = Object.hasOwn(prov, "modelContextTiers");
     const submittedModelAutoCompactTokenLimits = Object.hasOwn(prov, "modelAutoCompactTokenLimits");
     const submittedModelDisplayNames = Object.hasOwn(prov, "modelDisplayNames");
     const submittedRequestPacing = Object.hasOwn(prov, "requestPacing");
@@ -1468,7 +1308,8 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
     if (!submittedFastEnabled && liveFastEnabled !== undefined) prov.fastEnabled = liveFastEnabled;
     // The form sends none of the compatibility settings either (#5563). Read the live row rather
     // than `existing`, like the alias overlays below: a PATCH that saved one of them while DNS
-    // validation awaited must not be undone. Nothing is carried to a new destination.
+    // validation awaited must not be undone. Only the hideRawReasoning display policy follows the
+    // provider to a new destination; the upstream compatibility settings do not.
     carryProviderCompatFields(prov, config.providers[name], overwriteSample);
     if (existing?.modelContextWindows) {
       // When the client did send a map, its keys win and the user's other keys survive. When
@@ -1512,48 +1353,51 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
         prov.zaiResponsesDefaultVersion = latest.zaiResponsesDefaultVersion;
       }
     }
-    // Reapply pins to the latest live row after DNS/import awaits, then validate the
-    // complete draft before adopting any provider/default state.
+    // Reapply pins after DNS/import awaits; validate the complete draft before adoption.
     const latest = config.providers[name];
     const latestPinError = applyProviderPinFields(prov, body.provider, latest);
     if (latestPinError) return jsonResponse({ error: latestPinError }, 400);
     const pinsOwned = Object.hasOwn(body.provider, "pinnedReasoningEffort")
       || Object.hasOwn(body.provider, "modelPinnedReasoningEfforts")
       || latest?.pinnedReasoningEffort !== undefined || latest?.modelPinnedReasoningEfforts !== undefined;
-    // New registration also edits discovery/disabled-model state; stage those
-    // side effects with the registration draft instead of mutating live state
-    // before validation.
+    // Stage new-registration discovery state in a draft until validation passes.
     const registrationDraft = !latest ? {
       ...config,
       ...(config.modelDiscovery === undefined ? {} : { modelDiscovery: structuredClone(config.modelDiscovery) }),
     } : undefined;
     initializeProviderModelSelection(name, prov, latest, registrationDraft ?? config);
     const candidate = stripRegistryOnlyStaticHeaders(name, prov);
-    const draft = { ...(registrationDraft ?? config), providers: { ...config.providers, [name]: candidate },
-      ...(body.setDefault === true ? { defaultProvider: name } : {}) };
-    const validation = validateConfigCandidate(draft);
-    if (!validation.ok) return jsonResponse({ error: validation.error }, 400);
     const previous = Object.getOwnPropertyDescriptor(config.providers, name);
     const rollback = pinsOwned ? captureConfigTopLevelRollback(config, ["defaultProvider", "modelDiscovery", "disabledModels"]) : undefined;
-    try {
-      if (registrationDraft) {
-        for (const key of ["modelDiscovery", "disabledModels"] as const) {
-          if (Object.hasOwn(registrationDraft, key)) Object.defineProperty(config, key, {
-            value: registrationDraft[key], writable: true, enumerable: true, configurable: true,
-          });
+    let validationError: string | undefined;
+    withConfigMutationLockSync(() => {
+      const liveTiers = config.providers[name]?.modelContextTiers;
+      if (submittedModelContextTiers && liveTiers) candidate.modelContextTiers = Object.assign(Object.create(null), liveTiers, candidate.modelContextTiers ?? {});
+      else if (!submittedModelContextTiers && liveTiers) candidate.modelContextTiers = { ...liveTiers };
+      else if (!submittedModelContextTiers) delete candidate.modelContextTiers;
+      const draft = { ...(registrationDraft ?? config), providers: { ...config.providers, [name]: candidate }, ...(body.setDefault === true ? { defaultProvider: name } : {}) };
+      const validation = validateConfigCandidate(draft); if (!validation.ok) { validationError = validation.error; return; }
+      try {
+        if (registrationDraft) {
+          for (const key of ["modelDiscovery", "disabledModels"] as const) {
+            if (Object.hasOwn(registrationDraft, key)) Object.defineProperty(config, key, {
+              value: registrationDraft[key], writable: true, enumerable: true, configurable: true,
+            });
+          }
         }
+        config.providers[name] = candidate;
+        if (body.setDefault === true) config.defaultProvider = name;
+        (deps.saveConfigPreservingClaudeCode ?? save)(config);
+      } catch (error) {
+        if (rollback) {
+          if (previous) Object.defineProperty(config.providers, name, previous);
+          else delete config.providers[name];
+          rollback();
+        }
+        throw error;
       }
-      config.providers[name] = candidate;
-      if (body.setDefault === true) config.defaultProvider = name;
-      (deps.saveConfigPreservingClaudeCode ?? save)(config);
-    } catch (error) {
-      if (rollback) {
-        if (previous) Object.defineProperty(config.providers, name, previous);
-        else delete config.providers[name];
-        rollback();
-      }
-      throw error;
-    }
+    });
+    if (validationError !== undefined) return jsonResponse({ error: validationError }, 400);
     reconcileLiveStateStores();
     if (prov.apiKey && prov.apiKeyPool) {
       const { addProviderApiKey } = await import("../../providers/api-keys");
@@ -1646,6 +1490,15 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
     const next = applied.next;
 
     const pacingOnly = keys.every(key => key === "requestPacing");
+    // A combo naming this row as its decisionProvider is only as valid as the row: an adapter
+    // or baseUrl edit could fail the combo's load-time checks and get it salvaged away on the
+    // next reload. Disabling the row stays allowed (not editorTouched; runtime fails open).
+    const decisionDependent = () => Object.values(config.combos ?? {})
+      .some(combo => (typeof combo.decisionProvider === "string" && combo.decisionProvider.trim() === name)
+        || (typeof combo.decisionModel === "string" && combo.decisionModel.trim().startsWith(`${name}/`)));
+    const { decisionModelProviderPatchError } = await import("./decision-model-validation");
+    const decisionModelError = applied.editorTouched ? decisionModelProviderPatchError(config, name, next) : null;
+    if (decisionModelError) return jsonResponse({ error: decisionModelError }, 400);
     if (applied.editorTouched && !pacingOnly) {
       const providerError = canonicalBudgetOnly
         ? canonicalOpenAiBudgetPatchError(next, rawBody, keys, config)
@@ -1670,6 +1523,10 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
         const allowBenchmarkAddresses = name === "openai" && isCanonicalOpenAiForwardProvider(next);
         const resolvedError = await providerDestinationResolvedError(name, next, { allowBenchmarkAddresses });
         if (resolvedError) return jsonResponse({ error: resolvedError }, 400);
+      }
+      if (decisionDependent()) {
+        const validation = validateConfigCandidate({ ...config, providers: { ...config.providers, [name]: next } });
+        if (!validation.ok) return jsonResponse({ error: validation.error }, 400);
       }
     } else if (applied.enablingOpenAi) {
       // Same DNS gate as POST: Clash fake-IP only. Never honor a persisted
@@ -1724,8 +1581,10 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
       // A PATCH that managed headers owns the resulting block: the clear path restores
       // registry static headers, so exact-match stripping must not erase them again.
       const candidate = replay.headersTouched ? replay.next : stripRegistryOnlyStaticHeaders(name, replay.next);
+      const decisionModelError = replay.editorTouched ? decisionModelProviderPatchError(config, name, candidate) : null;
+      if (decisionModelError) { replayError = decisionModelError; return; }
       const pinsTouched = Object.hasOwn(rawBody, "pinnedReasoningEffort") || Object.hasOwn(rawBody, "modelPinnedReasoningEfforts");
-      if (pinsTouched) {
+      if (pinsTouched || (replay.editorTouched && !pacingOnly && decisionDependent())) {
         const validation = validateConfigCandidate({ ...config, providers: { ...config.providers, [name]: candidate } });
         if (!validation.ok) { replayError = validation.error; return; }
       }
@@ -1773,34 +1632,13 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
         message: "Passthrough provider is configured (forwards your Codex login; no upstream /models).",
       });
     }
-    if (name === "jev" && providerMatchesRegistryTransport(name, prov)) {
-      const probe = { targetKey: "jev/probe", effort: null } as const;
-      const decision = await resolveJevDecision({
-        body: { input: "Verify the configured TypeSafe JEV decision service." },
-        candidates: [{
-          key: probe.targetKey,
-          provider: "jev",
-          model: "jev-latest",
-          reasoningEfforts: [],
-        }],
-        fallback: probe,
-        config,
-        signal: req.signal,
-      });
-      if (decision.gate === "apply") {
-        return jsonResponse({
-          ok: true,
-          latencyMs: decision.latencyMs,
-          message: "Connected. TypeSafe JEV answered a decision probe.",
-        });
+    // Decision services answer through the bounded JEV client. A retargeted `jev` row is neither
+    // TypeSafe nor a self-hosted service, so it is not probed at all: its key stays unsent.
+    if (prov.adapter === "jev-decision") {
+      if (name === "jev" && !providerMatchesRegistryTransport(name, prov)) {
+        return jsonResponse({ applicable: false, reason: "retargeted_decision_service", latencyMs: 0 });
       }
-      return jsonResponse({
-        ok: false,
-        latencyMs: decision.latencyMs,
-        error: decision.gate === "missing_key"
-          ? "TypeSafe JEV API key is not configured"
-          : `TypeSafe JEV decision probe failed (${decision.gate})`,
-      });
+      return jsonResponse(await probeJevDecisionProvider(config, name, { signal: req.signal }));
     }
     if (prov.liveModels === false) {
       // A static catalog has no live discovery endpoint to test. This is neither
@@ -1817,6 +1655,7 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
     if (prov.authMode === "oauth" && !apiKey) {
       return jsonResponse({ ok: false, latencyMs: 0, error: "static catalog only — upstream not verified (not logged in)" });
     }
+    if (prov.adapter === "zed") return (await import("./zed-provider-probe")).probeZedProvider(prov, apiKey, snapshot?.providerUserId);
     if (prov.adapter === "cursor") {
       const started = Date.now();
       const live = await fetchCursorUsableModels({
@@ -2002,7 +1841,7 @@ export async function handleProviderRoutes(ctx: ManagementContext): Promise<Resp
       }, 409);
     }
     const dependentCombos = Object.entries(config.combos ?? {})
-      .filter(([, combo]) => combo.targets.some(target => target.provider === name))
+      .filter(([, combo]) => comboDependsOnProviderRoute(config, combo, name))
       .map(([id]) => id)
       .sort((a, b) => a.localeCompare(b));
     if (dependentCombos.length > 0) {

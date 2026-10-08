@@ -48,7 +48,7 @@ async function dispatch(path: string, init?: RequestInit, inputConfig: OcxConfig
   const response = await handleManagementAPI(new Request(url, {
     ...init,
     headers: { Host: url.host, "Content-Type": "application/json", ...(init?.headers ?? {}) },
-  }), url, inputConfig, deps);
+  }), url, inputConfig, { ensureClaudeIntercept: async () => ({ ok: true, state: { proxyPort: 10200, caCertPath: join(root, "claude-intercept", "ca.pem"), pickerProxyPort: null } }), ...deps }, "admin-token", undefined, { trustedLoopback: true });
   return { status: response!.status, body: await response!.json() as Record<string, any> };
 }
 
@@ -112,6 +112,13 @@ test("CLI apply flags: default gateway, legacy shape flags imply gateway, confli
   expect("error" in parseDesktopApplyArgs(["--first-party", "--gateway"], config())).toBe(true);
   expect("error" in parseDesktopApplyArgs(["--first-party", "--static"], config())).toBe(true);
   expect("error" in parseDesktopApplyArgs(["--bogus"], config())).toBe(true);
+});
+
+test("CLI apply rejects unknown arguments without echoing option values or operands", () => {
+  const rejected = parseDesktopApplyArgs(["--token=synthetic-secret", "synthetic-operand", "-tsynthetic-short",
+    "--token", "--synthetic-dash-value", "--bogus\u001b[2Jsynthetic-escape"], config());
+  expect(rejected).toEqual({ error: "알 수 없는 인자 6개 (값은 표시하지 않습니다). 사용 가능한 옵션: --first-party --gateway --static --hybrid --discovery-only" });
+  expect(JSON.stringify(rejected)).not.toContain("synthetic");
 });
 
 test("first-party apply writes only the proxy env, creates the CA, and removes cleanly", () => {
@@ -517,7 +524,7 @@ for (const surface of ["cli", "api"] as const) {
         expect(await applyDesktop(undefined, { kind: "first-party" }, { findLiveProxyImpl: async () => null })).toMatchObject({ ok: false, reason: failure });
       } else {
         const reply = await dispatch("/api/claude-desktop/apply", { method: "POST", body: JSON.stringify({ mode: "first-party" }) }, saved);
-        expect(reply.body.reason).toBe(failure);
+        expect(reply.body.reason).toBe(failure === "intercept_disabled" ? "disabled" : failure);
       }
       expect(inspectDesktop3pConfigLibrary({ appliedFingerprint })).toEqual(before);
     });
@@ -638,4 +645,17 @@ test("the status routes never mint the proxy token", async () => {
   const list = await dispatch("/api/native-integrations");
   expect(list.status).toBe(200);
   expect(existsSync(claudeInterceptProxyTokenPath(root))).toBe(false);
+});
+
+test("first-party apply and native enable refuse a changed configured port before writing env", async () => {
+  const live = config({ claudeCode: { desktopMode: "first-party", intercept: { port: 10300 } } });
+  writeFileSync(join(root, "config.json"), JSON.stringify(live));
+  for (const [path, body] of [["/api/claude-desktop/apply", { mode: "first-party" }], ["/api/native-integrations/claude-desktop", { enabled: true }]] as const) {
+    const result = await dispatch(path, { method: path.endsWith("apply") ? "POST" : "PUT", body: JSON.stringify(body) }, live);
+    expect(result.status).toBe(409);
+    expect(result.body.code).toBe("port_mismatch");
+    expect(result.body.bound).toBe(10200);
+    expect(result.body.configured).toBe(10300);
+    expect(existsSync(join(claudeDir, "settings.json"))).toBe(false);
+  }
 });

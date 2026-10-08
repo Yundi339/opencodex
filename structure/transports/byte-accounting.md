@@ -27,6 +27,11 @@ hard byte cap. Per-body limits, parsing, compression, and reader error envelopes
 `tests/usage/request-decompress.test.ts` covers exact accounting across codecs and Unicode/numeric
 normalization, UTF-8 counting without encoded copies, and release after malformed or optional empty input.
 
+The final native ChatGPT Responses HTTP send in `src/server/responses/fetch-helpers.ts` encodes JSON
+strings of at least 1 MiB as a UTF-8 buffer for Bun upload compatibility. This is a transport copy,
+not a counting allocation or retained continuation. Existing body admission limits still apply;
+the serialization observation keeps its existing lifetime, and nested dispatch reuses the buffer.
+
 ## Raised HTTP body admission
 
 `src/server/inbound-body-admission.ts` reserves the full resolved `maxInboundBodyBytes` allowance
@@ -56,23 +61,35 @@ lifecycle, cancellation races, protocol envelopes, and the real HTTP admission b
 
 ## Stream-buffer accounting
 
+Devin's [Messages ordering buffer](../clients/claude-desktop.md#devin-messages-output-ordering) charges retained
+semantic events consumed from the independently bounded adapter queue to the shared translator
+budget until downstream delivery. Cancellation and overflow release held events before producer shutdown.
+
 `src/web-search/run-turn-loop.ts` charges retained iteration events and generated replay history to
 the request translator budget. Each owner releases its own reservations on completion, error,
 cancellation or consumer closure; a buffer-limit failure terminates without another search.
 
 `src/server/sse-payload-rewrite.ts` shares an incremental block buffer with native Chat. It scans
-only new input, counts consumed blocks rather than remaining suffixes, and preserves LF/CRLF,
-partial-event, injection/drop, and EOF behavior. Output admission precedes its single UTF-8 encoding;
+only new input plus a three-character delimiter prefix and counts consumed blocks rather than
+remaining suffixes. CR, LF and CRLF share partial-event, injection/drop and EOF behavior.
+Output admission precedes its single UTF-8 encoding;
 failed enqueue and cancellation release the reservation without re-entering a disposed rewrite.
 Old/new buffer overlap remains charged against the same translator cap.
 
 Complete SSE blocks extract `data` fields with one indexed pass over the block rather than a
 regular-expression split and intermediate line array. Colonless `data` fields, one optional ASCII
-space after the colon, multiline joining, UTF-8 text, LF/CRLF input, and a trailing lone CR retain
-their event-stream semantics. `src/server/relay.ts` re-exports this canonical extractor instead of
-maintaining a second implementation. Empty byte results across the relay and
-`src/server/sse-frame-buffer.ts` reuse one immutable zero-length view; non-empty frame ownership,
-frame limits, cancellation, terminal detection, and wire bytes are unchanged.
+space after the colon, multiline joining, UTF-8 text and mixed CR/LF/CRLF input retain their
+event-stream semantics. Payload and event-field repairs use the shared line rules, including
+policy failures, custom tools, Copilot and Grok events; identity rewrites preserve
+original wire bytes. `src/server/relay.ts` re-exports the canonical extractor and block splitter.
+Empty byte results across the relay and `src/server/sse-frame-buffer.ts` reuse one immutable
+zero-length view; non-empty frame ownership,
+frame limits, cancellation and wire ownership remain bounded. The byte framer and inspection share
+one CR/LF/CRLF delimiter scanner; WebSocket projection uses the canonical data extractor. A terminal
+CR dispatches without awaiting EOF. A later LF extends that delimiter: byte delivery returns a
+framing-only continuation, excluded from event-count limits and the next event's byte cap;
+inspection consumes it without creating an event. The text rewrite relay keeps that continuation
+outside rewrite/drop callbacks and settles injected nonfinal CR delimiters as CRLF.
 
 `src/server/responses-custom-tool-repair.ts` continues to own retained routed argument bytes and
 their charge/release lifecycle while it asks the pure progressive decoder in
@@ -99,10 +116,35 @@ truncates diagnostic text at UTF-8 code-point boundaries without allocating arra
 byte sizing retains TextEncoder's coercion behavior for legacy non-string runtime callers.
 These optimizations do not add request queues, retry policies, or RSS-based admission gates.
 
+The buffered collector in `src/adapters/zed.ts` charges each delegated event before retaining it
+and releases owned events when collection fails. Its translated stream is cancelled on early exit
+for every provider family. `src/adapters/openai-responses/passthrough.ts` releases partial text and
+usage collectors on every exit, and compaction ciphertext unless its lease transfers with the
+`done` event. The ciphertext lease is bound to the event object and its budget separately from
+serialized-event retention; an uncharged ciphertext field never releases another owner's bytes.
+Zed releases that source lease if collection fails. The SSE bridge releases both source leases
+after each consumed or discarded event, including cancellation before its first pull, late events,
+and processing failure. Buffered bridging keeps ciphertext charged through output admission and
+releases all source leases on success or failure. Output retention remains independently charged.
+`tests/responses/compaction-event-ownership.test.ts` covers those transitions and unrelated owners.
+
 Translated audio/file admission follows the [final-adapter input contract](../adapters/registry.md#untranslated-input-media); native raw passthrough remains separate.
 Canonical Responses identity sanitation and narrowly scoped pre-output combo recovery follow [request-local target compatibility](../runtime.md#request-local-target-compatibility); other adapter contracts remain unchanged.
 
+Hosted Responses image display uses the allocation-free JSON byte counter to admit retained
+metadata and projected output before saving artifacts or serializing expanded JSON/SSE.
+The [Images display contract](../data-planes/images.md#hosted-responses-image-display) owns its
+item/metadata limits and lifecycle behavior; raw continuation replay stays upstream-shaped.
+
 ## Response-log inspection
+
+`src/lib/redact.ts` scans XML identifying attributes over disjoint tag spans rather than
+searching the remaining suffix from each opening delimiter. Tag terminators are quote-aware,
+so `>` inside a single- or double-quoted attribute cannot hide later credential attributes.
+The decoded and raw passes
+retain the original-offset mapping and mask a credential-bearing element through the rest
+of the input. `tests/lib/redact.test.ts` counts delimiter searches and scanned characters across doubled inputs
+without a machine-speed deadline, as well as malformed and escaped credential coverage.
 
 `src/server/response-log-body.ts` forwards raw response chunks on downstream demand.
 Diagnostic retention is limited to 32 MiB for JSON and an 8 KiB prefix for other
@@ -182,3 +224,5 @@ Schema size still determines traversal work and the cost of copying a changed br
 Dashboard Fast-row persistence and client refresh follow the [Fast selector rows setting contract](../gui-and-management-api.md#fast-selector-rows-setting).
 
 The [compaction routing override](responses-failover.md#compaction-routing-overrides) changes model and effort scalars on the already-read request body, before parsing, within the existing body-reader budget.
+
+`src/lib/sse-decoder.ts` recognizes CR, LF and CRLF line endings, including CRLF split between fetch chunks. Delimiters are consumed before field retention; event/comment ordering, EOF dispatch and translator-budget release remain shared across all three forms. The delimiter search keeps native `indexOf` cursors for the next CR and LF in each decoded chunk, so scanning stays linear for every framing.

@@ -26,7 +26,6 @@ const validStage: CodexWsStageRecord = {
   pongs: 0,
   closeCode: 1006,
   reused: true,
-  crossTurn: false,
   ocxVersion: "2.52.0",
   bunVersion: "1.4.0",
 };

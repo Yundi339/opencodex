@@ -1,8 +1,11 @@
 import { createHash, randomUUID, X509Certificate } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { canonicalPickerConfigDir, ensurePersistentPickerCa } from "./picker-ca-persistence";
+import type { PickerCaStore } from "./picker-ca-store";
 import { withClientLifecycleSync } from "../../client/lifecycle-lock";
 import {
+  ALL_IP_ADDRESS_BASES,
   createCertificateAuthority,
   issueServerLeaf,
   type LocalInterceptCa,
@@ -34,6 +37,137 @@ export function pickerCaFingerprints(certPem: string): { sha1: string; sha256: s
     sha1: createHash("sha1").update(der).digest("hex").toUpperCase(),
     sha256: createHash("sha256").update(der).digest("hex").toUpperCase(),
   };
+}
+
+interface DerItem { tag: number; body: Buffer; next: number }
+
+function readDer(bytes: Buffer, at: number): DerItem | null {
+  if (at + 2 > bytes.length) return null;
+  const tag = bytes[at]!;
+  let length = bytes[at + 1]!;
+  let cursor = at + 2;
+  if (length & 0x80) {
+    const width = length & 0x7f;
+    if (width === 0 || width > 4 || cursor + width > bytes.length) return null;
+    length = 0;
+    for (let i = 0; i < width; i++) length = length * 256 + bytes[cursor++]!;
+  }
+  if (cursor + length > bytes.length) return null;
+  return { tag, body: bytes.subarray(cursor, cursor + length), next: cursor + length };
+}
+
+function children(bytes: Buffer): DerItem[] | null {
+  const out: DerItem[] = [];
+  for (let cursor = 0; cursor < bytes.length;) {
+    const item = readDer(bytes, cursor);
+    if (!item) return null;
+    out.push(item);
+    cursor = item.next;
+  }
+  return out;
+}
+
+function constrainedToPickerHost(value: Buffer): boolean {
+  const root = readDer(value, 0);
+  if (!root || root.tag !== 0x30 || root.next !== value.length) return false;
+  const fields = children(root.body);
+  if (!fields || fields.length !== 2 || fields[0]!.tag !== 0xa0 || fields[1]!.tag !== 0xa1) return false;
+  const excluded = children(fields[1]!.body);
+  const excludesAllIps = excluded?.length === ALL_IP_ADDRESS_BASES.length && excluded.every((subtree, index) => {
+    const base = subtree.tag === 0x30 ? children(subtree.body) : null;
+    return base?.length === 1 && base[0]!.tag === 0x87
+      && base[0]!.body.equals(Buffer.from(ALL_IP_ADDRESS_BASES[index]!));
+  });
+  if (!excludesAllIps) return false;
+  const subtrees = children(fields[0]!.body);
+  const subtree = subtrees?.length === 1 && subtrees[0]!.tag === 0x30 ? children(subtrees[0]!.body) : null;
+  return subtree?.length === 1 && subtree[0]!.tag === 0x82
+    && subtree[0]!.body.equals(Buffer.from(PICKER_HOST, "ascii"));
+}
+
+interface ParsedExtension { oid: Buffer; critical: boolean; value: Buffer }
+
+/** One Extension SEQUENCE → oid, criticality, and extnValue bytes; malformed shapes return null. */
+function parseExtension(item: DerItem): ParsedExtension | null {
+  if (item.tag !== 0x30) return null;
+  const fields = children(item.body);
+  if (!fields || fields.length < 2 || fields.length > 3 || fields[0]!.tag !== 0x06) return null;
+  const value = fields[fields.length - 1]!;
+  if (value.tag !== 0x04) return null;
+  if (fields.length === 2) return { oid: fields[0]!.body, critical: false, value: value.body };
+  // DER encodes the critical flag only as BOOLEAN TRUE; anything else is not a real extension.
+  if (fields[1]!.tag !== 0x01 || !fields[1]!.body.equals(Buffer.from([0xff]))) return null;
+  return { oid: fields[0]!.body, critical: true, value: value.body };
+}
+
+// DER OID bodies for the only four extensions a picker authority carries. A SAN, an EKU, or any
+// other extension means the certificate is not a picker authority, whatever its subject claims.
+const EXT_BASIC_CONSTRAINTS = "551d13";
+const EXT_KEY_USAGE = "551d0f";
+const EXT_SUBJECT_KEY_IDENTIFIER = "551d0e";
+const EXT_NAME_CONSTRAINTS = "551d1e";
+const PICKER_CA_EXTENSION_OIDS = new Set([
+  EXT_BASIC_CONSTRAINTS, EXT_KEY_USAGE, EXT_SUBJECT_KEY_IDENTIFIER, EXT_NAME_CONSTRAINTS,
+]);
+
+/** basicConstraints CA:TRUE with pathLenConstraint 0 — the anchor signs leaves, not other CAs. */
+const PICKER_CA_BASIC_CONSTRAINTS = Buffer.from([0x30, 0x06, 0x01, 0x01, 0xff, 0x02, 0x01, 0x00]);
+/** keyUsage keyCertSign | cRLSign only — the anchor can never sign a TLS handshake itself. */
+const PICKER_CA_KEY_USAGE = Buffer.from([0x03, 0x02, 0x01, 0x06]);
+
+/**
+ * The trust decision accepts exactly the extension profile createCertificateAuthority emits, not
+ * merely a certificate that happens to contain the right name constraint. A root that also carries
+ * leaf privileges (SAN, serverAuth EKU, digitalSignature) could be presented directly as an
+ * off-host server certificate, where name constraints on subordinates no longer apply.
+ */
+function acceptsExtensionProfile(extensions: DerItem[]): boolean {
+  const seen = new Set<string>();
+  for (const item of extensions) {
+    const extension = parseExtension(item);
+    if (extension === null) return false;
+    const key = extension.oid.toString("hex");
+    if (!PICKER_CA_EXTENSION_OIDS.has(key) || seen.has(key)) return false;
+    seen.add(key);
+    switch (key) {
+      case EXT_BASIC_CONSTRAINTS:
+        if (!extension.critical || !extension.value.equals(PICKER_CA_BASIC_CONSTRAINTS)) return false;
+        break;
+      case EXT_KEY_USAGE:
+        if (!extension.critical || !extension.value.equals(PICKER_CA_KEY_USAGE)) return false;
+        break;
+      case EXT_SUBJECT_KEY_IDENTIFIER: {
+        const id = readDer(extension.value, 0);
+        if (extension.critical || id === null || id.tag !== 0x04 || id.next !== extension.value.length) return false;
+        break;
+      }
+      default:
+        if (!extension.critical || !constrainedToPickerHost(extension.value)) return false;
+    }
+  }
+  return seen.size === PICKER_CA_EXTENSION_OIDS.size;
+}
+
+/** Independently authorize a root before installing it as system trust. */
+export function acceptsPickerAuthority(certPem: string): boolean {
+  try {
+    const cert = new X509Certificate(certPem);
+    const names = cert.subject.split("\n");
+    if (!names.includes(`CN=${PICKER_CA_COMMON_NAME}`)) return false;
+    if (names.filter(line => line.startsWith("CN=")).length !== 1) return false;
+    // A picker authority is self-issued and self-signed; a foreign issuer is not one of ours.
+    if (cert.issuer !== cert.subject || !cert.verify(cert.publicKey)) return false;
+    const root = readDer(cert.raw, 0);
+    const certificate = root?.tag === 0x30 && root.next === cert.raw.length ? children(root.body) : null;
+    const tbs = certificate?.[0]?.tag === 0x30 ? children(certificate[0].body) : null;
+    const extensionField = tbs?.find(item => item.tag === 0xa3);
+    const wrapped = extensionField && readDer(extensionField.body, 0);
+    const extensions = wrapped?.tag === 0x30 && wrapped.next === extensionField!.body.length
+      ? children(wrapped.body) : null;
+    return extensions !== null && acceptsExtensionProfile(extensions);
+  } catch {
+    return false;
+  }
 }
 
 /** Atomically publish a public certificate; these files carry no key material. */
@@ -273,29 +407,58 @@ export function acknowledgePendingPickerCaUntrust(
  * unconditional so a later failed rotation can never leave that key behind.
  */
 export function discardPickerCaKey(configDir: string): void {
+  try {
+    const stat = lstatSync(pickerStateDir(configDir));
+    if (!stat.isDirectory() || (process.platform !== "win32" && stat.uid !== process.getuid!())) {
+      throw new Error("picker_ca_directory_unsafe");
+    }
+  } catch (error) {
+    if (error !== null && typeof error === "object" && (error as { code?: unknown }).code === "ENOENT") return;
+    throw error;
+  }
   rmSync(join(pickerStateDir(configDir), "ca.key"), { force: true });
 }
 
-export function ensurePickerCa(configDir: string, options: { rotation?: "startup" } = {}): PickerCa {
+export function ensurePickerCa(configDir: string, options: { rotation?: "startup"; persistent?: boolean; store?: PickerCaStore } = {}): PickerCa {
+  mkdirSync(configDir, { recursive: true, mode: 0o700 });
+  configDir = canonicalPickerConfigDir(configDir);
   const dir = pickerStateDir(configDir);
-  // The signing key must never survive this process: another process under the same user could
-  // otherwise steal it and later take over the predictable loopback proxy. Drop a key left (or
-  // restored) by an older release on every call, including cache hits.
+  // Persistent startup stores the signing key in the OS credential store; plain calls keep an
+  // in-process authority. Both paths remove legacy plaintext ca.key files, including cache hits.
   discardPickerCaKey(configDir);
   const cached = processAuthorities.get(dir);
-  const pickerCa = cached ?? (() => {
+  const create = () => cached ?? (() => {
     const ca = createCertificateAuthority({ commonName: PICKER_CA_COMMON_NAME, permittedDnsNames: [PICKER_HOST] });
     return { ...ca, fingerprint: pickerCaFingerprints(ca.certPem).sha256 };
   })();
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  lockedPickerCa(configDir, () => {
+  const pickerCa = lockedPickerCa(configDir, () => {
     if (readPendingPickerCaUntrust(configDir)) throw new Error("picker_ca_pending_untrust");
+    if (options.persistent) {
+      return ensurePersistentPickerCa({
+        configDir, stateDir: dir, store: options.store, acceptsAuthority: acceptsPickerAuthority, create,
+        predecessor: ca => {
+          const published = publishedPickerCa(configDir);
+          if (published === ca.certPem || published === null) return null;
+          if (livePublishedOwner(configDir, published)) throw new Error("picker_ca_live_owner");
+          const outgoing = publicCertificate(published);
+          if (outgoing && options.rotation !== "startup") throw new Error("picker_ca_rotation_requires_startup");
+          return outgoing?.certPem ?? null;
+        },
+        publishMetadata: publishPem,
+        publish: (ca, predecessor) => {
+          if (predecessor) writePendingPickerCaUntrust(configDir, publicCertificate(predecessor)!);
+          publishAuthority(configDir, ca);
+        },
+      });
+    }
+    const pickerCa = create();
     const published = publishedPickerCa(configDir);
     if (published === pickerCa.certPem) {
       // The signing key is still in this process. A missing/stale owner file must not let a
       // second process rotate this live authority after an otherwise harmless cached ensure.
       if (!currentProcessOwnsPublishedCa(configDir, pickerCa)) publishOwner(configDir, pickerCa);
-      return;
+      return pickerCa;
     }
     if (published !== null && livePublishedOwner(configDir, published)) {
       throw new Error("picker_ca_live_owner");
@@ -306,14 +469,17 @@ export function ensurePickerCa(configDir: string, options: { rotation?: "startup
       writePendingPickerCaUntrust(configDir, outgoing);
     }
     publishAuthority(configDir, pickerCa);
+    return pickerCa;
   });
-  if (!cached) processAuthorities.set(dir, pickerCa);
+  if (!cached || options.persistent) processAuthorities.set(dir, pickerCa);
   return pickerCa;
 }
 
 /** Fingerprint of this process's authority only — null until ensurePickerCa has run. */
 export function publishedPickerCaSha256(configDir: string): string | null {
-  const cached = processAuthorities.get(pickerStateDir(configDir));
+  let canonical: string;
+  try { canonical = canonicalPickerConfigDir(configDir); } catch { return null; }
+  const cached = processAuthorities.get(pickerStateDir(canonical));
   return cached ? pickerCaFingerprints(cached.certPem).sha256 : null;
 }
 

@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { manualUpdateFailureGuidance } from "./update-failure-guidance.mjs";
 import { STOP_HISTORY_INCOMPLETE_EXIT_CODE } from "./stop-contract.mjs";
 import { proxyIdentityAt } from "../server/proxy-liveness";
 import { probeProxyLiveness } from "./proxy-liveness-probe.mjs";
@@ -42,7 +43,6 @@ import { withoutSiblingMarker } from "../codex/sibling-start";
 import { packageVersion } from "../lib/package-version";
 import { selfLaunchArgv } from "../lib/self-launch-argv";
 import { PNPM_READ_CWD, withPnpmCommandCwd, pnpmReadEnvironment } from "./pnpm-read-policy.mjs";
-import { forkInstallSpec, resolveForkRelease } from "./fork-release.mjs";
 
 /**
  * A `codex-history-backup-*.json` surviving a stop means the native-history restore was
@@ -290,14 +290,6 @@ export function latestVersion(
   owner?: PnpmGlobalOwner,
   spawn: typeof spawnSync = spawnSync,
 ): string | null {
-  // This fork is not on the public registry: the newest release comes from its own repository,
-  // where every release carries the packed tarball the updater installs. See fork-release.mjs
-  // for why asking npm about upstream's package name would install the wrong build entirely.
-  // A registry source can still be configured through OCX_UPDATE_SPEC, in which case the
-  // package-manager query below is the right one.
-  if (!process.env.OCX_UPDATE_SPEC?.trim()) {
-    return resolveForkRelease(tag, { spawn })?.version ?? null;
-  }
   const resolvedOwner = installer === "pnpm" ? selectedPnpmOwner(owner) : undefined;
   if (installer === "pnpm" && !resolvedOwner) return null;
   const manager = registrySpawnTarget(installer, ["view", `${PKG}@${tag}`, "version"], resolvedOwner);
@@ -320,19 +312,15 @@ export function updateCommand(installer: Installer, tag: Channel, resolvedVersio
   if (installer === "mise") {
     throw new Error("mise-owned installations must be upgraded through mise");
   }
-  // Immutable target: when the lookup resolved a concrete version, install exactly that version —
-  // the "latest" release can move between resolution and install (TOCTOU). Without a resolved
-  // version the label is a placeholder: the callers refuse to install an unresolved target.
-  const version = resolvedVersion && !/^(latest|preview)$/.test(resolvedVersion) ? resolvedVersion : null;
-  const spec = version
-    ? forkInstallSpec(version, version.startsWith("v") ? version : `v${version}`)
-    : forkInstallSpec("<version>", "v<version>");
-  if (installer === "bun") return { bin: "bun", args: ["add", "-g", spec] };
+  // Immutable target: when the registry resolved a concrete version, install exactly
+  // that version — the dist-tag can move between resolution and install (TOCTOU).
+  const target = resolvedVersion || tag;
+  if (installer === "bun") return { bin: "bun", args: ["add", "-g", `${PKG}@${target}`] };
   if (installer === "pnpm") {
-    return { bin: "pnpm", args: ["add", "-g", "--allow-build=bun", spec] };
+    return { bin: "pnpm", args: ["add", "-g", "--allow-build=bun", `${PKG}@${target}`] };
   }
   const bin = "npm";
-  const args = ["install", "-g", spec];
+  const args = ["install", "-g", `${PKG}@${target}`];
   return { bin, args };
 }
 
@@ -357,21 +345,6 @@ export function checkUpdatePackageIntegrity(
   installer: Installer = detectInstall(),
   owner?: PnpmGlobalOwner,
 ): { ok: true; integrity: string } | { ok: false; reason: string } | { ok: "skipped"; reason: string } {
-  if (!process.env.OCX_UPDATE_SPEC?.trim()) {
-    // The fork's source is a GitHub release, and its tarball has no registry SRI to read. What it
-    // does have is the asset digest GitHub records for the upload: verify the SAME release the
-    // install spec points at, so a release that vanished between resolution and install still
-    // fails closed before the proxy is stopped.
-    if (!version) return { ok: "skipped", reason: "no resolved release (release lookup unavailable)" };
-    const release = resolveForkRelease("preview", { spawn });
-    if (!release || release.version !== version) {
-      return { ok: false, reason: `release ${version} is not readable from the update source` };
-    }
-    if (!release.digest) {
-      return { ok: "skipped", reason: `release ${version} publishes no asset digest` };
-    }
-    return { ok: true, integrity: release.digest };
-  }
   const resolvedOwner = installer === "pnpm" ? selectedPnpmOwner(owner) : undefined;
   if (installer === "pnpm" && !resolvedOwner) {
     return { ok: false, reason: "could not identify pnpm's owning global installation" };
@@ -598,12 +571,23 @@ export async function runUpdate(): Promise<void> {
   };
   const recoverStoppedRuntime = async (reason: string): Promise<void> => {
     try {
-      const current = await resolvedRuntimeOwnership();
-      const recovery = planStoppedRuntimeRecovery({
-        stopAttempted, ...current, sameOwner: sameOwner(current),
-        liveness: currentPackageRuntimeLiveness(), serviceInstalled: serviceWasInstalled,
-        launcherUsable: postUpdateLauncherUsable && existsSync(postUpdateLauncher), hadRuntimeState,
-      });
+      const planRecovery = async () => {
+        const current = await resolvedRuntimeOwnership();
+        return planStoppedRuntimeRecovery({
+          stopAttempted, ...current, sameOwner: sameOwner(current),
+          liveness: currentPackageRuntimeLiveness(), serviceInstalled: serviceWasInstalled,
+          launcherUsable: postUpdateLauncherUsable && existsSync(postUpdateLauncher), hadRuntimeState,
+        });
+      };
+      let recovery = await planRecovery();
+      if (recovery.action === "service") {
+        // The service manager starts the proxy outside this process tree, so it
+        // cannot join this lease, and holding it through the repair's health wait
+        // keeps that proxy from starting (#5760). Release it, then decide again —
+        // a claim could have landed while the repair ran unleased.
+        mutation.release();
+        recovery = await planRecovery();
+      }
       if (recovery.action === "manual") {
         console.warn(`⚠️  ${reason}; runtime recovery requires manual review (${recovery.reason}).`);
       } else if (recovery.action === "service") {
@@ -613,6 +597,9 @@ export async function runUpdate(): Promise<void> {
           env: mutation.controlEnvironment({ ...process.env, OCX_BAKE_PORT: String(capturedListen.port) }),
         });
         if (service.status !== 0 || !isServiceViable()) {
+          // The refresh ran unleased; a claim could have landed meanwhile, so take
+          // the lease back before re-reading ownership and authorizing a direct start.
+          mutation.reacquire();
           const nowOwned = await resolvedRuntimeOwnership();
           const fallback = planStoppedRuntimeRecovery({
             stopAttempted, ...nowOwned, sameOwner: sameOwner(nowOwned),
@@ -623,6 +610,8 @@ export async function runUpdate(): Promise<void> {
           else console.warn("⚠️  Service recovery was not confirmed; no second proxy was started.");
         }
       } else if (recovery.action === "direct") {
+        // No-op while the lease is held; re-locks if the service branch released it.
+        mutation.reacquire();
         await startProxyDirectly();
       }
     } catch {
@@ -843,6 +832,11 @@ export async function runUpdate(): Promise<void> {
       if (!freed) {
         console.warn(`⚠️  Port ${capturedListen.port} still busy after 30s; repairing service with pinned --port ${capturedListen.port} anyway (refusing to hop).`);
       }
+      // `service repair` re-activates a manager whose `ocx start` child is not a
+      // process descendant and cannot join this lease; held through its serving
+      // wait, the lease makes that child die at the acquire deadline (#5760).
+      // The kill-authorizing reclaim above already ran under the lease.
+      mutation.release();
       const prevBake = process.env.OCX_BAKE_PORT;
       process.env.OCX_BAKE_PORT = String(capturedListen.port);
       try {
@@ -883,6 +877,18 @@ export async function runUpdate(): Promise<void> {
             // Re-read rather than reuse the plan from before the package install: the app can
             // claim the runtime during an update that takes minutes, and the refusal the
             // repair above just returned is indistinguishable from any other failure here.
+            // The refresh above ran outside the lease — take it back so this re-read and
+            // the direct start stay serialized with a claim that landed in that window.
+            // A claim that outlasts the wait is reported here: the package is already
+            // swapped, so the unexpected-failure recovery below would run a second,
+            // unleased repair and surface the raw lock error instead.
+            try {
+              mutation.reacquire();
+            } catch {
+              console.warn("⚠️  Updated, but another process kept the runtime ownership lease claimed, so no proxy was started.");
+              console.warn(`   Run 'ocx service repair', then 'ocx start --port ${capturedListen.port}'.`);
+              return 1;
+            }
             const nowOwned = planUpdateRuntimeHandling({
               ...(await resolvedRuntimeOwnership()),
               serviceInstalled: true,
@@ -917,7 +923,7 @@ export async function runUpdate(): Promise<void> {
       spawnSync(process.execPath, [postUpdateLauncher, "tray", "start"], { stdio: "ignore", windowsHide: true, env: mutation.unprivilegedEnvironment() });
     }
     await recoverStoppedRuntime("package update failed");
-    console.error(`\n⚠️  Update failed (${bin} exit ${r.status ?? "?"}). Try manually:  ${bin} ${cmdArgs.join(" ")}`);
+    console.error(`\n⚠️  Update failed (${bin} exit ${r.status ?? "?"}). ${manualUpdateFailureGuidance({ bin, args: cmdArgs, owner }).join("\n")}`);
     return 1;
   }
   } catch (error) {

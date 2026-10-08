@@ -1,5 +1,26 @@
 # Responses Wire Shapes
 
+## Client rate-limit retry advice
+
+With a valid delay, `src/bridge/internal.ts` maps typed HTTP 429 `rate_limit_error` codes
+`resource_exhausted`, `rate_limit_exceeded`, and `slow_down` to `rate_limit_exceeded`.
+`src/lib/retry-delay.ts` formats typed and message-only rate-limit advice with the longest
+lower bound first; competing original hints are retained under an explicit provider-detail label.
+Other explicit verdicts, proxy replay budgets and event ordering are unchanged. This creates
+no reasoning/history item; client retry policy, Grok HTTP status and combo preflight stay intact.
+
+## Compaction image input
+
+For translated routed compaction, `src/responses/compaction-images.ts` replaces earlier user and
+tool-result images with a short reopening note only when a later nonempty `final_answer` message
+exists. This structural boundary does not prove the image was analyzed: text and source references
+remain, and the note asks the next model to reopen unresolved visual evidence. Pending images and
+commentary-only or unphased histories stay intact. Sidecar preparation projects parsed messages before
+vision planning. The projection does not rewrite `_rawBody` or stored history; later vision preprocessing
+may rewrite the request-local raw body for transport safety. Normal generation and native compaction
+stay unchanged. Both routed v1 and v2 pass through this boundary;
+raw Responses gateways retain their existing text-only compaction conversion.
+
 ## Direct MCP calls in code mode
 
 On routed bridge or converted-custom passthrough paths, when the request declares a
@@ -39,9 +60,9 @@ string on this wire instead of the numeric `thinking_budget` the Chat wire appli
 stays unpinned. `tests/providers/alibaba-token-plan-wire-defaults.test.ts` covers the pins and the
 replay flag.
 
-xAI keeps `openai-chat` as its provider-wide compatibility wire, but Grok 4.5/4.6/4.7 subscription
-Responses requests default to native `openai-responses`. Existing namespace, hosted-search and
-reasoning-replay normalization remains in force. The reserved `xai` OAuth transport is name-pinned
+Trusted custom Responses relays may opt into `preserveResponsesInputItemIds` and `preserveResponsesMessageMetadata` for launcher replay (#6220). Ordinary destinations still strip IDs when `store: false` and private `internal_chat_message_metadata_passthrough`; xAI custom-call ID repair remains active.
+
+xAI keeps `openai-chat` provider-wide; Grok 4.5/4.6/4.7 subscription Responses default to native `openai-responses`, retaining namespace, hosted-search and reasoning-replay normalization. The reserved `xai` OAuth transport is name-pinned
 to the Grok CLI gateway even if its saved base URL differs; custom provider IDs do not inherit this
 default. API-key requests, translated Chat/Anthropic defaults and other Grok models retain their
 existing wire and tier policy. The OAuth lane is service-tier classified per model
@@ -49,8 +70,8 @@ existing wire and tier policy. The OAuth lane is service-tier classified per mod
 `devlog/_plan/260923_grok47_parity/010_probe-evidence.md` records 4.7): grok-4.7, grok-4.6, grok-4.5,
 grok-4.3, grok-4.20-0309-reasoning, grok-4.20-0309-non-reasoning, grok-build-0.1 and
 grok-composer-2.5-fast accept `service_tier: "priority"` over Grok OAuth and echo it, so those
-routes resolve Fast-eligible, publish `--fast` rows, and forward a caller-sent tier on either
-wire (`chatServiceTier: true`). grok-4.20-multi-agent-0309 stays unclassified with its
+routes resolve Fast-eligible, publish `--fast` rows, and forward a caller-sent tier on either wire (`chatServiceTier: true`) — except OAuth grok-4.7, whose Fast serializes `grok-4.7-build-fast` with no tier ([xAI Grok](../providers/xai-grok.md#oauth-fast-tier-priority-processing)).
+grok-4.20-multi-agent-0309 stays unclassified with its
 caller-tier pin: the gateway accepts the field but answers `service_tier: "default"`, a live
 downgrade rather than a fast tier.
 
@@ -214,7 +235,6 @@ The restorable map is narrowed by `tool_choice` the same way `authorizedAliases`
 namespace layer: upstream still receives the whole aliased catalog, but a tool the caller
 disabled for the turn cannot be restored back into an executable client name.
 Arguments, user text, and schema property names are never rewritten.
-
 > Decision record: [ADR-0042](../decisions/ADR-0042-responses-http-sse.md)
 
 > Decision record: [ADR-0043](../decisions/ADR-0043-responses-http-sse.md)
@@ -227,7 +247,9 @@ Google wire compiler observes and reports compatibility narrowing; the Responses
 derive nor consume that report.
 
 `declaredToolNames` carries the request's tool catalog into both bridges, and it does two separate
-jobs that are separately controlled.
+jobs that are separately controlled. The passthrough guard reads the same CR/LF/CRLF event and
+field boundaries as Responses-to-Chat projection, including mixed and split line endings; the
+[shared SSE framing contract](byte-accounting.md#stream-buffer-accounting) owns that behavior.
 
 Normalization runs on every inbound wire. `normalizeDeclaredToolName` and `declaresCodeModeExec` in
 `src/types/tools.ts` read the same set to map a provider-invented `default.` namespace back to the
@@ -235,8 +257,7 @@ declared bare tool and to rewrite code-mode helper names into the declared `exec
 input unchanged when the set is absent, so the set reaches the bridge on every wire and enforcement
 is expressed by a separate flag rather than by withholding it.
 
-The passthrough guard resolves an emitted name through that same `normalizeDeclaredToolName`, so
-whatever it admits it must also EMIT under the resolved name. The two halves disagreed once:
+The passthrough guard resolves an emitted name through that same `normalizeDeclaredToolName`, so whatever it admits it must also EMIT under the resolved name. The two halves disagreed once:
 `normalizeDefaultNamespaceInItem` implemented only the bare-tool case (#4176), so a
 `default.`-prefixed code-mode helper was admitted as `exec` (#4412) and then relayed verbatim.
 The bounded helper vocabulary includes the goal lifecycle calls that Codex advertises inside its
@@ -355,7 +376,7 @@ destination receives unchanged whenever a caller sends one itself.
 ## Passthrough SSE stream shapes (#314)
 
 Native passthrough SSE has TWO shapes, selected per request in
-`src/server/responses/core.ts`:
+`src/server/responses/core.ts`; both apply the client-only [hosted-image projection](../data-planes/images.md#hosted-responses-image-display) after continuation-cache observers: `src/lib/errors.ts` selects the first nonblank string in the canonical upstream message precedence (error, last_error, response error, incomplete details, then a flat error event). Malformed or blank fields cannot hide a later valid diagnostic; retained text is not rewritten.
 
 - **Default outside Windows: tee + background inspection.** `upstreamResponse.body.tee()` sends
   branch[0] through a terminal-aware client relay while branch[1] is
@@ -375,26 +396,15 @@ Native passthrough SSE has TWO shapes, selected per request in
   inspection side-effect set (shared `createSseInspector` factory in `relay.ts`)
   including the #44 late-terminal semantics.
 
-Both client readers also retain a bounded, redacted message from a bare upstream
-`error` event. If EOF arrives without a real Responses terminal, they synthesize
-one `response.failed` with that message instead of replacing it with `adapter_eof`.
-That synthesized terminal also carries the upstream's own verdict. Codex classifies
-a `response.failed` by `error.code` alone and retries every code outside its fatal
-set, so a refusal stamped `upstream_server_error` reached the client as a retryable
-disconnect and drove a reconnect loop (#5176). The readers now read a refusal code
-and the message from the same candidate precedence, taking the first code present so
-a refusal nested below a transient one cannot overrule it, and fall back to
-recognized refusal copy only when the event carried no code at all. A refusal code
-with no message still produces a terminal, and a read that fails after a refusal was
-captured reports the refusal rather than a generic reset. Request-log accounting is
-unchanged: a row that ends on a refusal still records the transport-level status.
-The delivering reader owns this evidence; an asynchronous tee inspection branch
-cannot reliably supply it before EOF. Inspection independently applies the same
-bare-error rule when EOF arrives, so account health records failure instead of
-clearing avoidance as if the turn had succeeded. Existing real terminals and
-caller cancellation retain precedence on both branches. Native recovery preflight
-also preserves a rejected body reader and its bounded prefix for the normal
-mid-stream failure path; it does not turn that rejection into a decrypt retry.
+Both client readers retain a bounded, redacted message and the first structured refusal code from a bare upstream `error`.
+At EOF without a real terminal they synthesize `response.failed` rather than `adapter_eof`; a code without a message still
+produces a terminal. Codex retries codes outside its fatal set, so code and message follow the same candidate precedence;
+recognized refusal copy is used only when the event has no code. A read failure after refusal reports that refusal (#5176).
+The shared outbound rewrite masks diagnostics on real failed and incomplete terminals before SSE or buffered JSON delivery,
+while preserving status and output; failed turns are not retained as continuation state. Buffered JSON masks selected credentials in synthetic bare-error fields before log inspection or client formatting; request logs keep transport status.
+The delivering reader owns refusal evidence before EOF; asynchronous tee inspection cannot reliably supply it.
+Inspection still applies the bare-error rule at EOF for account health. Real terminals and caller cancellation take precedence.
+Native recovery preflight keeps the rejected body reader and bounded prefix for normal mid-stream failure, without decrypt retry.
 
 Native Responses may rebuild once when encrypted function/custom-tool output or
 agent-message content receives the exact known decrypt rejection before output
@@ -418,6 +428,17 @@ The two-shape contract is mirror-commented in `src/server/index.ts`; the real
 `core.ts` gate is source-invariant-tested by `tests/responses/passthrough-abort.test.ts`,
 and the platform matrix lives in `tests/lib/bun-stream-caps.test.ts`. Keep all three
 in lockstep with any passthrough-policy change.
+
+A non-streaming canonical ChatGPT client still uses the destination's SSE-only upstream path.
+The [Responses HTTP/SSE owner](responses.md#responses-httpsse) validates the first terminal
+and strictly covered output indices before publishing JSON or serving state; see [ADR-6162](../decisions/ADR-6162-responses-http-sse.md).
+Deferred inspection checks cancellation after each yield and commits serving-route state only
+after the final abort check; a disconnect returns 499 without publishing that state or a terminal.
+This buffered path makes no tee/eager choice. Failed and incomplete terminals mask selected outbound
+credentials across the full event, including nested output and metadata, before JSON or SSE delivery;
+synthetic stream failures use the same credential mask in both streaming relays.
+
+> Decision record: [ADR-6162](../decisions/ADR-6162-responses-http-sse.md)
 
 Canonical ChatGPT forward streaming has one transport-specific exception. A
 stable Bun runtime at or above 1.4.0 may use Codex's upstream
@@ -482,7 +503,7 @@ No pool timer or shutdown registration exists before eligible traffic activates 
 Translated response request-log tracking and the heartbeat relay also reuse
 `createSseInspector`. This keeps every client-facing SSE observation path on
 the same byte-bounded, discard-and-resynchronize frame policy and ensures the
-request-log, first-output, and terminal observers share one payload parse.
+request-log, first-output, and terminal observers share one payload parse. First-output timing recognizes nonempty text, reasoning, function-argument, and custom-tool-input deltas; empty deltas, tool scaffolding, control/echo frames, and terminal snapshots do not start it.
 The inspector records a structured `response.failed` status before invoking the
 terminal observer. Native Responses, Chat Completions, Claude Messages, and WebSocket
 request logs must therefore finalize through the context-aware terminal mapper; recognized
@@ -501,7 +522,7 @@ instead emits one `response.incomplete` with `adapter_eof`, followed by one `[DO
 EOF candidates follow the owning repair policy: the native boundary accepts a structurally valid
 terminal tail, while an opted-in terminal repair keeps its unframed suffix tainted and emits
 `missing_terminal_event`. Pull/tee and eager relays therefore agree on terminal, sentinel, and
-request-log accounting without promoting a truncated repair candidate.
+request-log accounting without promoting a truncated repair candidate. Terminal repair reconciles one delayed LF after a consumed CR delimiter, preserving its byte without treating it as an unframed EOF suffix; additional suffix bytes remain subject to the same strict check.
 
 > Decision record: [ADR-0044](../decisions/ADR-0044-responses-http-sse.md)
 
@@ -548,7 +569,20 @@ An injected combo default supplies `summary: "auto"` only when no summary was sp
 summary choices remain intact. Raw display and hidden-envelope replay follow
 [reasoning display parity](../providers/chat-compat.md#reasoning-display-parity-hidethinkingsummary).
 Final-route normalization preserves visible raw reasoning when the parsed request has a validated
-active effort and omits summary; explicit `summary: "none"` still hides it.
+active effort and omits summary; explicit `summary: "none"` still hides it (passthrough strips that internal marker before the upstream send).
+The provider policy `hideRawReasoning` suppresses the raw `reasoning_raw_delta` channel only —
+openai-chat `reasoning_content`, kiro tags, and Gemini thought parts on routes that do not return
+thought summaries (direct and Vertex Gemini; a `cloud-code-assist` Gemini route emits its thought
+parts as `thinking_delta` instead, so the switch leaves them visible) — while `thinking_delta`
+summaries keep streaming. The option controls display, not confidentiality: a Responses bridge
+route still sends the suppressed text to the client inside the txt-only `ocxr1` envelope
+(`encrypted_content`, base64 JSON, echoed back for replay), while the direct Chat and Messages
+encoders emit no envelope at all (the Chat wire has no field for one, and the Messages encoder
+emits no thinking block for a signature-less close), leaving replay to the server-side cache the
+delivery's terminal fold fills. That fold builds no `ocxr1` envelope (`omitHiddenReasoningEnvelope`),
+so a block that fit the live stream cannot overflow the translator budget there and skip the cache
+write. A fallback route without the option shows raw reasoning again. A native passthrough route
+relays the upstream's own frames and ignores the option.
 
 ## Codex App visualization references
 

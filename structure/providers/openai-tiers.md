@@ -18,6 +18,25 @@ earlier three-tier implementation. The replacement contract and its verification
 
 ## Public provider contract
 
+In Pool mode, ordinary main/pool WHAM queries share `src/codex/quota-query-backoff.ts`: transport and non-auth
+HTTP failures and unusable HTTP 200 bodies defer later queries (including forced refreshes) for
+5, 10, 20, 40, then 60 minutes. Same-key callers join one read through body validation and
+receive its settled result; only a confirmed reset-credit consume selects the separate post-reset
+proof epoch. Its failure deadline is also recorded for ordinary main reads under the same credential,
+so the epoch never bypasses pacing. Holding a native-main shared claim by itself does not bypass it.
+Outside Pool mode, main usage reads retain their independent forced-refresh behavior.
+A valid Retry-After can extend the delay under the existing bounded cooldown parser. Usable published
+usage, including a post-reset epoch result, clears failure pacing for the same credential only;
+401/403 retain the existing authentication recovery policy. Keys are scoped to
+configuration home, config generation and credential generation; no credentials are retained.
+Deferred calls publish neither fresh quota nor dispatch proof and do not advance quota timestamps.
+The bounded process-local failure cache resets on restart; active reads are never evicted to admit
+another key. Reserve and login probes are separate.
+Removing a pool account prunes its query pacing before provider eligibility is checked; a late
+completion from the removed account cannot restore that state.
+The reset-derived cooldown recovery worker keeps its own five-minute claim interval and sweep clock;
+it can retry past ordinary failure pacing, but still honors an explicit WHAM `Retry-After` deadline.
+
 | Provider id | Product route | Credential owner | Account selection |
 | --- | --- | --- | --- |
 | `openai` | Codex login | current caller/main login plus the hardened Codex account store | `codexAccountMode` is `"pool"` or `"direct"`; missing mode defaults to Pool |
@@ -159,6 +178,9 @@ alone for the rotation gate and fails closed, so only positive evidence changes 
 stable `__main__` alias remains visible for maintenance and quota reads, but is excluded from new
 affinity, quota rotation, cooldown probes, transient failover, and manual activation. In-flight
 requests keep their captured credential. An all-paused pool fails closed.
+Manual pause/resume synchronizes existing entries with a confirmed matching account and workspace,
+including a duplicated main login. [Account operations](openai-accounts.md#manual-account-pause-and-resume)
+owns identity matching and publication; automatic quota policies retain their per-entry decisions.
 The dashboard's bulk pause action refreshes all account quotas and mutates only accounts whose
 plan-relevant window is freshly confirmed at exactly 100%; unknown and failed refreshes are skipped.
 
@@ -274,6 +296,33 @@ admission source, still forward unchanged, as does a `gpt-reserve` selector an o
 or routed onto a noncanonical provider. Enabling the flag restores eligibility rather than the
 refusal, so the two predicates can never both hold.
 
+### Spendable Codex credits
+
+WHAM `credits` is spendable usage capacity, separate from manually redeemed
+`rate_limit_reset_credits`. The quota store keeps normalized flags, a finite nonnegative balance,
+and a separate observation clock. Explicit zero/null replaces earlier evidence; partial usage
+headers retain its original clock. A positive balance with `has_credits`, or unlimited credits,
+can keep an account selectable at 100% included usage for five minutes only when its id is in
+`creditCodexAccountIds`. Balance evidence never grants permission: unlisted accounts retain the
+default 100% hold, and opted-in accounts require fresh evidence. Included-plan `rate_limit.allowed`
+does not grant or veto credit spending; a present non-null `spend_control` must be an object with
+`reached: false`, and a reached or malformed control or an overage limit defeats that credit evidence.
+Absent/null controls impose no veto. A refusing control retracts cached credits even without a
+credits field or usage windows. Existing cached refusal flags are retained
+until a fresh WHAM credits observation replaces them. Selection caps its usage score
+at 99 so accounts with more included headroom remain preferred; observed percentage bars stay
+unchanged. Bulk pause and complete-snapshot recovery use the same credit decision. Credits-only
+payloads cannot clear cooldowns, actual request refusals still drive cooldown/failover, and the
+default-on main-account hard lock retains its separate local admission policy. Registration
+warmup remains conservative and does not spend paid credits to validate an exhausted account.
+
+Credit parsing, expiry, partial updates and reset-ticket separation are covered in
+`tests/codex-integration/codex-quota-parser-parity.test.ts`; selection and bulk-pause behavior
+are covered in `tests/codex-integration/codex-credits-after-limit.test.ts` and
+`tests/codex-integration/codex-credits-after-limit-main.test.ts`, alongside the general routing,
+bulk-pause and recovery suites `tests/codex-integration/codex-routing.test.ts`,
+`tests/codex-integration/codex-auth-api.test.ts` and `tests/codex-integration/codex-cooldown-recovery.test.ts`.
+
 ### Quota cache and short-window history
 
 `src/codex/quota.ts` drops an omitted account-level short tuple from the display/rotation
@@ -285,7 +334,7 @@ This stops partial weekly/Spark or credits-only refreshes from renewing obsolete
 The separately retained main-policy snapshot preserves omitted blocking short evidence even after
 its reset clock passes. Credits-only, partial weekly-only, and metadata-only updates cannot remove an
 existing blocking short usage reading or release its hard lock; a fresh short reading can replace
-it. A validated long-primary WHAM snapshot can also retire the short tuple as described below.
+it. A validated complete WHAM snapshot can also retire the short tuple as described below.
 Expired non-blocking short evidence is dropped, so it cannot take priority over a fresh blocking weekly reading.
 
 The Codex writer explicitly asks `src/quota/reset-observer.ts` to retain an absent short window
@@ -298,18 +347,27 @@ Regression coverage lives in `tests/codex-integration/codex-quota-parser-parity.
 `tests/usage/quota-reset-observation.test.ts`, and `tests/usage/quota-reset-seen-store.test.ts`.
 
 `codexMainAccountHardLock` is a local admission policy that is **on by default** since #5694, at
-`MAIN_ACCOUNT_HARD_LOCK_PERCENT` = 98%. The 5h/short window and the weekly window each govern on
-their own: either one at 98% blocks, and an unknown or invalid reading in one never hides a block
+short 90% and long `MAIN_ACCOUNT_HARD_LOCK_PERCENT` = 98%, overridden by ordered integer
+`codexMainAccountHardLockThresholds` in 80..100. The 5h/short and weekly windows each govern on
+their own: either one reaching its effective threshold blocks, and an unknown or invalid reading in one never hides a block
 in the other (unknown still admits). Monthly governs only a monthly-only account. A block holds
-until every blocking window reads lower, so its reported `resetAt` is the latest blocking reset,
+until every blocking window reads lower or is authoritatively absent, so `resetAt` is the latest blocking reset,
 omitted when any blocking window has none. In the policy snapshot a reset-only weekly observation
 keeps a blocking weekly tuple, mirroring the short-window rule; monthly-primary evidence still replaces it.
 It blocks newly admitted identity-matched main-account requests. Pool alternatives remain eligible;
 explicit main selection and stored Direct substitution do not override it. It neither pauses the
 account nor clears upstream cooldown/reauth state, and management quota refresh remains available.
-Only a fresh valid reading below 98%, including 0%, releases a measured block; passing a reset
-timestamp alone does not. While blocked, the existing once-per-minute background sweep refreshes
-owned main usage, with bounded/coalesced reads and no inference or reset-credit consumption. Failed,
+Fresh valid usage below the effective threshold, including 0%, or validated WHAM absence retires a measured short block;
+passing a reset timestamp alone does not. The minute sweep waits locally until the latest known blocking reset;
+when no future reset is known or reads remain blocked, main recovery uses the same capped
+5/10/20/40/60-minute delay calculation as usage-query failures. Skipped ticks do not extend it;
+the physical bearer is reconciled before checking the delay, and late results cannot charge
+a replacement credential. A longer valid Retry-After from any main usage reader is checked for the
+current credential before the recovery worker takes a profile lease or prepares a token; a replacement
+credential has a separate key and may proceed immediately.
+Nonterminal 401/403 responses do not arm the successful-but-blocked recovery delay; the next
+sweep may retry, while terminal authentication failure keeps its reauth quarantine.
+Only fresh lower usage or validated window absence releases the lock; no reset-credit consumption is added. Failed,
 missing, non-finite or out-of-range readings do not release the block. Policy validation precedes
 legacy clamping. Supplementary monthly data cannot become the fallback governing window without a
 monthly-only plan or explicit primary-monthly evidence. Previously unobserved usage is unknown, not
@@ -326,24 +384,26 @@ policy.
 The trade-off is admission, not accounting. The main account's Luna Reserve needs an exhausted
 ordinary window to activate, so while the lock is blocking Reserve cannot engage; an operator who
 wants Reserve turns the setting off rather than deleting the key. This is not a reservation of the
-last 2%: already-admitted, parallel, unmatched-keyring, or direct upstream traffic can still reach
+remaining headroom: already-admitted, parallel, unmatched-keyring, or direct upstream traffic can still reach
 exhaustion. Settings and the main-account DTO report enabled state separately from the current
 `off`, `unknown`, `ready`, or `blocked` status. Status semantics stay in
-`tests/codex-integration/main-account-hard-lock-policy.test.ts`; the default-on resolver, the 98%
-boundary, the admission consequence, and the settings opt-out round trip are covered by the
+`tests/codex-integration/main-account-hard-lock-policy.test.ts`; the default-on resolver, the per-window
+boundaries, the admission consequence, and the settings opt-out round trip are covered by the
 hard-lock tests registered in `scripts/test-layout/layout.json`, including
 `tests/config/settings-main-account-hard-lock.test.ts`.
 
-A single fresh valid WHAM response with an explicitly long primary window can replace an obsolete
-short-window tuple when secondary and tertiary windows are explicitly null or also explicitly long with a valid usage reading.
+A single fresh valid WHAM response with a measured long primary, or an explicitly null primary and
+measured secondary that supplies parsed weekly usage, can replace an obsolete short-window tuple.
+Secondary and tertiary must each be explicitly null or explicitly long with a valid usage reading.
 Long means **at least 24 hours**, matching the parser's short/long discriminator; a one-day primary
 qualifies, not only a seven-day or monthly window. The policy trusts that one reported topology;
 it does not require repeated observations or independently confirm upstream window completeness.
-Omitted secondary/tertiary fields, a long auxiliary window without a usage reading, an unknown primary duration, partial headers, or invalid usage cannot prove that the
-short window disappeared. Replacement proof belongs only to that observation and is never persisted;
-the resulting weekly/monthly window still blocks at 98%. This prevents old short-window exhaustion
+Any omitted window field, an unreadable long window, an unknown duration, partial headers, or invalid usage
+cannot prove that the short window disappeared. All-null credits-only and tertiary-only Go/Free responses remain insufficient. Replacement proof belongs only to that observation and is never persisted;
+the resulting weekly/monthly window still blocks at its long threshold (98% by default). This prevents old short-window exhaustion
 from surviving indefinitely on a now weekly/monthly account. Coverage lives in
 `tests/codex-integration/main-quota-evidence-validation.test.ts`,
+`tests/codex-integration/main-account-hard-lock-retirement.test.ts`,
 `tests/codex-integration/main-quota-provenance.test.ts`, and
 `tests/codex-integration/main-account-hard-lock-recovery.test.ts`.
 
@@ -353,6 +413,20 @@ invalidates old evidence. Request-owned bearers are matched only against a crede
 workspace already observed under native ownership; an unrelated or unmatched keyring credential
 is not attributed to stored main and introduces no physical-main read. Credential equality tags
 remain process-local and never enter disk, logs, or management DTOs.
+`src/codex/auth-api/main-account-probe.ts` re-reads the bounded stored main credential and
+rechecks its writer, bearer and generation after body/retry awaits, before publishing main usage,
+credits, plan, reauth or Reserve state, including terminal 401/403 mutations. An unreadable file
+or missing identity writer cannot bypass this check. A same-account bearer replacement is detected
+even with no second probe; an observed A→B→A transition remains fenced by its generation. An
+unchanged credential still permits an older success.
+Successful same-identity responses may still return parsed ordinary info to their caller, without
+shared-state updates, fresh quota or recovery proof. The account-list card uses the published cache
+for such a return, so its displayed quota agrees with the hard-lock state. The snapshot retains the
+unpublished marker, and Direct provider quota drops that response and any older cached report
+rather than reporting stale windows. Conflicting identities
+and stale errors return cached info. The request/body races and card projection are covered by
+`tests/codex-integration/main-account-hard-lock-recovery.test.ts`; the ordinary return and Reserve
+revocation contract remains covered by `tests/codex-integration/reserve-passive-revocation.test.ts`.
 
 Owned startup rebuilds this binding from its pinned auth path under the native owner and exclusive
 claim, after journal recovery and stage cleanup, before publishing ready. That work now runs for

@@ -68,15 +68,15 @@ export interface TransientRetryPolicy {
 }
 
 /**
- * Opt-in replacement of a native Responses send whose upstream connection closed while the
+ * Opt-in replacement of a Responses send whose upstream connection closed while the
  * caller had observed nothing (`providers.<name>.retryOnReset`).
  *
- * Covers both ambiguous stages the proxy can be in: no response head at all, and a head whose
- * SSE body carried only control events. Disabled unless the object is present; a bare `{}`
- * opts in with defaults. Only a request the proxy can judge self-contained is ever replaced;
- * see `src/server/responses/reset-replay.ts`. The replacement inference may still be billed if
- * the origin had already started the first one, which is what makes this opt-in rather than
- * default.
+ * Native Responses covers pre-header resets and post-header SSE carrying only control events.
+ * Generic translated dispatch covers initial and rebuilt pre-header sends, sharing the same
+ * grant and send budget; adapter-owned transports and translated post-header failures are excluded.
+ * Disabled unless present; `{}` opts in. Only self-contained requests qualify (see
+ * `src/server/responses/reset-replay.ts`). Replacement inference may still be billed if the
+ * origin had already started the first one, so this is opt-in rather than default.
  */
 export interface ResetReplayPolicy {
   /** Master switch. Presence of the object also enables the policy (default true). */
@@ -197,8 +197,10 @@ export interface FastWire {
    * `service_tier` request field; `cursor-variant` is a MODEL-VARIANT switch, because
    * Cursor has no tier field — its fast product is a different model id
    * (`claude-opus-5-thinking-high-fast`) or a `{id:"fast"}` request parameter for Grok.
+   * `model-variant` is internal only (config validation rejects it): the xAI OAuth Fast lane switch in
+   * src/providers/xai-fast-model.ts, whose only wire value is the serialized model id.
    */
-  kind: "service-tier" | "anthropic-speed" | "cursor-variant";
+  kind: "service-tier" | "anthropic-speed" | "cursor-variant" | "model-variant";
   /** Canonical tier name to upstream wire spelling. */
   canonicalToWire: Readonly<Record<string, string>>;
   /** Policy for non-canonical caller-provided tier values. */
@@ -272,6 +274,8 @@ export interface ModelCapabilities {
 }
 
 export interface OcxProviderConfig {
+  /** Optional browser-compatible outbound TLS profile; disabled by default. */
+  tlsProfile?: "antigravity-browser";
   /** Optional short provider namespace used only at request/catalog presentation time. */
   alias?: string;
   /** Native model id -> short, slash-free request alias. */
@@ -340,6 +344,8 @@ export interface OcxProviderConfig {
    * version here instead of waiting for a code change. Absent uses the adapter's current default.
    */
   commandCodeVersion?: string;
+  /** Include bounded repository context in Command Code envelopes. Default omitted/off sends empty memory/taste/skills. */
+  projectContext?: "off" | "on";
   /**
    * Responses upstream that stores nothing server-side (DeepSeek documents "the API
    * is stateless"). Stateful request parameters are dropped, `store` is pinned false,
@@ -405,6 +411,22 @@ export interface OcxProviderConfig {
    * `ocxr1` envelopes are still stripped because no upstream can decrypt them.
    */
   preserveResponsesReasoningContent?: boolean;
+  /**
+   * Whether to preserve Codex-private `input[].id` on `store: false` requests.
+   * Disabled by default: ordinary Responses upstreams interpret input IDs as references
+   * to nonexistent stored items and return 404. Upstream launcher relays such as
+   * Codex Web GPT (`chatgpt-web/*`) require the current-turn user message ID for
+   * browser-session replay (#6220).
+   */
+  preserveResponsesInputItemIds?: boolean;
+  /**
+   * Whether to preserve ChatGPT-internal `internal_chat_message_metadata_passthrough`
+   * on outgoing input messages for noncanonical destinations. Disabled by default:
+   * public Responses gateways reject the private field as an unknown parameter.
+   * Upstream launcher relays such as Codex Web GPT require this metadata (or the item ID)
+   * to extract turn provenance (#6220).
+   */
+  preserveResponsesMessageMetadata?: boolean;
   /**
    * Treat this provider's `modelReasoningEfforts` as authoritative at the wire, not only in the
    * catalog. Adapters that ship their own per-model effort table (currently `command-code`)
@@ -595,6 +617,8 @@ export interface OcxProviderConfig {
   contextWindow?: number;
   /** Per-model fallback when context metadata is absent; otherwise caps the reported window. */
   modelContextWindows?: Record<string, number>;
+  /** Per-model Copilot upstream tier; only the github-copilot route sends it. */
+  modelContextTiers?: Record<string, "default" | "long_context">;
   /** Model-specific Codex catalog input modalities, e.g. ["text"] or ["text", "image"]. */
   modelInputModalities?: Record<string, string[]>;
   modelCapabilities?: Record<string, ModelCapabilities>;
@@ -644,6 +668,8 @@ export interface OcxProviderConfig {
    */
   autoReviewModelOverrides?: Record<string, string>;
   headers?: Record<string, string>;
+  /** Inbound client metadata headers to copy to this provider when the outbound field is otherwise unset. */
+  forwardClientHeaders?: string[];
   /** Default provider-routing preferences for models sent through the canonical OpenRouter API. */
   openRouterRouting?: OpenRouterProviderRouting;
   /** Exact model-id overrides for `openRouterRouting`. Each matching entry replaces the default. */
@@ -963,6 +989,14 @@ export interface OcxProviderConfig {
    */
   showThinkingSummary?: boolean;
   /**
+   * Keep raw content-channel reasoning out of client frames for this provider. Provider-authored
+   * summaries (thinking_delta) stay visible, so an opted-in operator loses no summary; an explicit
+   * wire summary:"none" still hides both. This is a display control, not a confidentiality boundary:
+   * a Responses bridge route still carries the text to the client in the base64 `ocxr1` replay
+   * envelope; direct Chat/Messages encoders send no copy and replay from the server-side cache.
+   */
+  hideRawReasoning?: boolean;
+  /**
    * Opt-in same-target 429 retry policy. Codex itself never retries 429 (it retries 5xx only,
    * openai/codex#30471), and single-key pools have no failover, so the proxy waits and replays
    * the identical request on the same key before any failover. Pre-stream only: a 429 arrives
@@ -976,9 +1010,9 @@ export interface OcxProviderConfig {
    */
   transientRetryOn5xx?: TransientRetryPolicy;
   /**
-   * Opt-in replacement of a native Responses send that died while the caller had observed
-   * nothing (`providers.<name>.retryOnReset`). Disabled unless present; a bare `{}` opts in
-   * with defaults. Native Responses sends only, and only for self-contained requests.
+   * Opt-in replacement of self-contained Responses sends (`providers.<name>.retryOnReset`).
+   * Disabled unless present; `{}` opts in. Native sends and generic translated initial/rebuilt
+   * pre-header sends share the grant/budget; adapter-owned and translated post-header failures are excluded.
    */
   retryOnReset?: ResetReplayPolicy;
   /**

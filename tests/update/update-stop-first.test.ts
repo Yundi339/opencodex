@@ -552,7 +552,7 @@ describe("update stops the running proxy before replacing files", () => {
   test("cache access gates in both CLI entry points precede every tray/proxy stop", () => {
     const runtimeGate = updateSource.indexOf("const cachePreflight = runNpmCachePreflight();");
     const runtimeStop = updateSource.indexOf('selfLaunchArgv(["stop"])');
-    const launcherGate = launcherSource.indexOf("const cachePreflight = runNpmCachePreflight();");
+    const launcherGate = launcherSource.indexOf("runNpmCachePreflight({ cachePath: npmCache.path })");
     const launcherTrayStop = launcherSource.indexOf('runTrayLifecycle(launcher, "stop")');
     const launcherProxyStop = launcherSource.indexOf('[launcher, "stop"]');
 
@@ -561,6 +561,8 @@ describe("update stops the running proxy before replacing files", () => {
     expect(runtimeGate).toBeLessThan(runtimeStop);
     expect(launcherGate).toBeLessThan(launcherTrayStop);
     expect(launcherGate).toBeLessThan(launcherProxyStop);
+    // #6288: the stage installs into the very cache root the gate checked.
+    expect(launcherSource.indexOf("cachePath: npmCachePath,")).toBeGreaterThan(launcherSource.indexOf("transactionalNpmUpdate({"));
   });
 
   test("npm launcher update path stops via its own launcher path before npm install", () => {
@@ -685,6 +687,12 @@ esac
         expect(result.exitCode).toBe(1);
         expect(output).toContain("Stopping the running proxy before updating");
         expect(output).toContain("restarting the previous version directly");
+        expect(output).toContain("'ocx status'");
+        expect(output).toContain("let any in-progress recovery finish");
+        expect(output).toContain("confirm it has stopped before installing");
+        expect(output).toContain("'ocx stop'");
+        expect(output).toContain("Then run: npm install -g");
+        expect(output.indexOf("'ocx stop'")).toBeLessThan(output.indexOf("Then run: npm install -g"));
         expect(output).toContain(`Attempting to restart the proxy on port ${port}.`);
         expect(await waitForProxy(port, lastProbe => {
           console.error(new Error([

@@ -1,9 +1,13 @@
+import { isSubagentModelEntry, rawSubagentModelForce } from "./subagent-models";
+import { protocolConfigSchema } from "./schema/config-schema";
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import * as z from "zod/v4";
 import { compactionRecoveryConfigError } from "./schema/compaction-recovery";
+import { blockedModelRedirectsError } from "./schema/blocked-model-redirects";
 import type { OcxConfig } from "../types";
+import { parseAnthropicModelRoutes } from "../oauth/anthropic-model-routes";
 import { configReasoningPinsConfigError } from "./provider-validation";
 import { loopbackCompanionAllowed } from "../codex/loopback-target";
 import { UPSTREAM_HOST_CIRCUIT_MAX_THRESHOLD } from "../codex/upstream-host-health";
@@ -62,6 +66,8 @@ import {
   remoteGuiConfigSchema,
   runtimeRoleSchema,
   spendSchema,
+  chatgptDesktopSchema,
+  chatgptDesktopConfigIssue,
   compactionRoutingSchema,
   skillsConfigSchema,
   memoryModelsSchema,
@@ -97,12 +103,20 @@ function validFileConfigDiagnostics(config: OcxConfig, rawParsed: unknown): Conf
   // the entire config, which would hide unrelated providers/accounts. The next
   // ordinary save persists the normalized absence.
   const syncDisabledReason = nativeSubagentSyncDisabledReason(config, rawParsed);
+  const rawForce = rawSubagentModelForce(rawParsed);
   const rawEffort = rawClaudeSubagentEffort(rawParsed);
   const normalized = normalizeClaudeSubagentEffort(normalizeNativeSubagentSync(config, rawParsed), rawParsed);
   const warnings = configPlaceholderWarnings(normalized);
+  if (rawForce !== undefined && !isSubagentModelEntry(rawForce)) warnings.push("claudeCode.subagentModelForce ignored: expected a safe roster-style model id");
+  if (normalized.chatgptDesktop?.appServerShim === true && process.platform !== "darwin") {
+    warnings.push("chatgptDesktop.appServerShim is experimental and macOS only; ignored on this platform");
+  }
+  const chatgptDesktopIssue = chatgptDesktopConfigIssue(rawParsed);
+  if (chatgptDesktopIssue) warnings.push(`${chatgptDesktopIssue}; the whole chatgptDesktop block is ignored, so the ChatGPT desktop integration reads as off`);
   warnings.push(...inheritedFastWireConflictProviderNames(normalized).map(inheritedFastWireConflictWarning));
   warnings.push(...degradedCodexAccountPriorityWarnings(rawParsed, normalized));
   warnings.push(...degradedListenerWarnings(rawParsed, normalized));
+  if (blockedModelRedirectsError(rawParsed)) warnings.push("blockedModelRedirects ignored: expected a map of nonempty model keys to nonempty string targets");
   const quotaAutoRefreshWarning = degradedCodexQuotaAutoRefreshWarning(rawParsed, normalized);
   if (quotaAutoRefreshWarning) warnings.push(quotaAutoRefreshWarning);
   if (rawEffort !== undefined && !isClaudeSubagentEffort(rawEffort)) {
@@ -452,6 +466,23 @@ function dropCodexSafetyBufferingError(value: unknown): string | null {
   return "schema_invalid: dropCodexSafetyBuffering: must be a boolean or omitted";
 }
 
+function showCodexCreditsError(value: unknown): string | null {
+  const raw = rawConfigRecord(value);
+  if (!raw || !Object.hasOwn(raw, "showCodexCredits")) return null;
+  const enabled = raw.showCodexCredits;
+  if (enabled === undefined || typeof enabled === "boolean") return null;
+  return "schema_invalid: showCodexCredits: must be a boolean or omitted";
+}
+
+function creditCodexAccountIdsError(value: unknown): string | null {
+  const raw = rawConfigRecord(value);
+  if (!raw || !Object.hasOwn(raw, "creditCodexAccountIds")) return null;
+  const ids = raw.creditCodexAccountIds;
+  if (ids === undefined) return null;
+  if (Array.isArray(ids) && ids.every(id => typeof id === "string" && /^[a-zA-Z0-9._-]{1,64}$/.test(id))) return null;
+  return "schema_invalid: creditCodexAccountIds: must be an array of account ids or omitted";
+}
+
 function oauthOpenBrowserError(value: unknown): string | null {
   const raw = rawConfigRecord(value);
   if (!raw || !Object.hasOwn(raw, "oauthOpenBrowser")) return null;
@@ -608,6 +639,10 @@ function skillsConfigError(value: unknown): string | null {
 }
 
 export function validateConfigCandidate(value: unknown): { ok: true; config: OcxConfig } | { ok: false; error: string } {
+  const chatgptDesktop = rawConfigRecord(value)?.chatgptDesktop;
+  if (chatgptDesktop !== undefined && !chatgptDesktopSchema.safeParse(chatgptDesktop).success) {
+    return { ok: false, error: "schema_invalid: chatgptDesktop: requires an optional boolean appServerShim and no other fields" };
+  }
   const compactionRouting = rawConfigRecord(value)?.compactionRouting;
   if (compactionRouting !== undefined && !compactionRoutingSchema.safeParse(compactionRouting).success) {
     return { ok: false, error: "schema_invalid: compactionRouting: requires a nonblank model, an optional valid reasoningEffort, and optional non-repeating triggers drawn from \"manual\" and \"auto\"" };
@@ -616,8 +651,27 @@ export function validateConfigCandidate(value: unknown): { ok: true; config: Ocx
   if (memoryModels !== undefined && !memoryModelsSchema.safeParse(memoryModels).success) {
     return { ok: false, error: "schema_invalid: memoryModels: requires a nonblank model and an optional declared reasoningEffort per configured phase, and no other fields" };
   }
-  const boundaryError = compactionRecoveryConfigError(value) ?? configReasoningPinsConfigError(value)
+  const protocols = rawConfigRecord(value)?.protocols;
+  if (protocols !== undefined && !protocolConfigSchema.safeParse(protocols).success) {
+    return { ok: false, error: "schema_invalid: protocols: expected valid protocol policy and boolean rollout flags" };
+  }
+  const rawAnthropicPool = rawConfigRecord(value)?.anthropicAccountPool;
+  const anthropicPool = rawConfigRecord(rawAnthropicPool);
+  if (rawAnthropicPool !== undefined && !anthropicPool) {
+    return { ok: false, error: "schema_invalid: anthropicAccountPool: must be an object" };
+  }
+  if (anthropicPool && Object.hasOwn(anthropicPool, "nativeMessages") && typeof anthropicPool.nativeMessages !== "boolean") {
+    return { ok: false, error: "schema_invalid: anthropicAccountPool.nativeMessages: must be a boolean" };
+  }
+  const routeValue = anthropicPool?.routes;
+  if (routeValue !== undefined) {
+    const parsed = parseAnthropicModelRoutes(routeValue);
+    if (!parsed.ok) return { ok: false, error: `schema_invalid: anthropicAccountPool.routes: ${parsed.error}` };
+  }
+  const boundaryError = blockedModelRedirectsError(value)
+    ?? compactionRecoveryConfigError(value) ?? configReasoningPinsConfigError(value)
     ?? blankHostnameError(value)
+    ?? (rawSubagentModelForce(value) !== undefined && !isSubagentModelEntry(rawSubagentModelForce(value)) ? "schema_invalid: claudeCode.subagentModelForce: expected a safe roster-style model id" : null)
     ?? claudeSubagentEffortError(value)
     ?? appOwnedMemoryBudgetError(value)
     ?? upstreamHostCircuitThresholdError(value)
@@ -636,6 +690,8 @@ export function validateConfigCandidate(value: unknown): { ok: true; config: Ocx
     ?? emptyCompletionRetryError(value)
     ?? dropCodexSafetyBufferingError(value)
     ?? oauthOpenBrowserError(value)
+    ?? showCodexCreditsError(value)
+    ?? creditCodexAccountIdsError(value)
     ?? runtimeRoleError(value)
     ?? remoteGuiConfigError(value)
     ?? clientConnectionConfigError(value)
@@ -690,6 +746,8 @@ export function configDiagnosticsFromRaw(raw: string): ConfigDiagnostics {
     if (salvaged) {
       const config = normalizeApiKeyIds(salvaged.parsed);
       const warnings = degradedListenerWarnings(parsed, config);
+      const chatgptDesktopIssue = chatgptDesktopConfigIssue(parsed);
+      if (chatgptDesktopIssue) warnings.push(`${chatgptDesktopIssue}; the whole chatgptDesktop block is ignored, so the ChatGPT desktop integration reads as off`);
       return {
         config,
         source: "fallback",

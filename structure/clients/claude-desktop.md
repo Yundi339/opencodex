@@ -29,6 +29,29 @@ Native OpenAI pool routing also accepts
 [Orca-linked accounts](../codex-home.md#orca-source-owned-account-import), whose source resolution
 belongs to the shared account store. The import CLI adds pool rows independently of Desktop profiles.
 
+## Devin Messages output ordering
+
+`src/claude/devin-output-order.ts` orders each physical Devin turn after raw-event preflight in
+`src/server/responses/run-turn-execution.ts` when the original inbound wire is Anthropic
+Messages. Provider names may be customized; the selected adapter determines applicability.
+Text and tool events wait for that turn's terminal so Cognition's late reasoning signature
+precedes them. Claude Code therefore receives a final text or tool block rather than an empty
+signature-only thinking block. Reasoning and transport progress remain live; answer text and
+tool dispatch incur turn-completion latency. Responses and Chat retain their original ordering,
+and routed compaction is excluded.
+
+Retained events own deep snapshots, including nested usage, so producer/consumer mutations
+cannot alter their measured payload. They share the request translator budget and drain on demand without a synchronous
+burst into the adapter queue. They are released on terminal, cancellation, overflow, or adapter
+EOF. Overflow emits one typed `translation_buffer_limit` error and aborts only active Devin
+producers, preserving error classification through hosted search. Cancellation drops held
+semantic output; this consumer preserves error terminals and maps cancelled success/incomplete
+terminals to a 499 with their original usage, so partial output cannot commit completed replay
+state. Hosted search retains its existing independent cancellation mapping.
+Adapter error and incomplete terminals retain partial output and their original usage.
+Ordering occurs before hosted-search interception, independently for each physical iteration,
+so one iteration's signature cannot be attached to another iteration's answer.
+
 ## Desktop modes: gateway and first-party
 
 `src/claude/desktop-first-party.ts` owns the Desktop mode contract. Two modes exist and are
@@ -57,6 +80,8 @@ only while CLI first-party intent is off. An owned env observed with
 `claudeCode.cliFirstParty === true` is not Desktop-mode evidence, even when the
 intercept is disabled; foreign proxy settings do not count.
 `resolveClaudeDesktopApplyMode` preserves the resolved mode.
+First-party apply refuses `port_mismatch` before writing settings when the configured proxy port differs from the bound pair. Picker listener failures show their reason instead of offering a main-pair start that cannot repair them.
+
 An apply for a first-party install with `claudeCode.intercept.enabled: false` is refused with
 `intercept_disabled` rather than switched to gateway. New installs apply gateway.
 `src/claude/desktop-risk.ts` owns the account-suspension warning: first-party sends subscription
@@ -129,7 +154,7 @@ row; the only lever is the picker's Anthropic id on each request. A binding maps
 bindings overlaid (binding wins per key, `native/` targets normalized to the bare slug, global values
 left verbatim). The live config object is never copied or persisted with the merged map. Every other
 resolution rule is unchanged, so a bound id is translated rather than natively passed through, dated
-ids reach undated keys, and an `ocx-route` directive still wins. `ocx claude` sessions and the public
+ids reach undated keys, and an `ocx-route` directive still wins over a bare model id; an explicit gateway selector wins over that legacy fallback. `ocx claude` sessions and the public
 Messages listener never see bindings.
 
 `PUT /api/claude-desktop/first-party-bindings` (`{ set?, remove? }`) validates ids and routes against
@@ -154,9 +179,10 @@ The shared CONNECT primitive accepts optional `allowedTargets` authorities. It s
 normalizes that list at startup; an empty list denies all, and other host/port pairs receive 403
 before tunnel selection or dialing. Authentication and loopback refusal remain in force.
 Existing Claude consumers omit this option and retain blind forwarding; it enables no new integration or certificate trust.
+Windows local-CA publication in `src/claude/intercept/local-ca-files.ts` hardens legacy inherited DACLs only after verifying the current owner and exclusively current-user, SYSTEM or Administrators grants; already private directories skip hardening. Newly created exclusive files and directories are hardened before strict owner/ACL verification and before CA access. ACL verification, including inherited SQLite sidecar ACLs, is memoized by bigint device/inode/birthtime within one publication; birthtime distinguishes recycled file IDs while preserving same-volume rename identity. Path and descriptor identity checks remain active on every access, and removed or replaced entries retire their memo.
 The authority primitive accepts `validityDays` from 1 through 3650 for short-lived callers; omitted values preserve the existing 3650-day CA lifetime. This parameter does not install trust or rotate an existing authority.
 
-When the lifecycle passes `loadPickerRoutes` (the server always does), `startClaudeIntercept` also
+On macOS, when the lifecycle passes `loadPickerRoutes` (the server always does), `startClaudeIntercept` also
 wires Claude Desktop picker mode: a second loopback CONNECT proxy on the dedicated picker proxy
 port (`getClaudeInterceptState()?.pickerProxyPort`), used as Desktop's pinned egress proxy. Desktop
 also hands that proxy to the Claude Code processes it spawns, and the two trust different CAs, so
@@ -173,20 +199,46 @@ The User-Agent is a routing hint, not a trust boundary: a client that fakes it r
 any local process already reaches (the `api.anthropic.com` intercept is on the Claude Code proxy
 too; the `claude.ai` relay verifies upstream and adds no credential) and breaks only its own TLS,
 because each terminator presents a certificate only its intended client trusts. `claude.ai:443` is
-terminated by a `node:https` HTTP/1.1 relay (`picker-listener.ts`) only while the runtime's cached
+intercepted only while the runtime's cached
 decision is armed: macOS, persisted resolved Desktop mode first-party, Desktop intent on,
 `claudeCode.intercept.picker !== false`, no disarm latch, listener up, and the current picker CA
-trusted in the login keychain (`picker-trust.ts`). The picker CA (`picker-ca.ts`) carries critical
-name constraints permitting only `claude.ai` and excluding every IPv4 and IPv6 address. Its signing
-key exists only in the server process; only public certificates are written under
-`<OPENCODEX_HOME>/claude-picker/`. Every intercept start drops any legacy `ca.key`, even with the intercept or picker off; on restart the lifecycle keeps the applied
-profile row in place, and removes the prior public root only when the published certificate differs
-from this process's authority — a reused authority stays trusted, and a predecessor that cannot be
-untrusted leaves the picker disabled rather than trusted beside its replacement —
-then re-runs the controller's enable flow when that profile had been applied so the replacement
-authority is trusted (with the user's keychain consent) and the selection restored. Trust is added without a policy string: Chromium
+trusted in the login keychain (`picker-trust.ts`). A loopback TCP front in `picker-listener.ts`
+reads ClientHello ALPN through `src/claude/intercept/client-hello.ts`, reassembling across TCP
+splits and up to 16 TLS records within 64 KiB of wire bytes and a 10-second deadline. It splices
+the untouched connection to an HTTP/2 server when the client offers `h2`, or to the native
+`node:https` HTTP/1.1 relay otherwise. WebSocket connections use the latter: extended CONNECT
+is not enabled, so Chromium opens them over HTTP/1.1. HTTP/2 multiplexing avoids the connection
+starvation reported in #6511, where SSE subscriptions held Chromium's six per-origin HTTP/1.1
+connections and later requests queued before reaching the listener. Upstream remains one
+HTTP/1.1 request per client request. Incoming requests and ordinary upstream responses retain
+a 64 KiB header allowance for browser session cookies; Bun enforces the HTTP/2 inbound bound
+natively, counting name + value + 32 bytes per field and rejecting an oversized stream with
+`RST_STREAM ENHANCE_YOUR_CALM` before the request handler runs.
+The picker CA (`picker-ca.ts`) carries critical
+name constraints permitting only `claude.ai` and excluding every IPv4 and IPv6 address. Its exportable
+signing identity is protected by the OS credential store and scoped to the canonical config directory;
+normal restarts reuse the same validated certificate and key. No plaintext picker signing key is
+stored in that directory; public certificates and non-secret identity metadata remain under
+`<OPENCODEX_HOME>/claude-picker/`. Every unbound intercept startup attempt makes a best-effort cleanup of legacy `ca.key` before eligibility checks, including client role, disabled routing/interception, and ephemeral public ports; cleanup failures do not block startup. See the [runtime lifecycle contract](../runtime.md#claude-intercept-pair). Windows and Linux skip picker CA, credential-store and proxy construction entirely; the main intercept pair remains available.
+On restart the lifecycle keeps the applied profile and restores through the controller with
+`allowTrustPrompt: false`. An unchanged approved identity with an available credential store needs
+no Certificate Trust Settings add/remove operation. Missing, revoked or unknown trust leaves the
+picker pending; restore never installs trust. Explicit `on` or `trust` completes the trust step.
+Legacy predecessor cleanup may still require consent during migration. Native keychain unlock and
+application-access dialogs are controlled by macOS; restart or upgrade does not guarantee their absence.
+`picker-ca-store.ts` owns the versioned OS credential service, canonical-config identity namespace,
+bounded exact-shape payload, full constrained CA profile, validity and P-256 private-key match validation.
+`picker-ca-persistence.ts` validates public `authority.json` and `authority-init.json` records under
+the canonical CA lock, rejecting symlinks and mismatched pre-open/path and descriptor identities. Initialization journals the config identity, new fingerprint and public
+predecessor before writing the credential, verifies readback, then commits metadata and publication;
+it removes the journal last. Recovery requires matching journal/store identity; missing initialized
+credentials, unavailable storage or inconsistent metadata fail closed without publishing a replacement.
+Gateway/off startup does not read or initialize an OS picker credential unless an applied picker
+profile needs recovery. Its dormant macOS runtime/controller remains available for later explicit
+activation, which uses the same persistent authority path.
+Trust is added without a policy string: Chromium
 skips host-scoped trust settings, so `inspectPickerTrust` treats a current CA whose exported user
-trust settings carry `kSecTrustSettingsPolicyString` as untrusted and the trust step replaces it; an
+trust settings carry `kSecTrustSettingsPolicyString` as untrusted and an explicit trust step replaces it; an
 export it cannot read makes trust `unknown`, which never arms. A rotated-out picker certificate is
 removed from the login keychain as its replacement is published, and a failed removal stops the
 picker arming. Publication of `ca.pem` and `ca-owner.json` happens only inside the
@@ -196,11 +248,11 @@ certificate is rewritten under the lock so a second process cannot rotate out a 
 authority. The owner record carries the OS process start identity where the platform exposes one,
 so a reused PID does not count as the live owner; an older record without one still counts as live
 unless, on macOS, the PID's process started after the record was written.
-Before a startup rotation replaces `ca.pem`, the outgoing certificate's **public** PEM and its
+During legacy migration, before a replacement changes `ca.pem`, the outgoing certificate's **public** PEM and its
 SHA-1/SHA-256 go to `pending-untrust.json` (mode 0600, no key material); only one such record may
 exist, and a default `ensurePickerCa` call (the controller's enable/trust path) refuses while it
-does. Startup (`runtime.ts` via `picker-ca-cleanup.ts`) drains that record before and after
-rotation: it defers without calling `security` while the recorded certificate is still published by
+does. Activation (`runtime.ts` and the controller via `picker-ca-startup.ts` and `picker-ca-cleanup.ts`) drains that record before and after
+migration: it defers without calling `security` while the recorded certificate is still published by
 a live owner, untrusts a private temporary copy of the public PEM otherwise, and acknowledges the
 exact record only after a confirmed removal, so a failure survives process replacement and is
 retried by the next start. While the drain is incomplete and a Desktop picker profile is applied, the
@@ -217,8 +269,26 @@ remote `ccr` (`picker-bootstrap.ts`), failing open to the original bytes; the mo
 comes from a persisted snapshot (`picker-models.ts`), so a bootstrap never waits on discovery. Picker aliases carry `[1m]` only for authoritative windows of at least 1M, using the shared context marker helper with auto-context disabled. Sub-million opt-ins remain unmarked because the picker cannot guarantee the Desktop runner's compaction environment. A
 CONNECT to claude.ai that arrives before the first refresh waits at most 3 s, then goes blind. A
 picker proxy bind failure only disables picker mode; a picker construction or start failure closes
-every socket the start had bound before rethrowing. Nothing is logged but method, bootstrap or
-other, and status.
+every socket the start had bound before rethrowing. Ordinary session cookies within the header
+allowance relay unchanged. Upstream header overflow returns an empty 502 and logs the fixed
+reason `upstream:headers-too-large`; other records contain only method, bootstrap or other,
+status, and fixed bootstrap rewrite outcomes. Header values and request paths are not logged.
+Upgraded connections retain raw TLS relay semantics; their upstream bytes do not pass through
+the ordinary HTTP response parser.
+
+### Picker catalog rewrite bounds
+
+`src/claude/intercept/picker-budget.ts` preflights plain JSON before copying injected rows.
+Each retained field value and key is limited to 64 KiB of serialized UTF-8, each added row to
+256 KiB, and the whole response to 4096 added rows and 2 MiB of added JSON (including separators).
+All selected surfaces, including duplicate surface ids, share that budget. The original body plus
+reserved additions must fit 16 MiB before deep clones or final serialization. The CLI's explicit
+bootstrap fallback uses the same budget, including space for a newly created options property.
+A refused rewrite leaves every original row and the upstream response unchanged; it never publishes
+a partially extended picker. Small nested capabilities/thinking metadata retain their shape,
+while presentation/version stripping, descriptions, context windows, and surface eligibility keep
+their existing rules. Regression coverage is in `tests/claude-integration/claude-picker-bootstrap.test.ts`
+and `tests/claude-integration/claude-cli-picker.test.ts`.
 
 `src/claude/desktop-picker.ts` owns every mutation while a server is running. One controller lock
 serializes `enable`, `disable`, and `transition`; the latter wraps a whole Desktop mode change so
@@ -237,7 +307,13 @@ only `egressProxyUrl`. The previous Desktop selection is stored in
 
 The local controls are `ocx claude desktop picker on|off|status|trust`. With a live server, `on`,
 `off`, and transition cleanup use the controller; `trust` performs the operator's local keychain
-step and then reports the result to the server. Without a server, `on` is refused and `off` removes
+step and then reports the result to the server. Before installing the root, the CLI independently
+requires the picker common name on a self-signed CA and the exact critical `claude.ai`-only DNS
+and all-IP exclusion constraints, plus the full minted extension profile — critical `CA:TRUE`
+basicConstraints, a `keyCertSign|cRLSign`-only keyUsage, a non-critical subjectKeyIdentifier, and
+nothing else — so a forged root carrying leaf privileges (SAN, serverAuth EKU, digitalSignature)
+is refused. Matching the live server's reported fingerprint is an additional check, not a
+replacement for certificate-scope validation. Without a server, `on` is refused and `off` removes
 owned artifacts locally. The management surface accepts `GET /api/claude-desktop/picker` and
 `PUT /api/claude-desktop/picker` with `{ enabled, persist, trustedLocally?, callerAddedTrust? }`;
 unknown keys are rejected, a successful enable/disable or reported refusal returns `200 { ok: true,
@@ -358,6 +434,8 @@ data-token ownership, so displaying configuration cannot enter Desktop or client
 
 ## Claude Desktop config-library resolution
 
+`src/cli/claude-desktop-profile.ts` provides explicit runtime profile show/import through GET/PUT `/api/claude-desktop`. Bounded JSON input uses the canonical profile validator and the server retains unavailable-model, applied-marker and concurrent-save guards. Import saves desired state only; existing local show/import/apply commands retain their separate targets. The profile branch is dispatched before apply-mode aliases and never falls back to a local write.
+
 The Desktop profile writer and the management status probe share
 `resolveDesktop3pConfigLibraryPath`. The resolver reproduces Desktop's own rule rather than a guess:
 an explicit `CLAUDE_USER_DATA_DIR` (or the opencodex override) wins; on Windows
@@ -440,7 +518,11 @@ The [compaction routing override](../transports/responses-failover.md#compaction
 
 ## Routed bundled-skill text
 
+Translated tool results in `src/claude/inbound.ts` retain nonempty string `tool_reference.tool_name` values as `Tool loaded: <name>` text lines in the paired `function_call_output`, preserving mixed-content order and the error marker. Each marker ends with a newline and starts with one after text that does not, because text-only tool output is joined without separators downstream. References describe client output; they do not declare or authorize executable tools, enable translated server-side deferral, or alter native passthrough. `tests/claude-integration/claude-inbound-tool-reference.test.ts` covers reference-only results, mixed/error output, malformed names, caller immutability and the real Responses parser.
+
 `src/claude/inbound.ts` bounds the text-carrier skill-directory probe to 4,096 UTF-16 code units, plus one character to recognize the terminating newline. A longer first line is preserved intact instead of being scanned or stubbed; normal POSIX, Windows, mixed and UNC separators retain their basename matching. The existing 10,000-character payload threshold and `claudeCode.blockedSkills` policy remain: `claude-api` is blocked by default, and an explicit empty list disables elision. Native Anthropic passthrough and tool-call/result pairing are unchanged. `tests/claude-integration/claude-inbound.test.ts` covers the exact 4,096/4,097 boundary and a long newline-free carrier.
+
+`src/claude/inbound-content-options.ts` strips Claude Code's leading `x-anthropic-billing-header:` line from a string system prompt or from the first text block of a system array before it becomes Responses `instructions`, dropping a block left empty. The line's `cch` value rotates per request, so keeping it made the translated prefix and the system-derived fallback `prompt_cache_key` change every turn (#6627). The match is anchored at the prompt start, like the Antigravity strip in `src/adapters/google.ts`; native Anthropic passthrough does not use this translation and keeps the client preamble. `tests/claude-integration/claude-inbound.test.ts` covers string and array systems, header-only blocks, later mentions and key stability.
 
 ## Claude Code picker descriptions
 
@@ -455,5 +537,13 @@ The [compaction routing override](../transports/responses-failover.md#compaction
 ## Native passthrough tool-call ids
 
 Native Anthropic passthrough in `src/server/claude-messages.ts` forwards the caller's body except for tool-call ids: `sanitizePassthroughToolCallIds` runs the request-scoped allocator from `src/adapters/tool-call-id.ts` over every `*tool_use` id and `*tool_result` `tool_use_id`. Conforming ids are reserved first and stay byte-identical, a non-conforming or overlength id is rewritten to a conforming id of at most 64 characters with call/result pairing kept, and an empty id throws `AnthropicRequestError`, so the request fails with a local 400 before the upstream fetch. `tests/claude-integration/claude-native-passthrough.test.ts` covers rewriting, pairing, the empty id, the overlength id and collision with an existing valid id.
+
+## Native passthrough stream terminals
+
+Native passthrough retains upstream `anthropic-ratelimit-*` response headers for Claude Code quota/statusLine consumers on SSE, JSON and upstream errors. `src/server/anthropic-rate-limit-headers.ts` selects only that family instead of copying all upstream headers, so cookies and unrelated metadata are not relayed. Missing rate-limit headers are not fabricated; body, status, content type and existing non-stream `Retry-After` behavior stay unchanged. `tests/claude-integration/claude-native-rate-limit-headers.test.ts` exercises the production ingress against a synthetic upstream for all four response shapes (SSE, JSON, upstream error and count_tokens).
+
+`tapAnthropicSseForLog` in `src/server/claude-messages.ts` relays the streamed body of both the native passthrough and the managed native Messages lane (`src/server/messages-native.ts`). The response headers are already sent, so a stall, a byte-cap overflow, or an upstream read failure ends the body with an Anthropic `event: error` frame after a blank-line boundary and a clean close: `timeout_error` for an idle stall, `api_error` for the byte cap, and `api_error` when an upstream read fails mid-stream (a socket reset). The mid-stream reset is logged like the Responses relay's read error: status 502, `terminalStatus: "failed"`, `closeReason: "terminal"`, `transportPhase: "mid_stream"`, a synthetic terminal source, the attempt marked `streamAborted`, the redacted reason in `upstreamError`, and the usage seen before the reset. The non-streaming fold in the managed lane closes its row with the tap's meta for a reset, a stall or the byte cap, so its row matches the streaming lane's. The request is not replayed. Every one of these frames logs status 502. A stall is `terminalStatus: "incomplete"` with `closeReason: "body_stall"`, the status the Responses relay gives a stall-timeout incomplete. The byte cap is `incomplete` with `closeReason: "body_overflow"`, the same 502 the non-stream passthrough answers for it. Both carry the proxy's message in `upstreamError`, and a reset is `terminalStatus: "failed"`. Either way the row keeps its failure diagnostics in usage.jsonl. A stall or overflow after the turn's own terminal (`message_stop` or an upstream `error` event) is a finished turn: it logs 200 and closes without an error frame, as the read-error branch does. The tap finds frames in a copy normalized to LF, because SSE lines may end in CRLF, LF or CR; it holds a trailing CR until the next chunk so a split CRLF stays one line ending, and forwards the original bytes unchanged. Some read failures are not upstream failures. When the cancel signal is already aborted, the rejection is a `499` client cancel, because Bun can reject the read before it dispatches the abort listener. The managed lane passes its upstream controller's signal, so shutdown and turn release count as cancels too. When `message_stop` or an upstream `error` event has been seen, including one still in the buffer without its blank-line delimiter, the turn is complete: it logs 200 and closes with no error frame. A terminal found only in that unterminated tail gets its blank line restored, because an SSE parser drops an event that EOF cuts off. A translator budget overflow is a local cap, so it still errors the stream, and the non-streaming fold answers it with 413. `tests/claude-integration/claude-native-passthrough.test.ts` and `tests/claude-integration/messages-native.test.ts` cover both lanes against an upstream that resets after a partial or a complete body, plus both cancel paths.
+
+A native passthrough answered without a stream records its reason in `upstreamError`, so the row and the failure diagnostics in usage.jsonl name the cause. An upstream error response (status 400 or above) is relayed verbatim; the stored diagnostic is `Provider error <status>: <type>` only for a valid Anthropic error envelope with one of the closed types `invalid_request_error`, `authentication_error`, `permission_error`, `not_found_error`, `rate_limit_error`, `api_error`, `overloaded_error` or `request_too_large`. Upstream messages and arbitrary type strings never enter this diagnostic. Unknown or malformed envelopes, non-JSON bodies and bodies over 64 Ki characters log `Provider error <status>`. Local header timeout, body stall, byte-cap overflow and cancel diagnostics contain fixed text plus validated guard limits. Fetch failures log the fixed reason `anthropic passthrough failed: upstream connection error`; the existing redacted client response is preserved. Classification uses these stored reasons and HTTP status, so a `permission_error` at 403 is `permission_denied` regardless of upstream message wording. `tests/claude-integration/claude-native-passthrough.test.ts` covers these cases and checks that echoed account identifiers and request content are absent from both history sinks.
 
 Linked-machine data uses the [connection-bound relay contract](../remote-link.md#connection-bound-relay-authentication); client-local credentials and routing policy remain unchanged.

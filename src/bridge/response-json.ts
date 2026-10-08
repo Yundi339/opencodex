@@ -17,7 +17,7 @@ import {
   type OcxErrorPayload,
 } from "../lib/errors";
 import { mayBecomePatchEnvelope, repairFreeformToolInput } from "../responses/apply-patch-envelope";
-import { encodeCompactionSummary } from "../responses/compaction";
+import { encodeCompactionSummary, releaseCompactionCiphertextLease } from "../responses/compaction";
 import { compileCodeModeHelperInput, resolveCodeModeHelperName } from "../responses/code-mode-helper-compat";
 import { isTruncatedStopReason, truncationReasonFor } from "../responses/truncated-stop-reason";
 import { encodeReasoningEnvelope, type ReasoningEnvelope } from "../responses/reasoning-envelope";
@@ -59,21 +59,21 @@ export function buildResponseJSON(
 ): Record<string, unknown> {
   // Default-budget safety net: a caller that omits the budget gets a bounded
   // default (disposed with the call), never the unbounded append path.
-  if (options?.translatorBudget) {
-    const body = buildResponseJSONWithBudget(events, modelId, options);
-    // A buffered turn delivers its whole answer as one body, so nothing calls the per-frame
-    // recorder on the SSE bridge. Without this the attempt would persist adapter events with
-    // zero relayed ones, which is the loss signal -- raised on every non-streaming request.
-    if (options.recordBufferedDelivery !== false) {
-      attemptDeliveryRecorder(options.translatorBudget)?.noteBufferedDelivery(body);
+  const ownsBudget = !options?.translatorBudget;
+  const budget = options?.translatorBudget ?? createTranslatorBudget();
+  try {
+    const body = buildResponseJSONWithBudget(events, modelId, { ...options, translatorBudget: budget });
+    // Buffered delivery has no per-frame recorder; retain its existing one-shot attribution.
+    if (options?.translatorBudget && options.recordBufferedDelivery !== false) {
+      attemptDeliveryRecorder(budget)?.noteBufferedDelivery(body);
     }
     return body;
-  }
-  const budget = createTranslatorBudget();
-  try {
-    return buildResponseJSONWithBudget(events, modelId, { ...options, translatorBudget: budget });
   } finally {
-    budget.dispose();
+    for (const event of events) {
+      releaseTranslatedEvent(event, budget);
+      releaseCompactionCiphertextLease(event, budget);
+    }
+    if (ownsBudget) budget.dispose();
   }
 }
 
@@ -83,6 +83,8 @@ function buildResponseJSONWithBudget(
   modelId: string,
   options?: {
     hideThinkingSummary?: boolean;
+    /** Provider policy: suppress raw content-channel reasoning, keep provider-authored summaries. */
+    hideRawReasoning?: boolean;
     toolNsMap?: Map<string, { namespace: string; name: string; freeform?: true }>;
     /** Request-visible tool names. Required for client calls when enforcement is explicitly enabled. */
     declaredToolNames?: ReadonlySet<string>;
@@ -102,6 +104,13 @@ function buildResponseJSONWithBudget(
     translatorBudget?: TranslatorBudget;
     /** Conversation identity for the reasoning replay cache (issue #950). */
     replayCacheScope?: OcxReasoningReplayScopeRef;
+    /**
+     * Fold-only callers whose body never reaches the client (direct client encoders): hidden raw
+     * reasoning is still handed to the replay cache, but no client-bound `ocxr1` envelope is
+     * materialized. Encoding reserves roughly ten times the text against the translator budget,
+     * so a block that fit live delivery could otherwise overflow here and lose the cache write.
+     */
+    omitHiddenReasoningEnvelope?: boolean;
   },
 ): Record<string, unknown> {
   const responseId = `resp_${uuid()}`;
@@ -284,7 +293,12 @@ function buildResponseJSONWithBudget(
     const rawText = joinChunks(currentRawReasoning);
     if (!rawText) return;
     rawReasoningForNextToolCall = rawText;
-    if (options?.hideThinkingSummary === true) {
+    if (options?.hideThinkingSummary === true || options?.hideRawReasoning === true) {
+      if (options?.omitHiddenReasoningEnvelope === true) {
+        budget?.releaseRetained(currentRawReasoning.bytes, { kind: "reasoning" });
+        currentRawReasoning = emptyChunks();
+        return;
+      }
       // Same contract as the streaming path: no visible reasoning, txt-only envelope round-trip.
       pushOutput({
         type: "reasoning", id: `rs_${uuid()}`, summary: [],
@@ -604,7 +618,7 @@ function buildResponseJSONWithBudget(
       type: "compaction", id: `cmp_${uuid()}`,
       encrypted_content: compactionEncryptedContent ?? encodeCompactionSummary(joinChunks(batchCompaction)),
     };
-    pushOutput(item, compactionEncryptedContent ? bytesOf(compactionEncryptedContent) : batchCompaction.bytes);
+    pushOutput(item, compactionEncryptedContent ? 0 : batchCompaction.bytes);
   }
 
   const failure = errorEvent ? adapterFailureFromEvent(errorEvent) : undefined;

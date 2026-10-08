@@ -1,6 +1,8 @@
 import { isGenericFailoverProvider } from "./generic-account-failover";
 import { parseAccountPoolStickyLimit, parseAccountPoolStrategy, parseCodexAccountPoolStrategy } from "./pool-kernel";
 import type { OcxConfig, OcxProviderConfig } from "../types";
+import type { AnthropicModelRoute } from "../types/config";
+import { readAnthropicModelRoutes } from "./anthropic-model-routes";
 
 /**
  * Which pool-settings contract a provider speaks (#695, slice 1).
@@ -48,7 +50,7 @@ export function parseGenericStickyLimit(value: unknown): number | null {
 
 /** Fields the unified pool-settings contract can carry, per kind. */
 export const POOL_SETTINGS_FIELDS = [
-  "enabled", "strategy", "stickyLimit", "autoSwitchThreshold", "quotaWindow", "maxConcurrentPerAccount",
+  "enabled", "strategy", "stickyLimit", "autoSwitchThreshold", "quotaWindow", "maxConcurrentPerAccount", "routes", "nativeMessages",
 ] as const;
 export type PoolSettingsField = typeof POOL_SETTINGS_FIELDS[number];
 
@@ -81,6 +83,13 @@ export interface PoolSettingsDto {
   autoSwitchThreshold: number | null;
   quotaWindow: string | null;
   maxConcurrentPerAccount: number | null;
+  routes: AnthropicModelRoute[] | null;
+  /** Anthropic preference, default true; null for unsupported pool kinds. */
+  nativeMessages: boolean | null;
+  /** Present only when stored Anthropic routes fail validation on read. */
+  routesError?: string;
+  /** Saved state confirmed despite a post-publication failure. */
+  warning?: "config_bookkeeping_failed";
 }
 
 
@@ -129,7 +138,7 @@ export function genericPoolSettingsDto(
 /** Which fields each kind actually honours. Declared, never silently omitted. */
 const SUPPORTED_BY_KIND: Record<PoolSettingsKind, PoolSettingsField[]> = {
   codex: ["strategy", "stickyLimit", "autoSwitchThreshold"],
-  anthropic: ["enabled", "strategy", "stickyLimit", "autoSwitchThreshold", "quotaWindow"],
+  anthropic: ["enabled", "strategy", "stickyLimit", "autoSwitchThreshold", "quotaWindow", "routes", "nativeMessages"],
   generic: ["enabled", "strategy", "stickyLimit", "autoSwitchThreshold"],
 };
 
@@ -159,6 +168,8 @@ export function unifiedPoolSettingsDto(
       autoSwitchThreshold: parseGenericAutoSwitchThreshold(config.autoSwitchThreshold) ?? 80,
       quotaWindow: null,
       maxConcurrentPerAccount: null,
+      routes: null,
+      nativeMessages: null,
     };
   }
   if (kind === "anthropic") {
@@ -168,11 +179,13 @@ export function unifiedPoolSettingsDto(
       ...base,
       enabled,
       enabledEffective: enabled === true,
+      nativeMessages: !Object.hasOwn(pool, "nativeMessages") || pool.nativeMessages === true,
       strategy: parseGenericPoolStrategy(pool.strategy) ?? "quota",
       stickyLimit: parseGenericStickyLimit(pool.stickyLimit) ?? 1,
       autoSwitchThreshold: parseGenericAutoSwitchThreshold(pool.autoSwitchThreshold) ?? 80,
       quotaWindow: typeof pool.quotaWindow === "string" ? pool.quotaWindow : "five-hour",
       maxConcurrentPerAccount: null,
+      ...readAnthropicModelRoutes(pool.routes),
     };
   }
   const failover = config.providers?.[provider]?.oauthAccountFailover ?? {};
@@ -190,5 +203,7 @@ export function unifiedPoolSettingsDto(
     autoSwitchThreshold: parseGenericAutoSwitchThreshold(failover.autoSwitchThreshold),
     quotaWindow: null,
     maxConcurrentPerAccount: provider === "kiro" ? parseKiroAccountCap(failover.maxConcurrentPerAccount) : null,
+    routes: null,
+    nativeMessages: null,
   };
 }
