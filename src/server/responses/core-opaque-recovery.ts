@@ -133,6 +133,21 @@ export function isReasoningBlobCallerMismatchMessage(message: string): boolean {
   return message.includes("encrypted_content") || message.includes("reasoning");
 }
 
+/**
+ * The code-less "The encrypted content <id> could not be verified." identity, in any envelope.
+ *
+ * The 4xx form is matched inline in {@link isSelfIdentifiedOpaqueBlobRejection} (nested
+ * `error.type = invalid_request_error`, code null). Measured 2026-10-08 on the leasebot
+ * conversation, the SAME wording also arrives inside a streamed `response.failed` frame, where the
+ * error sits under `response.error` and the message is the only identity available -- and the item
+ * it names (`<uuid>-0`) is a reasoning item's encrypted_content, not a function output. Both
+ * envelopes name a blob the destination cannot decrypt, so both must reach the same recovery.
+ */
+export function isUnverifiableEncryptedContentMessage(message: string): boolean {
+  return message.startsWith("The encrypted content ")
+    && message.endsWith(" could not be verified. Reason: Encrypted content could not be decrypted or parsed.");
+}
+
 
 /**
  * Longest embedded payload this will parse. The wrapper is a short error envelope; anything
@@ -245,10 +260,7 @@ export function isSelfIdentifiedOpaqueBlobRejection(bodyText: string): boolean {
         if (
           (error.code === null || error.code === undefined)
           && typeof error.message === "string"
-          && error.message.startsWith("The encrypted content ")
-          && error.message.endsWith(
-            " could not be verified. Reason: Encrypted content could not be decrypted or parsed.",
-          )
+          && isUnverifiableEncryptedContentMessage(error.message)
         ) return true;
         // #4469: the caller-mismatch wording arrives without a dedicated code, so the
         // message itself is the identity. It is not gated on code being null — the upstream
@@ -293,11 +305,19 @@ export function shouldAttemptOpaqueBlobRecovery(args: {
   errorBody: string;
   alreadyAttempted: boolean;
 }): boolean {
+  // The 502 leg is the streamed shape: the rejection arrived inside an already-200 body and the
+  // relay projected it. It accepts a body carrying a FUNCTION OUTPUT blob, and -- since
+  // 2026-10-08 -- a body carrying any other opaque item (a reasoning item's encrypted_content,
+  // which is what the leasebot rejection named) together with a self-identified blob verdict.
   const acceptedStatus = (args.status >= 400 && args.status < 500)
     || (
       args.status === 502
-      && outboundResponsesBodyCarriesEncryptedFunctionOutput(args.outboundBody)
-      && isEncryptedFunctionOutputRejection(args.errorBody)
+      && (
+        (outboundResponsesBodyCarriesEncryptedFunctionOutput(args.outboundBody)
+          && isEncryptedFunctionOutputRejection(args.errorBody))
+        || (outboundResponsesBodyCarriesOpaqueBlob(args.outboundBody)
+          && isSelfIdentifiedOpaqueBlobRejection(args.errorBody))
+      )
     );
   return acceptedStatus
     && adapterSpeaksResponsesWire(args.adapterName)
@@ -451,6 +471,55 @@ export function prepareOpaqueBlobRecovery(parsed: OcxParsedRequest): void {
     return item;
   });
   Object.assign(rawBody, { input: strippedInput });
+}
+
+
+/**
+ * Threads the origin has already rejected for opaque state, and when that memory expires.
+ *
+ * The recovery above is corrective: the first send carries the blob, the origin refuses it, and the
+ * stripped rebuild is what actually runs. That costs one extra physical send on EVERY later turn of
+ * a conversation whose history keeps replaying the same rejected part -- measured 2026-09-30 on one
+ * thread: 37 of 41 turns carried `opaque-blob-rejection`, so half of that conversation's sends were
+ * the refused ones, and a shed verdict lands on a physical send. Since the strip is what the origin
+ * ends up accepting anyway, a thread that has been refused once starts stripped: the same request,
+ * one fewer send, half the exposure to the shed windows.
+ *
+ * Six hours, because the rejected part stays in the caller's transcript until it is compacted away,
+ * and refreshed by every later rejection. Nothing here changes what is sent for a thread that has
+ * never been refused, which is every other conversation on this deployment.
+ */
+const opaqueBlobPreStripThreads = new Map<string, number>();
+const OPAQUE_BLOB_PRE_STRIP_TTL_MS = 6 * 60 * 60_000;
+const OPAQUE_BLOB_PRE_STRIP_MAX_THREADS = 512;
+
+export function noteOpaqueBlobRejectedThread(threadId: string | undefined, now = Date.now()): void {
+  const key = threadId?.trim();
+  if (!key) return;
+  opaqueBlobPreStripThreads.delete(key);
+  opaqueBlobPreStripThreads.set(key, now + OPAQUE_BLOB_PRE_STRIP_TTL_MS);
+  while (opaqueBlobPreStripThreads.size > OPAQUE_BLOB_PRE_STRIP_MAX_THREADS) {
+    const oldest = opaqueBlobPreStripThreads.keys().next().value;
+    if (oldest === undefined) break;
+    opaqueBlobPreStripThreads.delete(oldest);
+  }
+}
+
+export function shouldPreStripOpaqueBlob(threadId: string | undefined, now = Date.now()): boolean {
+  const key = threadId?.trim();
+  if (!key) return false;
+  const until = opaqueBlobPreStripThreads.get(key);
+  if (until === undefined) return false;
+  if (until <= now) {
+    opaqueBlobPreStripThreads.delete(key);
+    return false;
+  }
+  return true;
+}
+
+/** Drop the pre-strip memory. Same contract as `clearReasoningReplayCacheForTests`. */
+export function clearOpaqueBlobPreStripForTests(): void {
+  opaqueBlobPreStripThreads.clear();
 }
 
 

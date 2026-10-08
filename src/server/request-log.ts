@@ -5,6 +5,13 @@ import { KEY_ACCOUNT_LOG_LABEL_RE } from "../codex/account-label";
 import { attemptAccountChanged, sealRequestAttemptIdentity } from "./request-log-account-rotation";
 export { sealRequestAttemptIdentity };
 import { readBoundedResponseBody } from "../lib/bounded-body";
+import {
+  noteThreadOverloadVerdict,
+  noteThreadRestrictionVerdict,
+  noteThreadTurnDuration,
+  noteThreadUpstreamCut,
+  shouldArmUpstreamCut,
+} from "./ws-thread-transport";
 import type { ResponsesTerminalStatus } from "../bridge";
 import {
   classifyError,
@@ -1128,6 +1135,8 @@ function captureUpstreamErrorParsed(
     const message = upstreamErrorMessageFromPayload(parsed);
     if (typeof message === "string" && message.trim()) {
       logCtx.upstreamError = redactSecretString(message).slice(0, 500);
+      noteThreadOverloadVerdict(logCtx.conversationId, logCtx.upstreamError);
+      noteThreadRestrictionVerdict(logCtx.conversationId, logCtx.upstreamError);
       return;
     }
     // No human-readable error message: fall back to the structured incomplete reason emitted by
@@ -1143,6 +1152,8 @@ function captureUpstreamErrorParsed(
   const trimmed = text.trim();
   if (trimmed) {
     logCtx.upstreamError = redactSecretString(trimmed).slice(0, 500);
+    noteThreadOverloadVerdict(logCtx.conversationId, logCtx.upstreamError);
+    noteThreadRestrictionVerdict(logCtx.conversationId, logCtx.upstreamError);
   }
 }
 
@@ -1447,6 +1458,20 @@ export function addFinalRequestLog(
   const closeReason = effectiveStatus === 499
     ? "client_cancel"
     : meta?.closeReason;
+  // A turn the origin cut AFTER output had started: the user watched the answer and then the
+  // stream died ("stream disconnected before completion"). Nothing may be replayed at that point,
+  // so the useful response is to stop routing this conversation the same way -- the same re-roll an
+  // overload verdict arms, on the same ledger. effectiveStatus already folded a client cancel into
+  // 499, which is not a verdict about the route, so the guard excludes it by construction.
+  if (shouldArmUpstreamCut(effectiveStatus, logCtx.transportPhase, logCtx.firstOutputMs)) {
+    noteThreadUpstreamCut(logCtx.conversationId, { status: effectiveStatus, midStream: true });
+  }
+  // Same seam, the other shape: this conversation is much slower than its OWN recent normal. Only
+  // successful turns feed both the baseline and the verdict -- a cancelled turn is the user
+  // leaving, and it would drag the yardstick down until every turn looked slow.
+  if (effectiveStatus < 400) {
+    noteThreadTurnDuration(logCtx.conversationId, Date.now() - start, logCtx.firstOutputMs);
+  }
   if (logCtx.activeAttempt) {
     finishRequestAttempt(
       logCtx.activeAttempt,

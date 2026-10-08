@@ -15,6 +15,8 @@
  * MUST stay a leaf module: imports nothing from server.ts or adapters (kiro-retry imports
  * the shared abort helpers from here).
  */
+import { withSsePreludeDeclineRetry } from "./sse-prelude-retry";
+
 import { clearableDeadline } from "./abort";
 import { redactSecretString } from "./redact";
 
@@ -529,6 +531,51 @@ export interface TransientRetryOptions extends ResetRetryOptions {
   /** Test seam: per-attempt slow budget override (defaults to TRANSIENT_RETRY_SLOW_ATTEMPT_MS). */
   slowAttemptMs?: number;
   /**
+   * Allow ONE extra send when a 502/503/504 arrived after {@link slowAttemptMs}.
+   *
+   * The ChatGPT backend answers capacity pressure slowly, so the elapsed-time guard -- which exists
+   * to stop doubling the latency of a genuinely slow failure -- would otherwise suppress the retry
+   * exactly when it is most useful. Opt-in per caller; the send budget still bounds the total.
+   */
+  retrySlowCapacity?: boolean;
+  /**
+   * Paced extra sends for a CAPACITY verdict, as the waits before each one.
+   *
+   * `retrySlowCapacity` buys one send and only for a SLOW failure; the canonical backend also
+   * sheds a heavy turn in 1-4 seconds, and a run of sheds inside one window outlives a single
+   * retry. A caller that opts in hands over the ladder it is willing to wait (see
+   * {@link CAPACITY_RETRY_DELAYS_MS}); an empty or absent list keeps the previous behaviour
+   * exactly. These sends are additional to `attempts`, never a widening of it, and a
+   * non-capacity failure still returns on the first response.
+   */
+  retryCapacityDeferralsMs?: readonly number[];
+  /**
+   * Paced extra sends for an upstream 429, as the waits before each one.
+   *
+   * Separate from {@link retryCapacityDeferralsMs} because the verdict differs: a capacity answer
+   * means the origin is busy, a 429 means this requester is over a limit. Both arrive before
+   * anything has run, both are spent as ADDITIONAL sends, and neither widens `attempts`. An empty
+   * list keeps 429 exactly as it was -- a non-transient status the caller owns.
+   */
+  retryRateLimitDeferralsMs?: readonly number[];
+  /**
+   * Reports every capacity deferral this call imposed before a resend.
+   *
+   * The caller marked "the send started" before this function, and the absorb waits happen inside
+   * it, so a turn that absorbed twice would otherwise look like a backend that took 17s longer to
+   * answer its HEADERS. Callers subtract the reported total before measuring the origin.
+   */
+  onCapacityWait?: ((waitMs: number) => void) | undefined;
+  /**
+   * Also retry a capacity decline that arrives INSIDE an already-200 SSE body.
+   *
+   * The transient ladder can only act on a status; the ChatGPT backend also declines *after* a 200,
+   * by emitting the prelude and then an overload event. `lib/sse-prelude-retry.ts` holds those
+   * prelude frames and splices a fresh attempt into the same body, so the client never sees the
+   * declined one. Opt-in, and bounded by the same ladder the caller passed above.
+   */
+  retrySsePreludeDecline?: boolean;
+  /**
    * How long this caller can wait on an honoured `Retry-After`, defaulting to
    * {@link RETRY_AFTER_CEILING_MS}. It is a deadline, never a clamp: an instruction inside it
    * is slept in full, and an instruction past it ends the call with the upstream answer and
@@ -699,11 +746,60 @@ export async function fetchWithResetRetry(
  * `opts.attempts` is ONE total-send budget covering this layer and the inner reset layer
  * together, so it bounds the real number of upstream requests rather than multiplying.
  */
+/**
+ * Extra sends a caller may spend on a CAPACITY verdict, and the waits between them.
+ *
+ * The canonical backend answers a heavy turn "Our servers are currently overloaded" while the
+ * SAME account serves a lighter conversation in the same minute (measured 2026-09-23: 8% shed on
+ * one conversation, 0.6% on its sibling). Rejections cluster into windows of minutes, and inside
+ * a window the very next attempt succeeds only about half the time, so a single retry cannot ride
+ * one out. The waits are deliberately paced: they let a window close instead of spending the
+ * client's own retry budget against it. Bounded by the array length, and spent only on a
+ * 502/503/504 the caller opted into reading as capacity -- never on a request-shaped error.
+ *
+ * Measured again at 23:00-23:31 on the same day with the earlier three-rung ladder: every one of
+ * the shedding conversation's five failures was PRE-content (absorbable), which is the class this
+ * ladder exists for -- so the ladder, not the routing, was the binding constraint. Four rungs and
+ * a longer tail cover roughly one more halving of the residual.
+ */
+export const CAPACITY_RETRY_DELAYS_MS: readonly number[] = [5_000, 12_000, 25_000, 45_000];
+
+/**
+ * Extra sends a caller may spend on an upstream 429, and the waits between them.
+ *
+ * The plan limiter answers `{"code":"rate_limit_exceeded"}` in about a second, before anything has
+ * run, and the next attempt succeeds once the window reopens (measured 2026-10-05/06: five of these
+ * on two conversations, and every turn that followed the ladder completed). Nothing executed before
+ * the headers arrived, so a resend cannot duplicate work -- the send budget's amplification concern
+ * does not apply to this class, exactly as it does not for capacity.
+ *
+ * Paced rather than immediate: the limiter counts requests in a window, so resending on the same
+ * second spends another request against the same window. Three rungs keep a turn alive for half a
+ * minute without turning one rejection into a burst.
+ */
+export const RATE_LIMIT_RETRY_DELAYS_MS: readonly number[] = [2_000, 8_000, 20_000];
+
+/** Longest `Retry-After` honoured on a 429 before the answer is handed back untouched. */
+export const RATE_LIMIT_RETRY_AFTER_CEILING_MS = 60_000;
+
 export async function fetchWithTransientRetry(
   doFetch: ReplayableFetch,
   opts: TransientRetryOptions = {},
 ): Promise<Response> {
   const budget = normalizeSendAttempts(opts.attempts, TRANSIENT_RETRY_MAX_ATTEMPTS);
+  /**
+   * Capacity sends are ADDITIONAL to the transient budget on purpose.
+   *
+   * That budget exists to stop per-request amplification of RETRIES against a provider that keeps
+   * answering the same way; a capacity verdict is the opposite case -- the provider just said
+   * "not now" about a turn nothing has started, and the operator's whole complaint is that the
+   * turn dies instead of progressing. Each one is still a real send and is reported as such.
+   */
+  const capacityDelays = opts.retryCapacityDeferralsMs ?? [];
+  let capacityRetriesUsed = 0;
+  const rateLimitDelays = opts.retryRateLimitDeferralsMs ?? [];
+  let rateLimitRetriesUsed = 0;
+  const totalBudget = budget + capacityDelays.length + rateLimitDelays.length;
   const slowAttemptMs = opts.slowAttemptMs ?? TRANSIENT_RETRY_SLOW_ATTEMPT_MS;
   const transientStatuses: number[] = [];
   // `attempts` is ONE total-send budget shared with the inner reset layer, not a per-layer
@@ -714,6 +810,34 @@ export async function fetchWithTransientRetry(
   // `transientRetryOn5xx` policy is the first one that does, and multiplying load against an
   // already-failing provider is worse than not retrying at all.
   let sent = 0;
+  /** Set once the opt-in extra send for a SLOW capacity verdict has been spent. */
+  let slowCapacityRetryUsed = false;
+  /**
+   * Wrap a response whose 200 body may turn out to BE the decline.
+   *
+   * This has to run at every return point that can hand an ok response back, not only at the end
+   * of the transient loop. The loop's first statement returns immediately on `res.ok`, so for a
+   * year the wrapper below it was unreachable in exactly the case it was written for: measured
+   * 2026-09-26 09:28/09:38, two native turns carried `Our servers are currently overloaded` inside
+   * a 200 and the wrapper never logged a line because it was never called.
+   */
+  const wrapSseDeclineRetry = (candidate: Response): Response => {
+    if (opts.retrySsePreludeDecline !== true || capacityDelays.length === 0
+      || !candidate.ok || !candidate.body) return candidate;
+    return withSsePreludeDeclineRetry(candidate, {
+      delaysMs: capacityDelays,
+      label: opts.label,
+      signal: opts.abortSignal,
+      // The caller opted in because it knows this endpoint speaks the Responses event protocol, so a
+      // decline that arrives with a wrong or missing content-type must still be caught.
+      acceptAnyContentType: true,
+      resend: async () => {
+        // One more physical send, counted exactly like every send this helper owns.
+        opts.onSendsConsumed?.(1);
+        return await fetchWithResetRetry(countedFetch, innerResetOptions(1), "transient-5xx");
+      },
+    });
+  };
   const countedFetch: ReplayableFetch = (recovery) => {
     // Incremented BEFORE the await so a rejected send still consumes budget; counting only
     // successes would let a reset storm loop without bound.
@@ -728,9 +852,12 @@ export async function fetchWithTransientRetry(
   // sends `countedFetch` already counts. Forwarding the reporter down the `remaining()` path
   // would report each of them twice, which is how a four-send cap becomes a two-send cap. One
   // send is counted once, by the outermost layer that owns the budget.
-  const innerResetOptions = (): ResetRetryOptions => ({
+  const innerResetOptions = (floor = 0): ResetRetryOptions => ({
     ...opts,
-    attempts: remaining(),
+    // `floor` is the capacity lane's one physical send: it is a NEW send the caller authorized,
+    // not a refund of a budget this helper already spent. A reset on that send is still refused
+    // by the inner layer, which is exactly the behaviour the missing allowance should keep.
+    attempts: Math.max(remaining(), floor),
     onSendsConsumed: undefined,
   });
   // Reported in `finally` rather than at each exit: this function returns from five places
@@ -740,14 +867,97 @@ export async function fetchWithTransientRetry(
   if (budget === 0) throw new SendBudgetExhaustedError(opts.label);
   let attemptStart = Date.now();
   let res = await fetchWithResetRetry(countedFetch, innerResetOptions());
-  for (let attempt = 0; sent < budget; attempt++) {
+  for (let attempt = 0; sent < totalBudget; attempt++) {
     // A non-replayable gateway status was settled after the request body had already left
     // for the origin; retrying it here is the automatic resend the marker exists to forbid.
-    if (res.ok || !isTransientUpstreamStatus(res.status) || isNonReplayableResponse(res)) return res;
+    // A 429 only enters this loop when the caller opted into a rate-limit ladder; without one it
+    // keeps its old meaning (a non-transient status the caller owns) and returns here.
+    const rateLimited = res.status === 429 && rateLimitDelays.length > 0;
+    if (res.ok || (!isTransientUpstreamStatus(res.status) && !rateLimited) || isNonReplayableResponse(res)) {
+      return wrapSseDeclineRetry(res);
+    }
     // Checked before cancelResponseBodyBestEffort so an already-aborted caller never receives
     // a response whose body we just cancelled.
     if (opts.abortSignal?.aborted) return res;
-    if (Date.now() - attemptStart > slowAttemptMs) return res;
+    // Capacity lane, checked BEFORE the slow gate: the canonical backend's shed answers arrive in
+    // anywhere from 1s to 36s (measured 2026-09-23), so gating on elapsed time missed the fast
+    // half of them entirely.
+    if ((res.status === 502 || res.status === 503 || res.status === 504)
+      && capacityRetriesUsed < capacityDelays.length) {
+      const waitMs = capacityDelays[capacityRetriesUsed]!;
+      capacityRetriesUsed += 1;
+      console.warn(
+        `[upstream-retry] capacity ${res.status}${opts.label ? ` (${opts.label})` : ""} — absorbing: waiting ${waitMs}ms before resend ${capacityRetriesUsed}/${capacityDelays.length}`,
+      );
+      cancelResponseBodyBestEffort(res);
+      await sleepWithAbort(waitMs, opts.abortSignal);
+      opts.onCapacityWait?.(waitMs);
+      attemptStart = Date.now();
+      transientStatuses.push(res.status);
+      try {
+        res = await fetchWithResetRetry(countedFetch, innerResetOptions(1), "transient-5xx");
+      } catch (err) {
+        if (err instanceof SendBudgetExhaustedError) throw err;
+        throw new UpstreamRetryEvidenceError(transientStatuses, err);
+      }
+      continue;
+    }
+    // Rate-limit lane: the plan limiter's verdict, absorbed with pacing. Headers-only by
+    // construction -- the limiter refuses before the turn runs -- so a resend cannot duplicate a
+    // step, and an explicit Retry-After is honoured in full when it fits the ceiling.
+    if (rateLimited) {
+      if (rateLimitRetriesUsed >= rateLimitDelays.length) {
+        console.warn(
+          `[upstream-retry] rate limited 429${opts.label ? ` (${opts.label})` : ""} — ladder exhausted after `
+          + `${rateLimitRetriesUsed} absorb(s); handing the answer back`,
+        );
+        return res;
+      }
+      const instructed = retryAfterDelayMs(res.headers);
+      if (instructed !== undefined && instructed > RATE_LIMIT_RETRY_AFTER_CEILING_MS) {
+        console.warn(
+          `[upstream-retry] rate limited 429${opts.label ? ` (${opts.label})` : ""} — Retry-After `
+          + `${Math.round(instructed / 1000)}s exceeds the ceiling; handing the answer back`,
+        );
+        return res;
+      }
+      const waitMs = instructed ?? rateLimitDelays[rateLimitRetriesUsed]!;
+      rateLimitRetriesUsed += 1;
+      console.warn(
+        `[upstream-retry] rate limited 429${opts.label ? ` (${opts.label})` : ""} — absorbing: waiting ${waitMs}ms before resend ${rateLimitRetriesUsed}/${rateLimitDelays.length}`,
+      );
+      cancelResponseBodyBestEffort(res);
+      await sleepWithAbort(waitMs, opts.abortSignal);
+      attemptStart = Date.now();
+      transientStatuses.push(res.status);
+      try {
+        res = await fetchWithResetRetry(countedFetch, innerResetOptions(1), "transient-5xx");
+      } catch (err) {
+        if (err instanceof SendBudgetExhaustedError) throw err;
+        throw new UpstreamRetryEvidenceError(transientStatuses, err);
+      }
+      continue;
+    }
+    // Everything that is NOT a capacity verdict keeps the caller's original budget, even when the
+    // capacity rungs below have not been spent: the extra sends exist for "the origin said not now"
+    // and must never widen the general transient ladder (a forward pool that retries its own 429s
+    // and 500s is the amplification the send budget was built to stop).
+    if (sent >= budget) return res;
+    if (Date.now() - attemptStart > slowAttemptMs) {
+      // The ChatGPT backend's capacity verdicts arrive SLOWLY: on 2026-09-23 one conversation was
+      // answered `Our servers are currently overloaded` after 8-57 seconds, every one of them past
+      // this 15s guard, so the transient layer never resent and the caller saw a bare 502/503 on a
+      // lane where the very next attempt usually succeeds. A caller that opted in gets exactly ONE
+      // extra send for a slow capacity status; the elapsed-time guard still stops everything else.
+      const capacityStatus = res.status === 502 || res.status === 503 || res.status === 504;
+      if (!(opts.retrySlowCapacity === true && capacityStatus && !slowCapacityRetryUsed && remaining() > 0)) {
+        return res;
+      }
+      slowCapacityRetryUsed = true;
+      console.warn(
+        `[upstream-retry] slow ${res.status}${opts.label ? ` (${opts.label})` : ""} treated as a capacity verdict - one extra send`,
+      );
+    }
     const instructedDelay = retryAfterDelayMs(res.headers);
     // The deadline is the CALLER'S, not this module's default. Reading the constant directly
     // broke it in both directions: a caller with a 30s budget slept the full 45s an upstream
@@ -786,8 +996,9 @@ export async function fetchWithTransientRetry(
       throw new UpstreamRetryEvidenceError(transientStatuses, err);
     }
   }
-  // Budget exhausted: the last response is returned with its body intact.
-  return res;
+  // Any remaining ok response goes through the same wrapper as the early return above (the helper
+  // is idempotent about the gate); a budget-exhausted 5xx is returned with its body intact.
+  return wrapSseDeclineRetry(res);
   } finally {
     opts.onSendsConsumed?.(sent);
   }
