@@ -90,6 +90,12 @@ export interface ResetReplayPolicy {
    * send allowance the leg already had.
    */
   replacements?: number;
+  /**
+   * Allow canonical ChatGPT forward requests with server-side continuation state to spend the
+   * bounded replacement grant after a pre-header reset. Disabled by default because a reset does
+   * not prove the origin did not already execute the turn.
+   */
+  allowStateful?: boolean;
 }
 
 /**

@@ -885,7 +885,7 @@ export async function prepareAdapterExchange(
           for await (const _ of prepareSameTarget429Wait({
             body: upstreamResponse.body,
             signal: options.abortSignal,
-            delayMs: rateLimitRetryDelayMs(rateLimitPolicy, retryAfterHeader, Date.now()),
+            delayMs: rateLimitRetryDelayMs(rateLimitPolicy, retryAfterHeader, Date.now(), rateLimitRetries - 1),
           })) {
             // pre-stream: no stall watchdog to feed
           }

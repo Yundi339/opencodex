@@ -197,6 +197,8 @@ import { fetchWithHeaderTimeout, providerFetch, safeHostLabel, safeOriginLabel }
 import { mapCodexAuthContextErrorToResponse, nativeMainRefreshFailureResponse } from "./codex-auth-error";
 import { linkRequestSessionLane, sessionLaneIdFromRequest } from "../request-log-conversation";
 import { recallComboForLane } from "./combo-session-recall";
+import { peekConversationSelection, recallConversationSelection, rememberConversationSelection } from "./conversation-selection";
+import { threadModelSettingForRequest } from "./thread-model-settings";
 
 export const COMPACT_RESPONSE_MAX_BYTES = 32 * 1024 * 1024;
 
@@ -1382,7 +1384,24 @@ export async function handleResponsesCompact(
       if (!options.compactionRoutingOverride) forgetCompactHandoffRoute(req, admission);
       rememberServingConversationStateIssuer(outcomeCtx, codexPoolAffinityKey(req.headers));
     } else if (!options.compactionRoutingOverride && quotaFailure && !storedPool401ReplayAttempted) {
-      const fallbackModel = compactHandoffRoute(req, admission, raw.model);
+      // A fresh user selection outranks an older compact-only handoff. Codex may name the
+      // previous model on an automatic compact; the lane's latest ordinary request is the
+      // selection the user just made and is therefore the route that must inherit it.
+      const rememberedSelection = peekConversationSelection(req.headers, admission);
+      const threadSetting = threadModelSettingForRequest(req.headers, admission);
+      // Codex's automatic compact carries the previous model in `raw.model`. When a local
+      // thread has a newer model setting event, use that event to bridge the gap before the
+      // first ordinary request reaches the proxy. A newer ordinary request still wins.
+      const threadSettingWins = !!threadSetting
+        && (!rememberedSelection || threadSetting.lastSeenAt > rememberedSelection.lastSeenAt);
+      const fallbackModel = threadSettingWins
+        ? threadSetting.model
+        : rememberedSelection
+          ? recallConversationSelection(req.headers, admission)
+          : compactHandoffRoute(req, admission, raw.model);
+      if (threadSettingWins && threadSetting) {
+        rememberConversationSelection(req.headers, admission, threadSetting.model);
+      }
       if (fallbackModel && !req.signal.aborted) {
         const fallbackReq = new Request(req.url, {
           method: "POST",

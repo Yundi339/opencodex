@@ -14,6 +14,7 @@ test("provider management validates retryOnReset bounds and unknown keys", () =>
   const base = { adapter: "openai-responses", baseUrl: "https://api.openai.com/v1" };
   expect(providerManagementConfigError("custom", { ...base, retryOnReset: {} })).toBeNull();
   expect(providerManagementConfigError("custom", { ...base, retryOnReset: { enabled: true, replacements: 2 } })).toBeNull();
+  expect(providerManagementConfigError("custom", { ...base, retryOnReset: { allowStateful: true } })).toBeNull();
   expect(providerManagementConfigError("custom", { ...base, retryOnReset: { replacements: 0 } }))
     .toContain("retryOnReset.replacements is invalid");
   expect(providerManagementConfigError("custom", { ...base, retryOnReset: { replacements: 3 } }))
