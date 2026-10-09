@@ -37,6 +37,28 @@ async function run(optIn: boolean, shedCount: number, delays: number[]) {
   return { status: response.status, calls, at };
 }
 
+/**
+ * 2026-10-09: a heavy turn under sustained load is refused only after 25-45s of queueing, and the
+ * same weight fails every rung. The second SLOW refusal must skip the remaining rungs instead of
+ * pacing through them; the first refusal keeps its chance regardless of speed.
+ */
+async function runShedShape(shedMs: number[], delays: number[]) {
+  let calls = 0;
+  const doFetch = async () => {
+    const wait = shedMs[Math.min(calls, shedMs.length - 1)] ?? 0;
+    calls += 1;
+    if (wait > 0) await new Promise(resolve => setTimeout(resolve, wait));
+    return shed();
+  };
+  const response = await fetchWithTransientRetry(doFetch as never, {
+    attempts: 1,
+    slowAttemptMs: 15_000,
+    retryCapacityDeferralsMs: delays,
+    slowShedAttemptMs: 60,
+  });
+  return { status: response.status, calls };
+}
+
 // Baseline: no opt-in, the send budget alone governs.
 const baseline = await run(false, 3, []);
 check("baseline: a shed response is returned after one send", baseline.status === 503 && baseline.calls === 1, "status=" + baseline.status + " sends=" + baseline.calls);
@@ -57,6 +79,15 @@ check("exhausted: the last upstream answer is returned", exhausted.status === 50
 // An empty ladder must behave exactly like the baseline.
 const empty = await run(true, 3, []);
 check("empty ladder: no extra sends", empty.calls === 1 && empty.status === 503, "sends=" + empty.calls);
+
+// Weight-shaped shed: first (fast) refusal walks the first rung, the second refusal arrives slowly
+// and must hand the answer back instead of pacing through the remaining rungs.
+const slowShed = await runShedShape([5, 90], [30, 60, 90, 120]);
+check("slow shed: first refusal keeps its chance, second slow one stops the ladder", slowShed.calls === 2 && slowShed.status === 503, "sends=" + slowShed.calls + " status=" + slowShed.status);
+
+// Fast refusals keep the full ladder: the threshold is never reached, all rungs are spent.
+const fastShed = await runShedShape([0, 0, 0, 0], [30, 60, 90, 120]);
+check("fast shed: the whole ladder still runs (first send + one per rung)", fastShed.calls === 5 && fastShed.status === 503, "sends=" + fastShed.calls + " status=" + fastShed.status);
 
 console.log(failures === 0 ? "ALL CAPACITY ABSORB CHECKS PASSED" : failures + " CHECK(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

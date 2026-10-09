@@ -530,6 +530,8 @@ export interface ResetRetryOptions {
 export interface TransientRetryOptions extends ResetRetryOptions {
   /** Test seam: per-attempt slow budget override (defaults to TRANSIENT_RETRY_SLOW_ATTEMPT_MS). */
   slowAttemptMs?: number;
+  /** Test seam: slow-shed threshold override (defaults to SLOW_SHED_ATTEMPT_MS). */
+  slowShedAttemptMs?: number;
   /**
    * Allow ONE extra send when a 502/503/504 arrived after {@link slowAttemptMs}.
    *
@@ -765,6 +767,24 @@ export async function fetchWithResetRetry(
 export const CAPACITY_RETRY_DELAYS_MS: readonly number[] = [5_000, 12_000, 25_000, 45_000];
 
 /**
+ * A capacity verdict that took this long to COME BACK is a different verdict from a fast one.
+ *
+ * The ladder above was measured on windows: the backend refuses within seconds, the next attempt
+ * has a real chance, and the paced waits let the window close. But on 2026-10-09, again on
+ * 2026-10-08 23:49-13:59, the official backend under sustained load answered HEAVY turns
+ * (400k+ input) with "overloaded" only after 25-45s of deep queueing, five times in a row per
+ * request, while a 1-token probe on the same account completed in 10s. That is a weight-shaped
+ * shed: the window is not closed, this request does not fit through it, and resending the same
+ * weight after another paced wait repeats the same queue. Each of those requests burned
+ * 106-236s of the operator's time to learn what its first slow refusal already said.
+ *
+ * The first rung is kept regardless of speed (the first refusal is also the cheapest
+ * information); from the second slow refusal on, the remaining rungs are skipped and the
+ * upstream answer is handed back with its body intact. Fast refusals keep the full ladder.
+ */
+export const SLOW_SHED_ATTEMPT_MS = 25_000;
+
+/**
  * Extra sends a caller may spend on an upstream 429, and the waits between them.
  *
  * The plan limiter answers `{"code":"rate_limit_exceeded"}` in about a second, before anything has
@@ -884,6 +904,14 @@ export async function fetchWithTransientRetry(
     // half of them entirely.
     if ((res.status === 502 || res.status === 503 || res.status === 504)
       && capacityRetriesUsed < capacityDelays.length) {
+      const attemptMs = Date.now() - attemptStart;
+      const slowShedMs = opts.slowShedAttemptMs ?? SLOW_SHED_ATTEMPT_MS;
+      if (capacityRetriesUsed > 0 && attemptMs >= slowShedMs) {
+        console.warn(
+          `[upstream-retry] capacity ${res.status}${opts.label ? ` (${opts.label})` : ""} after ${(attemptMs / 1000).toFixed(1)}s of queueing — slow weight-shaped shed; skipping the remaining ${capacityDelays.length - capacityRetriesUsed} rung(s) and handing the answer back`,
+        );
+        return res;
+      }
       const waitMs = capacityDelays[capacityRetriesUsed]!;
       capacityRetriesUsed += 1;
       console.warn(
