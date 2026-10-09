@@ -5,6 +5,13 @@ discovers the loopback proxy, lazily retries management authentication, starts
 the bundled `ocx` sidecar only when the configured endpoint is unreachable,
 and owns the tray, autostart, single-instance, and window lifecycle behavior.
 
+The desktop Cargo package requires Rust 1.88 or newer. Its committed lockfile already
+contains dependencies with that minimum; the package declaration must not advertise 1.77.
+The lockfile selects patched `serde_with` and `time` releases, with compatible exact
+`serde` and `serde_json` pins in `desktop/src-tauri/Cargo.toml`. Build and test with the
+committed lockfile (`--locked`); the dependency update does not change app configuration,
+the bundled model proxy, or the minimum supported operating-system versions.
+
 `desktop/ui/` is the startup surface. Once the runtime reports healthy, a visible or manually
 launched shell navigates the webview to the proxy's loopback dashboard (`/#/usage`) rather than
 bundling or serving `gui/dist` itself. A hidden login launch retains the small bundled ready surface
@@ -22,10 +29,16 @@ drawing anything.
 `withGlobalTauri` is on so that page can invoke without a bundler. The bootstrap commands are
 granted to the local app origin only: `capabilities/default.json` declares no `remote` entry, and
 Tauri checks the ACL for any invoke from a non-local origin. The one exception is page zoom. The main
-window enables Tauri's zoom hotkeys (Cmd or Ctrl with + / - / 0); WebView2 handles them natively, but
-on macOS and Linux Tauri injects a keydown polyfill that calls `set_webview_zoom` from whatever page
-is loaded, including the loopback dashboard. `capabilities/dashboard-zoom.json` grants that single
-command to the main window for `http://127.0.0.1:*`, and a test in `window.rs` pins its shape.
+window keeps Tauri's zoom hotkeys on (Cmd or Ctrl with + / - / 0): WebView2 handles them natively, and on
+macOS and Linux Tauri injects a keydown polyfill that calls `set_webview_zoom` from whatever page is loaded.
+A dashboard that handles zoom itself (`gui/src/lib/desktop-zoom.ts`) keeps the level in `localStorage`,
+re-applies it at start and calls the same command, and its handlers run in the capture phase and stop the
+event before the polyfill's bubble-phase listeners see it. Nothing is negotiated, because the shell cannot
+know which dashboard it shows: the runtime serves the dashboard and the installed app is the shell, so a
+declined takeover or a service that has not restarted puts them on different versions. An older dashboard
+has no handler, so the polyfill keeps working; an older shell's polyfill is pre-empted by a newer
+dashboard. `capabilities/dashboard-zoom.json` grants that single command to the main window for
+`http://127.0.0.1:*`, and a test in `window.rs` pins its shape.
 
 The main window carries an integrated title bar on macOS: the builder sets
 `TitleBarStyle::Overlay` with `hidden_title`, so the webview draws to the top of the window and
@@ -48,7 +61,10 @@ The window is created and shown before anything is registered, resolved, probed 
 `desktop/src-tauri/src/startup.rs` runs the whole sequence inside it as named states —
 registering, resolving, probing, attaching or starting, waiting, then ready or failed — under one
 30-second machinery deadline. Waiting for takeover consent suspends that budget; consuming the
-answer extends the shared deadline before clearing the prompt. Calls use the remaining budget.
+answer extends the shared deadline before clearing the prompt. An approved Windows takeover adds
+60 seconds once to the machinery budget (90 seconds total), covering guarded stop, ownership claim,
+and replacement startup. Declined consent and other platforms retain 30 seconds. Calls and the
+deadline guard share the same remaining budget; no phase renews it.
 The failure state carries a retry, the
 child's exit code and a copyable diagnostic naming the state, the endpoint, the configuration home
 and the runtime's last output; `desktop/src-tauri/src/sidecar.rs` consumes the spawn event stream
@@ -295,6 +311,12 @@ here. The shell does not read the record: resolving a claim means reading every 
 failing closed on an unreadable one, on a corrupt anchor and on paths that disagree, and a second
 weaker implementation of a question core already answers is the mistake this tree has made before.
 The bundled CLI answers ownership and takeover compatibility through `ocx resolve --json`.
+It also answers how the live runtime's version compares to the bundled CLI's
+(`versionSkew.relation`; future relation strings read as unknown without discarding the live answer), and the shell acts on the direction instead of reparsing the
+warning: `proxy-newer` makes a supported takeover a downgrade, so the run attaches as a
+guest with the versions, downgrade risk and verbatim CLI warning rather than asking consent to it. Every other guest path — held
+consent, an unreadable owner, a blocked takeover, a declined prompt, a recovery — appends
+the CLI's warning to its phase detail, and the consent panel shows it beside the subject.
 Unknown ownership never means "nobody owns it". A supported offer shows the endpoint, home
 and owner. After consent, the shell resolves again and refuses a changed answer without
 invoking stop. It passes the approved token, endpoint and PID to the CLI's opt-in guarded stop.
@@ -333,8 +355,12 @@ that is not running has no menu bar item, so leaving autostart off by default le
 installed app absent after a reboot. The marker in the app config directory is written
 before the login item is touched and is never removed, so a user who turns the setting
 off keeps it off; writing it afterwards would let a failed enable retry on every launch.
-The behaviour is not macOS-only — the autostart plugin implements the Linux autostart
-entry and the current-user Windows Run registration too.
+The behaviour is not macOS-only. The autostart plugin implements the macOS and Linux
+registrations and reads or disables the current-user Windows Run entry. Shell enables
+on Windows write a quoted executable path followed by `--autostart`, preserving the
+plugin's registration name and Task Manager explicit-enable semantics. A Windows-specific
+launch-origin migration marker revisits older registrations once, only when already
+enabled; entries disabled in the tray or Task Manager stay disabled.
 
 The WidgetKit extension in `app/` needs three things that Xcode's app-extension target
 would supply on its own, and SwiftPM has no such target: `@main` on
@@ -352,6 +378,33 @@ extension's own container rather than a shared App Group, which ad-hoc signing c
 Bun targets and prepares the external binary plus dashboard resources used by
 Tauri. Generated files under desktop/src-tauri/binaries/ and
 desktop/src-tauri/resources/ remain ignored.
+
+### Packaged native keyring binding
+
+The compiled `ocx` sidecar cannot resolve or execute a N-API addon from Bun's virtual
+`$bunfs`. `scripts/build-standalone.ts` therefore stages the exact target's pinned
+`@napi-rs/keyring-*` binary under `keyring/`, and `desktop/scripts/prepare-sidecar.ts`
+copies that directory into Tauri resources. A universal macOS bundle carries both Darwin
+architectures. `src/lib/keyring-native.ts` selects only the platform/architecture filename
+under `Contents/Resources/keyring` (or an adjacent standalone `keyring/` directory); it never
+searches the launch working directory. Source and npm installs retain ordinary package
+resolution and never probe beside the shared Bun or Node executable. Compiled installs derive
+their asset root from the executable's canonical real path, so a symlinked launcher still finds
+the addon shipped with the real binary.
+
+The macOS bundle verifier launches the signed sidecar from a disposable unrelated directory and
+requires its bounded, load-only keyring probe to expose both native constructors. It does not read
+or write an OS credential, which would make an ad-hoc CI identity depend on a consent dialog.
+Release verification separately requires both Darwin architecture files inside the universal app.
+Merely finding a `.node` file in the source checkout is not sufficient evidence.
+
+Linux desktop bundles place resources under `usr/lib/OpenCodex` while the sidecar lives under
+`usr/bin`. The compiled loader recognizes only that exact bundle shape after the adjacent
+standalone directory, and the extracted-AppImage verifier executes the same bounded load-only
+probe in ordinary PR CI and release CI. This keeps source/npm runtimes and non-`usr/bin`
+standalone layouts out of the Tauri resource fallback.
+
+> Decision record: [ADR-6139](decisions/ADR-6139-packaged-native-keyring-binding.md)
 
 The management API companion presence check in
 `src/server/management/companion-routes.ts` accepts both
@@ -376,6 +429,14 @@ the path a close button takes) and requires the app to exit on its own with code
 the runtime to be gone; destroying the X window or a crash does not count as a drain. Its
 report records readiness time and whole app-process-tree RSS as evidence; those observations are not
 pass/fail budgets until a reviewed cross-platform baseline exists.
+
+The lane takes about 15 minutes, so a pull request selects it only through the `changes` job's
+`desktop` filter: `desktop/**`, the standalone build and its runtime locator
+(`scripts/build-standalone.ts`, `scripts/standalone-targets.ts`, `src/lib/standalone.ts`,
+`src/lib/bun-runtime.ts`), native keyring staging (`scripts/standalone-keyring.ts`,
+`src/lib/keyring-native.ts`), `package.json`, `bun.lock` and `ci.yml` itself. Ordinary `src/**` and
+`gui/**` edits do not run it on a pull request; promotion pushes to `main` and `preview` and
+`workflow_dispatch` always do, so a packaging regression from such an edit surfaces at promotion.
 
 Extraction is intentional. A GitHub-hosted runner is disposable but its package database is still a
 shared job resource, and a normal pull request does not need passwordless package installation or GUI

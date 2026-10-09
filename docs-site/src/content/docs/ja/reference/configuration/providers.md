@@ -31,7 +31,7 @@ GUI で登録または OAuth ログインが完了すると、Models ページ�
 | `providerContextCapValues?` | `Record<string, number>` | `{}` | プロバイダーごとに最後に選択した上限。無効にしても保持され、この値だけで上限が有効になることはありません。有効な値が保存済みの値より優先されます。 |
 | `contextCapValue?` | `number` | `350000` | 初回の有効化で使う既定値。再び有効にすると、そのプロバイダーの選択値を復元します。`setAll: true` とともにグローバル値を変更すると、有効な上限だけを更新します。値を指定せずに `setAll: true` を送ると、設定済みの全プロバイダーの上限を現在のグローバル値で有効にします。 |
 | `codexAccounts?` | `CodexAccount[]` | `[]` | ChatGPT/Codex プール アカウントのメタデータは Codex Auth によって管理されます。秘密は`codex-accounts.json`に別に住んでいます。 |
-| `pausedCodexAccountIds?` | `string[]` | `[]` |再開するまでプールの選択から除外されるアカウント (一時停止時のメイン `__main__` アカウントを含む)。 |
+| `pausedCodexAccountIds?` | `string[]` | `[]` |再開するまでプールの選択から除外されるアカウント (一時停止時のメイン `__main__` アカウントを含む)。 手動の一時停止と再開は、同じアカウント・ワークスペースのメインログインとプール内の既存エントリにも反映されます。 |
 | `codexAccountNamespaces?` | `Record<string, string>` | — | 任意の公開 model selector を保存済み Codex アカウント target に対応付ける任意の map。account-qualified picker row が有効な場合、target が存在する各 selector は Codex picker に個別の `<selector>/<native-openai-model>` row を追加し、各 row はそのアカウントだけを使用します。selector が 1 つでも有効な場合、bare native row は picker で非表示になりますが、明示的に無効化されない限り id は引き続き routing でき、raw `/v1/models` にも表示されます。 |
 | `codexAccountPickerEnabled?` | `boolean` | map が空なら off | 有効な `codexAccountNamespaces` mapping から account-qualified Codex picker row を生成するかを制御します。`true` は mapping された行の表示を許可します。空でない map で省略した場合は後方互換性のため有効として扱われ、map が空なら off です。`false` は mapping を削除せず、明示的な `<selector>/<native-openai-model>` routing も無効にせずに、生成行を非表示にして picker の bare native 行を復元します。 |
 | `activeCodexAccountId?` | `string` | — |次のリクエスト用に手動で選択されたプール アカウント。選択するとスレッドのアフィニティがクリアされます。実行中のリクエストでは、取得された資格情報が保持されます。 |
@@ -135,7 +135,7 @@ account を削除しても mapping は保持され、同じ id を再追加す�
 | `responsesSnapshotRepair?` | `boolean` | デフォルトで無効のクライアント向け修復です。SSE と JSON の Responses ライフサイクルで欠落した status、output、ツールメタデータを補完し、raw 検査と永続化は変更しません。 |
 | `retryOn429?` | `{ enabled?: boolean; attempts?: number; intervalMs?: number; maxIntervalMs?: number; respectRetryAfter?: boolean }` | API-key プロバイダーのみ(`authMode: "key"`)。オプトインの同一ターゲット 429 リトライ: `retryOn429` が無ければ無効で、オブジェクトがあれば `enabled: false` でない限り有効になります。429 時に待機(上流の `Retry-After` または固定間隔)してから、キー フェイルオーバーの前に同一キーで同一リクエストを再送します — メインのテキストターン回復ループ、Responses passthrough、画像/動画ブリッジ、web-search サイドカー、ターミナル継続要求をすべてカバーします。再送の対象はプリストリームの HTTP 429 応答のみで、カスタム `runTurn` トランスポートは HTTP リトライループの対象外です。`attempts` は最初の 429 以降の同一キー再送回数(合計送信数 = `attempts` + 1)で、メインの回復ループ・ターミナルガード継続・ブリッジ再試行で共有されるリクエスト単位の予算です。`attempts` を使い切っても同一キーでの再送が止まるだけで、通常のキー フェイルオーバーまたは最終エラー処理が利用可能なターゲットに応じて続きます — キー認証の passthrough ワイヤにはフェイルオーバーがないため、使い切った 429 はそのまま返ります。Codex 自体は 429 をリトライしないため、単一キーのプロバイダーでは唯一の防御です。デフォルト: `enabled: true`、`attempts: 3`、`intervalMs: 5000`、`maxIntervalMs: 60000`(1回の待機は `maxIntervalMs` で上限、その上限は 600000)、`respectRetryAfter: true`。 |
 | `transientRetryOn5xx?` | `{ enabled?: boolean; attempts?: number }` | キー認証の `openai-chat` および `openai-responses` プロバイダーのみ。`authMode: "forward"` のプロバイダー（ChatGPT アカウントプール）はこのオプションを読まず、既定の再試行段数を維持します。ストリーム開始前に上流から返される一時的なステータス（500、502、503、504、520、521、522）に対するオプトインの再試行です。設定がなければ無効で、オブジェクトを指定すると `enabled: false` でない限り有効になります。最初の Responses リクエスト、ターミナルガード継続、ネイティブの `/v1/chat/completions`、および 429／アカウント回復時の再取得が対象です。`attempts` は最初の送信を含め、1 回のリクエストで許可される上流への送信総数です（1～10、デフォルトは 3）。接続リセット回復と共有するリクエスト単位の単一予算であるため、`3` を指定した場合、プロバイダーに到達する実リクエストは最大 3 回です。待機には 400 ms を基準とする固定式の指数バックオフを使用し、上限は 5 秒で、`Retry-After` に従います。レート制限を扱う `retryOn429` とは別の機能であり、ストリーム開始後の失敗は再送されません。 |
-| `retryOnReset?` | `{ enabled?: boolean; replacements?: number }` | ネイティブ `openai-responses` プロバイダー専用で、`authMode: "forward"` も含みます。呼び出し側が何も観測しないまま失敗した送信を、オプトインで置き換えます。設定がなければ無効で、オブジェクトを指定すると `enabled: false` でない限り有効になります。レスポンスヘッダーが届く前に接続が切れた場合と、ヘッダー後に SSE 本文が制御イベントだけを運んだまま切れた場合の両方が対象です。canonical ChatGPT upstream WebSocket で create フレームの送信後、Responses イベントが届く前にソケットが閉じたかエラーになった場合も同じく対象で、その置き換えは HTTP で送信します。置き換えるのは自己完結したリクエストだけで、`store: false`、完全な `input`、`previous_response_id` / `conversation` / `stream_id` がないこと、クライアントが実行するツールのみ、が条件です。`replacements` は、すべてのレッグとすべてのコンボ子リクエストを合わせて 1 つの論理リクエストが行える置き換え送信の回数です（1..2、デフォルトは 1）。レッグ単位の再試行回数でも送信予算でもないため、置き換え送信もそのレッグがすでに持つ送信許容量に収まる必要があります。すでに出力やツール呼び出しを送ったリクエストは、この値に関わらず置き換えません。元の送信がすでに開始されていた場合は置き換えた推論も課金される可能性があるため、既定では無効です。 |
+| `retryOnReset?` | `{ enabled?: boolean; replacements?: number }` | ネイティブ `openai-responses` プロバイダー（`authMode: "forward"` を含む）と、上流ヘッダー受信前の汎用 Responses 変換経路に適用されます。呼び出し側が何も観測しないまま失敗した送信を、オプトインで置き換えます。設定がなければ無効で、オブジェクトを指定すると `enabled: false` でない限り有効になります。レスポンスヘッダーが届く前に接続が切れた場合と、ヘッダー後に SSE 本文が制御イベントだけを運んだまま切れた場合の両方が対象です。canonical ChatGPT upstream WebSocket で create フレームの送信後、Responses イベントが届く前にソケットが閉じたかエラーになった場合も同じく対象で、その置き換えは HTTP で送信します。置き換えるのは自己完結したリクエストだけで、`store: false`、完全な `input`、`previous_response_id` / `conversation` / `stream_id` がないこと、クライアントが実行するツールのみ、が条件です。`replacements` は、すべてのレッグとすべてのコンボ子リクエストを合わせて 1 つの論理リクエストが行える置き換え送信の回数です（1..2、デフォルトは 1）。レッグ単位の再試行回数でも送信予算でもないため、置き換え送信もそのレッグがすでに持つ送信許容量に収まる必要があります。すでに出力やツール呼び出しを送ったリクエストは、この値に関わらず置き換えません。元の送信がすでに開始されていた場合は置き換えた推論も課金される可能性があるため、既定では無効です。 汎用変換経路では、初回送信と再構築後の送信のどちらも、同じ許可と送信予算でヘッダー受信前の接続リセットを置き換えます。アダプター独自のトランスポートと、上流ヘッダー受信後の変換ストリーム障害は対象外です。 |
 | `autoToolChoiceOnlyModels?` | `string[]` | `tool_choice` が `auto` または `none` のみを受け入れるモデル。強制的な選択は格下げされます。 |
 | `preserveReasoningContentModels?` | `string[]` |チャット履歴に以前のアシスタント `reasoning_content` が必要なモデル。ダッシュボードから保存しても、保存済みのリスト（`[]` を含む）は保持されます。`PATCH /api/providers?name=<provider>` は配列、または消去するための `null` を受け付けます。 アダプター、ベース URL、または認証モードを変えて別の宛先に移す保存では保持されません（下の節を参照）。 |
 | `reasoningDetailsModels?` | `string[]` | thinking を構造化された `reasoning_details` 配列で返すモデル（`reasoning_split` 使用の MiniMax M シリーズ）。ストリーム差分は累積スナップショットとして prefix-diff され、保持された reasoning は `reasoning_content` 文字列ではなく `reasoning_details` 配列としてリプレイされます。 |
@@ -160,17 +160,17 @@ API キープロバイダーは、リテラルキーまたは環境参照を保�
 
 ### プロバイダーの保存で保持されるもの
 
-既存のプロバイダー名で `POST /api/providers` を送ると、保存済みの行はリクエストから組み立てた行で置き換えられます。ダッシュボードの追加・編集フォームはすべてのフィールドを送れないため、リクエストが省略した保存済みフィールドの一部は保存時に引き継がれます。そのうち次の 5 つは、特定のアップストリームの挙動を記録するものです：`preserveReasoningContentModels`, `requiresReasoningPlaceholderModels`, `foldDeveloperRoleToSystem`, `reasoningWireFormat`, `omitReasoningEffortWithToolsModels`。
+既存のプロバイダー名で `POST /api/providers` を送ると、保存済みの行はリクエストから組み立てた行で置き換えられます。ダッシュボードの追加・編集フォームはすべてのフィールドを送れないため、リクエストが省略した保存済みフィールドの一部は保存時に引き継がれます。そのうち次の 8 つは、特定のアップストリームの挙動を記録するものです：`preserveReasoningContentModels`, `requiresReasoningPlaceholderModels`, `foldDeveloperRoleToSystem`, `reasoningWireFormat`, `omitReasoningEffortWithToolsModels`, `retryOn429`, `transientRetryOn5xx`, `retryOnReset`。
 
-| 保存 | 5 つの設定 | 保存済みの `apiKeyPool` |
+| 保存 | 8 つの設定 | 保存済みの `apiKeyPool` |
 | --- | --- | --- |
 | 同じ宛先、フィールド省略 | 保存済みの値を保持（明示的な `[]` や `false` を含む） | 保持 |
 | 新しい宛先、フィールド省略 | 保持しない。新しい宛先のレジストリ既定値が適用されることがあります | 保持しない |
 | リクエストでフィールドを送信 | リクエストの値 | リクエストの値 |
 
-宛先とは、アダプター、ベース URL（スキームとホストは大文字小文字を区別せず、末尾のスラッシュは無視）、そしてリクエストが指定した場合は認証モードです。別の宛先へ移すと、以前のアップストリームを表す 5 つの設定と、そのために発行されたキーのプールは引き継がれません。保存時に古い行の残りを新しい行へマージすることはありません。
+宛先とは、アダプター、ベース URL（スキームとホストは大文字小文字を区別せず、末尾のスラッシュは無視）、そしてリクエストが指定した場合は認証モードです。別の宛先へ移すと、以前のアップストリームを表す 8 つの設定と、そのために発行されたキーのプールは引き継がれません。保存時に古い行の残りを新しい行へマージすることはありません。
 
-`PATCH /api/providers?name=<provider>` は指定したフィールドだけを変更し、宛先に関係なくほかの保存済みフィールドはすべて保持します。5 つの設定をすべて受け付け、`null` で消去します。2 つの推論リストでは、空の配列は削除されず明示的なオプトアウトとして保存されます。
+`PATCH /api/providers?name=<provider>` は指定したフィールドだけを変更し、宛先に関係なくほかの保存済みフィールドはすべて保持します。8 つの設定をすべて受け付け、`null` で消去します。2 つの推論リストでは、空の配列は削除されず明示的なオプトアウトとして保存されます。
 
 ## プロバイダーによるアウトバウンドの安全性診断
 
@@ -222,7 +222,7 @@ affinity を維持します。これらの戦略は provider enforcement を回�
 | `anthropicAccountPool.quotaWindow?` | `"five-hour" \| "weekly" \| "max-utilization"` | `"five-hour"` |使用量ベースのアカウント選択で使う、プロバイダー報告のキャッシュ済み使用率です。`five-hour` は従来の動作を維持します。`weekly` は週次使用量を使い、他に対象アカウントが残る間だけ 5 時間使用量が上限に達したアカウントを除外し、残らない場合はそれらへフォールバックします。`max-utilization` は判明している値のうち最も高いものを使うため、週次使用量が未取得でも 5 時間使用量を利用できます。どちらも不明なら unknown の順位付けに従います。既知の使用量は unknown より先ですが、対象がすべて unknown でも対象順の先頭を選択します。記載した 5 時間使用量による同点判定後も完全に同点なら、対象順を維持します。正常な affinity セッションを先回りして再配置することはありません。新規セッションの割り当てと、対象となる 429 代替後のルーティング復旧では、`quota` はこの期間で対象候補を直接順位付けし、`fill-first` はこの期間のしきい値と上限到達ルールを使って安定順に進み、`round-robin` はこの設定を無視します。クールダウン、フェイルオーバー上限、再認証の適格性は別のローカル状態です。アカウント別の週次使用量は、ダッシュボードのプロバイダーページで取得した後にのみ利用できます。 |
 | `anthropicAccountPool.stickyLimit?` | `number` | `1` |成功した新しいセッションのバインドは 1 つのラウンドロビン選択で保持されます。範囲は 1 ～ 100。 |
 
-有効にすると、429 レコードは `Retry-After` またはデフォルトのバックオフからの制限されたクールダウンを記録し、リクエスト内でローテーションする可能性があります。アフィニティはプロセスローカルであり、サイズ制限があります。資格情報 401/403 は、アカウントに再認証が必要であることをマークします。すべての対象となるアカウントが冷却されている場合、クライアントは、既知の場合、認証エラーではなく、`Retry-After` を含む 429 を受け取ります。
+共有の5時間・週次クォータが拒否された429だけがアカウントのクールダウンと切り替えを行います。一時的な速度制限はアフィニティを維持して送信受付だけを停止し、リクエストごとに短い同一アカウント再試行1回と別の対象アカウントへの切り替え1回までです。根拠ヘッダーのない429は同一アカウントで1回だけ再試行し、アカウントを冷却せず、Retry-Afterも生成しません。既定の単一アカウント動作は変わりません。Fable専用の拒否はSonnetを制限しません。手動選択とアフィニティもリクエストモデルの共有・ファミリークォータを確認します。パッシブなファミリー情報は30分または既知のリセットで期限切れとなり、1つの送信リクエストで再確認します。使用量しきい値はソフトな優先設定で、全候補消耗時のフォールバックを維持します。使用量・課金のハード上限ではありません。アフィニティはプロセスローカルであり、サイズ制限があります。トークン更新の失敗は既存の再認証ルールに従います。確認済みの契約・アカウント請求の 403 は出力前に別アカウントへ切り替え、`Retry-After` または既定の10分間のクールダウンを記録します。一般的な権限拒否では切り替えません。すべての対象となるアカウントが冷却されている場合、クライアントは、既知の場合、認証エラーではなく、`Retry-After` を含む 429 を受け取ります。
 
 :::caution[実験的]
 Anthropic アカウント ポリシーのリスクを理解していない限り、これは無効のままにしてください。不明な場合は、`ocx account use anthropic <id>` を手動で切り替えることをお勧めします。
@@ -328,6 +328,8 @@ Anthropic アカウント ポリシーのリスクを理解していない限り
 ## xAI の Grok 4.7
 
 Grok 4.7 は OAuth で Fast を利用でき、`low` / `medium` / `high` / `xhigh` と 500,000 トークンのコンテキストを提供します。[xAI の標準料金](https://docs.x.ai/developers/models/grok-4.7)は 100 万トークンあたり入力 2.00 ドル、キャッシュ入力 0.50 ドル、出力 6.00 ドルです。コンテキストが 200,000 トークン以上の場合は 4.00 / 1.00 / 12.00 ドルになります。
+
+プロバイダーの `fastWire` を明示的に設定していない場合、`allowedModels` で制限した opencodex API キーの OAuth Fast リクエストには、`xai/grok-4.7-build-fast`（またはプロバイダー名を除いたモデル ID）の許可が必要です。`xai/grok-4.7` だけの許可では、この Fast モデルを利用できません。Fast モデルだけを許可したキーでも利用できますが、通常のリクエストや Fast が無効な場合には `xai/grok-4.7` の許可が必要です。`fastWire` を明示的に設定した場合は、実際に送信されるモデルを許可してください。例えば、`service-tier` 方式では `xai/grok-4.7` が維持され、そのモデルの許可が必要です。プロバイダーの制限も引き続き適用されます。
 
 ## OpenRouter プロバイダーのルーティング
 
@@ -483,3 +485,7 @@ Vercel AI Gateway は、1 つのモデルを複数の基盤となる推論プロ
   "visionSidecar": { "enabled": true }
 }
 ```
+
+### `anthropicAccountPool.routes`
+
+`anthropicAccountPool.routes` は Anthropic OAuth の保存済みアカウント ID をモデルに割り当てます。有効なプールでは、大文字小文字を区別する `match` グロブの最初の一致が初回選択と 429 再試行を制限します。`fallback: true` はルート内に適格なアカウントがない場合だけ通常のプールを使います。

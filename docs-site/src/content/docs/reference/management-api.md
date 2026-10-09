@@ -75,6 +75,7 @@ route-specific results rather than repeating this table.
 | --- | --- | --- |
 | `GET, PUT /api/v2` | Read or change native multi-agent v2 mode and thread settings | 400 invalid settings; 502 transition or persistence failure |
 | `GET, PUT /api/injection-model` | Read or set the injected sub-agent model, effort, prompt, and guidance settings | 400 invalid model, effort, or body |
+| `POST /api/injection-model/suggest` | Size a described delegated workload and propose a delegation model and effort without writing | 400 invalid work or model; 409 no sizing model |
 | `GET, PUT /api/effort-caps` | Read or set global and sub-agent reasoning-effort ceilings | 400 invalid ladder value |
 | `GET, PUT /api/subagent-models` | Read or order the models advertised to sub-agents | 400 invalid list or more than five models |
 | `GET, PUT /api/subagent-model-fallback` | Read or set the ordered fallback chain and poll interval | 400 invalid list or poll interval |
@@ -288,6 +289,17 @@ the client window after edits, eviction, query changes or restart. Invalid curso
 `error.code: "invalid_cursor"`. Authentication is unchanged. The dashboard falls back to full snapshots
 for older servers. This reduces response bytes for stable windows; server projection remains bounded
 by the current window size.
+
+Successful `/api/logs` `displayMetrics.decodeTokPerSecond` values carry
+`timingBasis: "generation-window" | "legacy-post-visible-output"` alongside `kind`, `value`
+and `estimated: true`; attempt values identify their own window. Unavailable results keep their
+existing `reason` and no timing basis. The field is derived only at read time: stored JSONL,
+end-to-end `tokPerSecond`, request-history DTOs and aggregate throughput are unchanged.
+Older DTOs can omit the field; clients must treat the timing basis as unknown in that case.
+The dashboard names these methods **Generation window** and **After visible output**, with
+**Timing unknown** for a missing or unfamiliar basis. Request details show **Output rate during
+generation (est.)**, **Output rate after first visible output (est.)**, or **Output rate (est.;
+timing method unknown)** and a visible explanation of the timing method when a rate is available.
 
 | Method and path | Purpose | Notable errors |
 | --- | --- | --- |
@@ -557,10 +569,10 @@ outcome fields from an older server do not establish successful recovery.
 | `POST /api/oauth/login/cancel` | Cancel a public in-progress OAuth flow | 400 unknown provider |
 | `GET /api/oauth/status` | Poll one provider's OAuth flow | 400 unknown provider |
 | `POST /api/oauth/logout` | Remove the selected provider credential | 400 unknown provider; `oauth_mutation_busy` |
-| `GET /api/oauth/accounts` | List masked accounts; generic OAuth account rows include their `paused` state. Kiro rows include `autoSelectable` and a closed `skipReason` when excluded from automatic selection; an active singleton may still send. Quota remains opt-in. | 400 invalid provider |
+| `GET /api/oauth/accounts` | List masked accounts; Anthropic and generic OAuth account rows include their `paused` state. Kiro rows include `autoSelectable` and a closed `skipReason` when excluded from automatic selection; an active singleton may still send. Quota remains opt-in. | 400 invalid provider |
 | `DELETE /api/oauth/accounts` | Remove one account | 400 invalid provider/id; 404 account missing; `oauth_mutation_busy` |
 | `PUT /api/oauth/accounts/active` | Select the active OAuth account | 400 invalid provider/account; 404 account missing; 409 account paused; `oauth_mutation_busy` |
-| `PUT /api/oauth/accounts/pause` | Pause or resume one generic OAuth account. Body `{ provider, accountId, paused }`; pausing the active account selects the next usable account when available | 400 unsupported provider or invalid body; 404 account missing; `oauth_mutation_busy` |
+| `PUT /api/oauth/accounts/pause` | Pause or resume one Anthropic or generic OAuth account. Body `{ provider, accountId, paused }`; pausing the active account selects the next usable account when available. Pause is durable and independent of pool enablement; resume preserves health and credentials. | 400 unsupported provider or invalid body; 404 account missing; `oauth_mutation_busy` |
 | `GET, PUT, PATCH /api/pool/settings` | Read or update pool policy for any kind (codex, anthropic, generic); answers with the same keys for all three and declares in `supported` which the kind honours | 400 unknown provider, a field the kind does not support, or an invalid value |
 | `GET, PUT, PATCH /api/oauth/accounts/pool` | Legacy per-pool policy for Anthropic and generic OAuth providers; superseded by `/api/pool/settings` and kept for existing clients | 400 codex or api-key provider, or invalid policy |
 | `POST /api/oauth/accounts/clear-cooldown` | Clear one OAuth account's runtime cooldown | 400 invalid provider/account |
@@ -569,6 +581,8 @@ outcome fields from an older server do not establish successful recovery.
 | `PUT /api/providers/keys/active` | Select a provider's active key | 400 invalid input; 404 provider/key missing |
 | `PUT /api/providers/keys/alias` | Set or clear a provider-key alias | 400 invalid input; 404 provider/key missing |
 | `GET, POST, PATCH, DELETE /api/keys` | List, create, edit, or delete data-plane admission keys | 400 invalid body/id; 404 key missing |
+
+For Anthropic, `routes` is an ordered array of `{name, match, accounts, fallback?}` rules on both settings endpoints. GET and write echoes include `routes` (`null` when absent); unified DTOs expose `routes: null` for other kinds. A supplied `routes` on another kind is rejected. Omission preserves rules, `[]` matches nothing, and `null` clears them. The `accounts` values are stored IDs; removed IDs remain valid in a rule so re-adding an account can restore routing. Management responses retain valid configured names; request logs identify a match only as `route:#<n>` (1-based list position). If a hand-edited stored rule is invalid, both settings GETs return `routes: null` and a `routesError` diagnostic instead of presenting that rule as valid; the stored value remains available for correction. Valid or absent rules omit `routesError`.
 
 Credential list responses are deliberately masked. OAuth access tokens and complete provider API
 keys are not returned to dashboard clients.
@@ -648,6 +662,12 @@ whether to star the repository.
 
 ### System lifecycle
 
+During a restart drain, new data-plane requests receive HTTP 503 with JSON
+`error.type: "server_error"`, `error.code: "server_restarting"`, and the message
+"OpenCodex is restarting; retry this request." Responses retain `Retry-After: 5`
+and the receiving listener's CORS policy. This code lets every Codex version retry
+the 503 without reporting model capacity; provider overload errors retain their separate mapping.
+
 | Method and path | Purpose | Notable errors |
 | --- | --- | --- |
 | `GET /api/system/memory` | Return scalar process, heap, stream, response-state, watchdog, and active-turn metrics. Response-state diagnostics include spill-write status, consecutive failures, fixed privacy-safe failure class, and last failure/success timestamps. `spillLastWriteFailureOrigin` is `retry_returned_timeout`, `timeout_memo_refusal`, or null; cumulative `spillAclRetryReturnedTimeouts` and `spillAclTimeoutMemoRefusals` count terminal failed publications. See [Windows spill diagnostics](/troubleshooting/windows-memory/) for process-local semantics. Raw errors and paths are never returned. | — |
@@ -674,8 +694,9 @@ manager. Its routes are:
 | --- | --- | --- |
 | `GET, POST, DELETE /api/codex-auth/accounts` | List/refresh or delete Codex accounts. POST is retained as a disabled compatibility endpoint; successful DELETE responses include `catalogRefreshPending`. | POST always returns 403 `manual_import_disabled`; 400 invalid DELETE input |
 | `PUT /api/codex-auth/accounts/alias` | Set or clear an account alias | 400 invalid account/alias |
-| `PUT /api/codex-auth/accounts/pause` | Pause or resume one account | 400 invalid account/state; 404 missing account |
+| `PUT /api/codex-auth/accounts/pause` | Manually pause or resume an account and its existing matching main/pool entries; returns `affectedAccountIds` | 400 invalid account/state; 404 missing account; 503 main identity busy or unreadable |
 | `PUT /api/codex-auth/accounts/pause-exhausted` | Pause accounts whose quota is exhausted | Mutation-lock failures become 503 |
+| `PUT /api/codex-auth/accounts/credits` | Allow or stop spending ChatGPT credits after the usage limit. Body `{ id, creditsAfterLimit }` for one account, including `__main__`: true adds the id to `creditCodexAccountIds`, false removes it. Body `{ all }` for the global switch: true lists `__main__` and every pool account, false clears the list. Applies to the next selection. | 400 invalid id or non-boolean value; 404 missing account |
 | `PUT /api/settings` with `codexQuotaAutoRefresh: { id, window, enabled }` | Enable or disable 5-hour or weekly automatic window activation for one account | 400 invalid id/window/state; 404 missing account; 409 unavailable window |
 | `POST /api/codex-auth/accounts/clear-cooldown` | Clear runtime cooldown for one account or all accounts | 400 invalid id |
 | `GET, PUT /api/codex-auth/active` | Read or select the active account | 400 invalid or missing account; 409 paused/legacy-row conflict |
@@ -683,6 +704,7 @@ manager. Its routes are:
 | `PUT, PATCH /api/codex-auth/pool-strategy` | Update Codex account-pool selection strategy | 400 invalid strategy/config |
 | `PUT /api/codex-auth/failover` | Set the account failover threshold | 400 invalid threshold |
 | `GET /api/codex-auth/quota` | Read cached quota state by account | — |
+| `GET /api/codex-auth/low-quota-events?limit=20` | Read only this server’s last 0–100 low-quota log/notice and pause-save events (default 20); includes account id and status (`logged` for the default log-only alert; `delivered` for a successful injected notice sink; `succeeded` for a completed pause save) | 400 invalid limit; management authentication required |
 | `GET /api/codex-auth/reset-credits` | Inspect reset-credit eligibility for an account | 400 missing account id; upstream status passthrough; 500 lookup failure |
 | `POST /api/codex-auth/reset-credits/consume` | Consume an eligible reset credit. Optional `operationId` (UUIDv4) makes the redemption idempotent: the same id replays one durable outcome instead of spending a second credit. | 400 missing account id or invalid `operationId`; 409 `identity_mismatch` when the id belongs to another account; upstream status passthrough; 503 `server_busy`, `capacity`, or `unavailable`; 500 consume failure |
 | `POST /api/codex-auth/login` | Start Codex login or reauthentication | 400 invalid request; conflict/busy login states |
@@ -741,3 +763,25 @@ Direct HTTP is most useful for integrations that need the exact endpoint contrac
 ## Remote sessions and data-key rotation
 
 `POST /api/keys/rotate {id}` starts a ten-minute overlap and returns the new data secret once. `POST /api/keys/rotate/commit {id,rotationId}` commits it; `DELETE /api/keys/rotate {id,rotationId}` aborts it. All require management authentication; data keys cannot call them. `POST /api/session/logout` requires the current `gui-session`, matching Origin, and CSRF. An admin token receives 403 and can never mint or exchange into a consent session.
+
+## Anthropic account usage threshold
+
+`PUT /api/oauth/accounts/auto-switch`
+
+Anthropic OAuth only; `{ provider: "anthropic", accountId, threshold }` accepts integer 0–100 or null to inherit. Missing threshold is invalid. Stored override survives restart and is removed with the account.
+
+Account-list DTOs include `autoSwitchThresholdOverride` (integer/null), `autoSwitchThreshold` (pool default), and `effectiveAutoSwitchThreshold`. 0 disables usage-driven switching only; it never disables pause or 429 recovery.
+
+HTTP: 400 invalid/unsupported; 404 missing account; `oauth_mutation_busy` on lock contention.
+
+### Forced Claude Code subagent model
+
+The Subagents page offers **Force all subagents onto one model**, off by default. Select an exposed roster-style id, such as `combo/tev-auto`, then enable the switch. The roster is offered first; unavailable saved roster entries cannot be force targets.
+
+`ocx agent subagents force combo/tev-auto` sets `claudeCode.subagentModelForce`; `ocx agent subagents force -` clears it. `ocx agent status` reports the setting. `GET /api/subagent-models` returns `force`, `forceAvailable`, and `forceStatus`; `PUT` accepts `{ "force": "combo/tev-auto" }` or `{ "force": null }` without changing the roster. Omitting `force` leaves it unchanged. Invalid or unexposed targets are rejected on write; stale targets are reported and skipped at launch.
+
+This takes effect on the **next routed `ocx claude` launch**, injecting `CLAUDE_CODE_SUBAGENT_MODEL` as an explicit proxy alias (with `[1m]` only for an authoritative million-token window; native Claude targets use a reversible native alias) and `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`. Each nonempty shell-exported variable independently wins. Native launches inject neither variable; plain `claude` is not affected. No plugin files or `settings.json` are modified by this setting.
+
+Claude Code **2.1.257 or newer** is required for FORCE. Plugin and built-in agents (including Explore/Plan) and per-call model arguments are overridden. Forks and subagent skills with `model: inherit` keep the main conversation model. The main loop and Haiku/small-fast sidecars are unaffected. Existing roster files remain available.
+
+The dashboard warns about old or unknown CLI versions, unavailable targets, and either variable already present in `settings.json` → `env` (which overrides launch env). Detection is read-only and server-local: it cannot inspect another launch shell, another machine, or project-local settings. An unknown result is not proof of force support.

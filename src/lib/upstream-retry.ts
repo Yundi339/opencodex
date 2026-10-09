@@ -550,6 +550,15 @@ export interface TransientRetryOptions extends ResetRetryOptions {
    */
   retryCapacityDeferralsMs?: readonly number[];
   /**
+   * Paced extra sends for an upstream 429, as the waits before each one.
+   *
+   * Separate from {@link retryCapacityDeferralsMs} because the verdict differs: a capacity answer
+   * means the origin is busy, a 429 means this requester is over a limit. Both arrive before
+   * anything has run, both are spent as ADDITIONAL sends, and neither widens `attempts`. An empty
+   * list keeps 429 exactly as it was -- a non-transient status the caller owns.
+   */
+  retryRateLimitDeferralsMs?: readonly number[];
+  /**
    * Reports every capacity deferral this call imposed before a resend.
    *
    * The caller marked "the send started" before this function, and the absorb waits happen inside
@@ -755,6 +764,24 @@ export async function fetchWithResetRetry(
  */
 export const CAPACITY_RETRY_DELAYS_MS: readonly number[] = [5_000, 12_000, 25_000, 45_000];
 
+/**
+ * Extra sends a caller may spend on an upstream 429, and the waits between them.
+ *
+ * The plan limiter answers `{"code":"rate_limit_exceeded"}` in about a second, before anything has
+ * run, and the next attempt succeeds once the window reopens (measured 2026-10-05/06: five of these
+ * on two conversations, and every turn that followed the ladder completed). Nothing executed before
+ * the headers arrived, so a resend cannot duplicate work -- the send budget's amplification concern
+ * does not apply to this class, exactly as it does not for capacity.
+ *
+ * Paced rather than immediate: the limiter counts requests in a window, so resending on the same
+ * second spends another request against the same window. Three rungs keep a turn alive for half a
+ * minute without turning one rejection into a burst.
+ */
+export const RATE_LIMIT_RETRY_DELAYS_MS: readonly number[] = [2_000, 8_000, 20_000];
+
+/** Longest `Retry-After` honoured on a 429 before the answer is handed back untouched. */
+export const RATE_LIMIT_RETRY_AFTER_CEILING_MS = 60_000;
+
 export async function fetchWithTransientRetry(
   doFetch: ReplayableFetch,
   opts: TransientRetryOptions = {},
@@ -770,7 +797,9 @@ export async function fetchWithTransientRetry(
    */
   const capacityDelays = opts.retryCapacityDeferralsMs ?? [];
   let capacityRetriesUsed = 0;
-  const totalBudget = budget + capacityDelays.length;
+  const rateLimitDelays = opts.retryRateLimitDeferralsMs ?? [];
+  let rateLimitRetriesUsed = 0;
+  const totalBudget = budget + capacityDelays.length + rateLimitDelays.length;
   const slowAttemptMs = opts.slowAttemptMs ?? TRANSIENT_RETRY_SLOW_ATTEMPT_MS;
   const transientStatuses: number[] = [];
   // `attempts` is ONE total-send budget shared with the inner reset layer, not a per-layer
@@ -841,7 +870,10 @@ export async function fetchWithTransientRetry(
   for (let attempt = 0; sent < totalBudget; attempt++) {
     // A non-replayable gateway status was settled after the request body had already left
     // for the origin; retrying it here is the automatic resend the marker exists to forbid.
-    if (res.ok || !isTransientUpstreamStatus(res.status) || isNonReplayableResponse(res)) {
+    // A 429 only enters this loop when the caller opted into a rate-limit ladder; without one it
+    // keeps its old meaning (a non-transient status the caller owns) and returns here.
+    const rateLimited = res.status === 429 && rateLimitDelays.length > 0;
+    if (res.ok || (!isTransientUpstreamStatus(res.status) && !rateLimited) || isNonReplayableResponse(res)) {
       return wrapSseDeclineRetry(res);
     }
     // Checked before cancelResponseBodyBestEffort so an already-aborted caller never receives
@@ -860,6 +892,42 @@ export async function fetchWithTransientRetry(
       cancelResponseBodyBestEffort(res);
       await sleepWithAbort(waitMs, opts.abortSignal);
       opts.onCapacityWait?.(waitMs);
+      attemptStart = Date.now();
+      transientStatuses.push(res.status);
+      try {
+        res = await fetchWithResetRetry(countedFetch, innerResetOptions(1), "transient-5xx");
+      } catch (err) {
+        if (err instanceof SendBudgetExhaustedError) throw err;
+        throw new UpstreamRetryEvidenceError(transientStatuses, err);
+      }
+      continue;
+    }
+    // Rate-limit lane: the plan limiter's verdict, absorbed with pacing. Headers-only by
+    // construction -- the limiter refuses before the turn runs -- so a resend cannot duplicate a
+    // step, and an explicit Retry-After is honoured in full when it fits the ceiling.
+    if (rateLimited) {
+      if (rateLimitRetriesUsed >= rateLimitDelays.length) {
+        console.warn(
+          `[upstream-retry] rate limited 429${opts.label ? ` (${opts.label})` : ""} — ladder exhausted after `
+          + `${rateLimitRetriesUsed} absorb(s); handing the answer back`,
+        );
+        return res;
+      }
+      const instructed = retryAfterDelayMs(res.headers);
+      if (instructed !== undefined && instructed > RATE_LIMIT_RETRY_AFTER_CEILING_MS) {
+        console.warn(
+          `[upstream-retry] rate limited 429${opts.label ? ` (${opts.label})` : ""} — Retry-After `
+          + `${Math.round(instructed / 1000)}s exceeds the ceiling; handing the answer back`,
+        );
+        return res;
+      }
+      const waitMs = instructed ?? rateLimitDelays[rateLimitRetriesUsed]!;
+      rateLimitRetriesUsed += 1;
+      console.warn(
+        `[upstream-retry] rate limited 429${opts.label ? ` (${opts.label})` : ""} — absorbing: waiting ${waitMs}ms before resend ${rateLimitRetriesUsed}/${rateLimitDelays.length}`,
+      );
+      cancelResponseBodyBestEffort(res);
+      await sleepWithAbort(waitMs, opts.abortSignal);
       attemptStart = Date.now();
       transientStatuses.push(res.status);
       try {

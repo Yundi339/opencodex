@@ -39,9 +39,76 @@ that survives the transport budget: unified Desktop `exec` as well as the legacy
 unified `exec` keeps its own schema and is surfaced back to Codex as a client tool. It must never
 fall through to the separate native-local-exec dispatcher.
 
-In external Cursor turns using code mode or shell aliases, the bounded leading-commentary guard in `src/adapters/cursor/envelope-echo.ts` counts `Shell`, `네이티브 셸`, and `네이티브 쉘` as one `shell` identity, including spacing variants and names split across text deltas. Korean aliases require a Unicode-aware left token boundary so wording embedded in a larger word or identifier is not counted; punctuation and following Korean grammatical suffixes remain supported. Rejection still requires a failure claim plus either an explicit redirect or at least two distinct native-tool identities; repeated aliases alone do not count as multiple tools.
+Denied native fs/shell/fetch frames carry a catalog-aware redirect (`cursorNativeExecRedirectHint`).
+When the visible catalog is Codex code mode — a freeform unified `exec` and no bare shell bridge —
+the redirect steers the model INSIDE `exec`: shell, file, search, and fetch are nested
+`tools.<name>(...)` helpers of the JavaScript cell with `text(...)` required for output, and the
+wording never recommends the top-level `shell_command`/`exec_command` bridge code mode does not
+expose; separately listed namespaced tools remain callable as usual. A flat catalog with a bare
+bridge or a non-freeform unified `exec` keeps the default bridge wording, and a catalog with no
+execution path at all keeps naming the request's actual client/MCP wire names.
+
+Explicit Claude-family targets (`claude-*`, including `cursor/claude-*` selections) receive
+factual tool guidance and native-exec redirects from `src/adapters/cursor/tool-wording.ts`:
+they name available catalog tools, state that Cursor-native tools are unavailable, and end with
+“Continue the task with that tool call.” An empty client/MCP catalog instead states that no client
+tools are available and asks for an answer without tools or a report of the limitation; it never
+names assumed shell/edit tools. Catalog-less dispatcher fallback uses its advertised definitions.
+They impose no tool-routing narration restrictions. `src/adapters/cursor.ts` leaves the routing-
+commentary sniffer unarmed for these targets so factual routing prose can precede a tool call;
+tool-envelope echo guards remain active under their existing predicates.
+`src/adapters/cursor/protobuf-request.ts` uses the final request model for system guidance;
+`src/adapters/cursor/live-transport.ts` re-derives the redirect and `plainToolWording` exec flag
+on every turn. The flag also covers catalog-less fallback and apply-patch mutation refusals.
+Other targets, including Auto/default whose underlying family is unknown, retain byte-identical
+legacy wording. Execution policy, tool names, argument schemas, and denial wire shapes are unchanged.
+`tests/providers/cursor/cursor-tool-wording.test.ts` covers encoded roots, per-turn target changes,
+all denied fs/shell/fetch frame kinds, empty catalogs, factual-prose continuations through the next
+tool call, and pre-change non-Claude wording snapshots.
+
+In non-Claude external Cursor turns using code mode or shell aliases, the bounded leading-commentary guard in `src/adapters/cursor/envelope-echo.ts` counts `Shell`, `네이티브 셸`, and `네이티브 쉘` as one `shell` identity, including spacing variants and names split across text deltas. Korean aliases require a Unicode-aware left token boundary so wording embedded in a larger word or identifier is not counted; punctuation and following Korean grammatical suffixes remain supported. Rejection still requires a failure claim plus either an explicit redirect or at least two distinct native-tool identities; repeated aliases alone do not count as multiple tools.
 
 > Decision record: [ADR-0048](../decisions/ADR-0048-cursor-native-exec.md)
+
+## Client tool wire names and transport budget
+
+`src/adapters/cursor/tool-naming.ts` derives client wire names from the turn's tool catalog.
+Recognized bare Claude client tools such as `Bash`, `Read`, `Write`, `Edit`, `Grep`, `Glob`, and
+`Task` keep their names when the catalog has no bare Codex `exec_command` or `shell_command`
+bridge. When either bare bridge is present, those tools receive the `ocx_client_` prefix to avoid
+Cursor-private tool collisions. Other non-proxy-owned bare tools always receive that prefix;
+proxy-owned execution/edit tools and namespaced MCP tools retain their existing identities.
+Registration, guidance, denied-native-exec redirects, live call mapping, and protobuf history
+replay use this catalog-dependent rule. Return mapping restores the client's semantic tool name.
+Claude factual redirects resolve each tool against the complete visible request catalog, regardless
+of declaration order, so their listed names match registration with or without a bare shell bridge.
+`tests/providers/cursor/cursor-tool-wording.test.ts` checks both bridge orders and no-bridge catalogs
+through redirect guidance and live transport request preparation.
+Request construction resolves accepted bare wire aliases in forced and allowed-tool choices to
+semantic names against the original catalog, retaining only the originally selected identities
+before prompt and budget filtering so a removed bridge cannot invalidate registration or widen
+the choice to a namespaced sibling.
+
+`src/adapters/cursor/tool-definitions.ts` measures actual repeated protobuf entries using the
+same catalog context for tool-choice matching and wire naming as registration.
+`src/adapters/cursor/request-builder.ts` passes the eligible catalog to every admission and
+eviction size calculation, so both serialized name fields include alias bytes. The transport
+budget remains 330 tools and 120,000 bytes. If a bridge is omitted, surviving Claude tools can
+use shorter bare names; the eligible-catalog measurement remains conservative in that case.
+`tests/providers/cursor/cursor-blob-claude-client-tools.test.ts` covers replay naming and mixed
+catalogs exactly at, and immediately above, the byte limit.
+
+## Structured final output
+
+Cursor's Connect wire has no native Responses `text.format` schema field. The adapter preserves
+`json_object` and `json_schema` in `src/adapters/cursor/types.ts` and renders the final-output
+contract through `src/adapters/cursor/structured-output.ts`. The protobuf builder includes it in
+system roots and repeats it in active user-message actions, including tool-result continuations.
+This is a prompt fallback, not constrained decoding or response-schema validation. Tool calls
+remain available before the final answer; ordinary text requests receive no JSON instruction.
+The checkpoint instruction digest includes the format, so a changed schema forces full replay.
+`tests/providers/cursor/cursor-request-compat.test.ts` checks the encoded action and
+`tests/providers/cursor/cursor-request-builder.test.ts` checks checkpoint invalidation.
 
 ## Cursor parameterized models
 

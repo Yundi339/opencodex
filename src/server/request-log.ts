@@ -92,6 +92,7 @@ import {
   normalizePersistedJevDecision,
   type PersistedJevDecisionV1,
 } from "../usage/jev-stats";
+import { generationWindowFields, recordGenerationEvent } from "./request-log-generation-window";
 import type { RequestMetricsRecorder } from "./request-metrics";
 import type {
   CacheDiagnosticDraft,
@@ -143,6 +144,9 @@ export interface RequestLogContext {
   affinityMoveReasons?: CodexAffinityReason[];
   /** TTFT: ms from request start to the first non-empty model output delta (WP4, devlog 040). */
   firstOutputMs?: number;
+  /** Epoch ms of the first output item and of the last output delta; see request-log-generation-window.ts. */
+  generationStartedAt?: number;
+  lastOutputAt?: number;
   /** Best-effort chat/session correlation for Logs grouping (#330). Opaque; omit when unknown. */
   conversationId?: string;
   surface?: "claude" | "claude-desktop" | "grok";
@@ -254,6 +258,8 @@ export interface RequestLogContext {
   terminalSource?: "upstream" | "synthetic";
   /** Bounded route-decision trace (RI-01); never contains secrets. */
   routeDecision?: RouteDecisionTraceV1;
+  /** Full eligible provider/model membership from a policy route; never logged. */
+  policyEligibility?: ReadonlySet<string>;
   /** Privacy-bounded JEV selection metadata; downstream usage is recorded on attempts[]. */
   jevDecision?: PersistedJevDecisionV1;
   /** Opt-in shadow evidence, normalized again at the logging boundary. */
@@ -287,6 +293,9 @@ export interface RequestLogEntry {
   provider: string;
   /** TTFT: ms from request start to the first non-empty model output delta; unset for non-streaming/tool-only. */
   firstOutputMs?: number;
+  /** Request-relative generation window (#6309): first output item of any kind, then the last output delta. */
+  genStartMs?: number;
+  lastOutputMs?: number;
   surface?: "claude" | "claude-desktop" | "grok";
   /**
    * Set when the proxy answered this turn locally and sent nothing upstream. Without it a zero-send
@@ -458,6 +467,8 @@ export function requestLogEntryFromPersistedUsage(entry: PersistedUsageEntry): R
     model: entry.model,
     provider: entry.provider,
     ...(entry.firstOutputMs !== undefined ? { firstOutputMs: entry.firstOutputMs } : {}),
+    ...(entry.genStartMs !== undefined ? { genStartMs: entry.genStartMs } : {}),
+    ...(entry.lastOutputMs !== undefined ? { lastOutputMs: entry.lastOutputMs } : {}),
     ...(isKnownUsageSurface(entry.surface) ? { surface: entry.surface } : {}),
     ...(entry.conversationId ? { conversationId: entry.conversationId } : {}),
     ...(isCodexUsageAccountLogLabel(entry.accountLogLabel)
@@ -673,6 +684,8 @@ export function addRequestLog(entry: RequestLogEntry) {
       status: entry.status,
       durationMs: entry.durationMs,
       ...(entry.firstOutputMs !== undefined ? { firstOutputMs: entry.firstOutputMs } : {}),
+      ...(entry.genStartMs !== undefined ? { genStartMs: entry.genStartMs } : {}),
+      ...(entry.lastOutputMs !== undefined ? { lastOutputMs: entry.lastOutputMs } : {}),
       usageStatus: entry.usageStatus,
       ...(entry.usage ? { usage: entry.usage } : {}),
       ...(entry.totalTokens !== undefined ? { totalTokens: entry.totalTokens } : {}),
@@ -1061,6 +1074,7 @@ export function inspectResponseLogSsePayloadParsed(
   if (!payload || payload.trim() === "[DONE]") return;
   const debugEnabled = isUsageDebugEnabled();
   const sseAlreadyMarked = logCtx.usageDebugBodyKind === "sse";
+  if (parsed !== undefined) recordGenerationEvent(logCtx, (parsed as { type?: unknown } | null)?.type);
   if (parsed !== undefined) applyResponseLogMetadata(logCtx, parsed);
   else logCtx.activeTierMetadata?.markResponseUnparseable();
   captureUpstreamErrorParsed(logCtx, payload, parsed);
@@ -1594,6 +1608,7 @@ export function addFinalRequestLog(
     status: effectiveStatus,
     durationMs,
     ...(logCtx.firstOutputMs !== undefined ? { firstOutputMs: logCtx.firstOutputMs } : {}),
+    ...generationWindowFields(logCtx, start),
     ...(errorCode ? { errorCode } : {}),
     ...(meta?.terminalStatus ? { terminalStatus: meta.terminalStatus } : {}),
     ...(closeReason ? { closeReason } : {}),

@@ -113,6 +113,8 @@ export interface CatalogModel {
   displayName?: string;
   owned_by?: string;
   reasoningEfforts?: string[];
+  /** Exact CCA family evidence, retained through the in-memory discovery cache. */
+  antigravityEffortWireModelIds?: Partial<Record<"low" | "medium" | "high", string>>;
   /** Suppress only catalog synthesis of a missing max rung; provider-declared max survives. */
   suppressSyntheticMax?: boolean;
   defaultReasoningEffort?: string;
@@ -633,7 +635,10 @@ export function ensureStrictCatalogFields(
     entry.max_context_window = contextWindow;
   }
   if (typeof entry.effective_context_window_percent !== "number") entry.effective_context_window_percent = 95;
-  if (typeof entry.comp_hash !== "string") entry.comp_hash = "opencodex";
+  // Unknown compatibility is not an incompatibility marker. Codex compares hashes only
+  // when both turns supply one; a synthetic value forces native/routed switches to compact
+  // even below the token limit. Keep authoritative strings and represent unknown as null.
+  if (typeof entry.comp_hash !== "string") entry.comp_hash = null;
   // Routed rows must not carry NATIVE eligibility metadata. `deriveEntry` deep-clones a
   // native template and deletes a fixed denylist, so these eligibility fields survive onto rows backed
   // by unrelated provider credentials — advertising ChatGPT plan eligibility for a model

@@ -33,6 +33,18 @@ export function isEagerRelaySseResponse(response: Response): boolean {
   return eagerRelaySseResponses.has(response);
 }
 
+/** Mark bounded JSON whose request-log metadata was already derived from its source events. */
+const preinspectedJsonResponses = new WeakSet<Response>();
+
+export function markPreinspectedJsonResponse(response: Response): Response {
+  preinspectedJsonResponses.add(response);
+  return response;
+}
+
+export function isPreinspectedJsonResponse(response: Response): boolean {
+  return preinspectedJsonResponses.has(response);
+}
+
 // runTurn adapters own an event queue and perform their combo preflight before bridging. A second
 // byte-stream reader would reinterpret that transport's already-committed event boundary and can
 // replay custom adapter work.
@@ -42,4 +54,5 @@ export function carrySseResponseMarkers(source: Response, rewrapped: Response): 
   if (nativePassthroughSseResponses.has(source)) nativePassthroughSseResponses.add(rewrapped);
   if (eagerRelaySseResponses.has(source)) eagerRelaySseResponses.add(rewrapped);
   if (runTurnAdapterSseResponses.has(source)) runTurnAdapterSseResponses.add(rewrapped);
+  if (preinspectedJsonResponses.has(source)) preinspectedJsonResponses.add(rewrapped);
 }

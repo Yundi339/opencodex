@@ -11,18 +11,13 @@ other providers whose models happen to share a name fragment.
 
 ## Chronological in-conversation instructions
 
-`src/adapters/openai-chat/messages.ts` keeps a text-only timeline developer message in the
-slot it arrived in, on every Chat destination and model. Appending a reminder therefore does
-not hoist new text into the leading system prompt and rewrite the existing serialized message
-prefix, and a mid-conversation instruction no longer moves ahead of the turns it was written
-to follow. Pending tool results still precede deferred reminders. This was previously scoped
-to the registry-recognized OpenCode Go destination and the exact model
-`deepseek-v4.1-flash`, which made prompt-prefix stability read as a property of that one
-destination. The base system prompt, vision conversion and native OpenAI developer roles
-retain their existing behavior. This is independent of the Claude trailing-notice
-stabilization option and does not guarantee upstream cache hits. Regression coverage is in
-`tests/adapters/openai/openai-chat-system-order.test.ts` and
-`tests/adapters/openai/openai-chat-developer-position.test.ts`.
+`src/adapters/openai-chat/messages.ts` keeps text-only timeline developer messages in their
+original slots on every Chat destination and model. A later reminder does not rewrite the
+leading system prompt or move ahead of earlier turns; pending tool results still precede
+deferred reminders. This behavior previously covered only OpenCode Go and
+`deepseek-v4.1-flash`. The base system prompt, vision conversion, native OpenAI developer
+roles, and Claude trailing-notice option are unchanged; cache hits are not guaranteed.
+Tests: `tests/adapters/openai/openai-chat-system-order.test.ts` and `tests/adapters/openai/openai-chat-developer-position.test.ts`.
 
 The role that slot carries is a separate decision, and the setting that makes it is tri-state.
 `foldDeveloperRoleToSystem` unset sends `system`, `true` sends `system`, and `false` sends
@@ -34,6 +29,12 @@ folded one because a destination that rejects the role answers
 repository where no test can reach it. The role was previously decided by testing the base URL host
 against `api.openai.com`, so every OpenAI-compatible gateway was assumed not to support a standard
 role until proven otherwise, and the instruction silently lost `developer` precedence.
+
+The translated `Qwen3.8-27B` Chat route follows its [pinned template](https://huggingface.co/Qwen/Qwen3.8-27B/blob/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/chat_template.jinja): a late `system` raises, `developer` is unsupported, and a late `user` renders in place.
+Gateway-namespaced ids such as LiteLLM's `openai/Qwen3.8-27B` match too. Text-only developer items therefore keep their content and slot but use the `user` wire role,
+losing developer precedence. Other models retain the mapping above; native Chat passthrough
+is unchanged. The rule is recorded in `tests/fixtures/qwen38-27b-chat-template-contract.json`
+and exercised by `tests/adapters/openai/openai-chat-qwen38-leading-system.test.ts`.
 
 That mapping is not prose to be restated. `tests/ci-workflows/docs-developer-role-policy.test.ts`
 builds the sentence above from the role `src/adapters/openai-chat/messages.ts` serializes for each
@@ -121,13 +122,12 @@ and synthesizing explicit "no tool result was recorded" answers only when no rea
 (Kimi/Moonshot 400 `ocx-mrqaiw05-269`; unit `devlog/_fin/260718_dangling_toolcall_hardening`).
 
 The native Ollama wire carries the same contract. `src/adapters/ollama-native.ts`
-`buildNativeMessages` defers `user`/`developer` messages that arrive while a batch is open and
-releases them after the tool messages, and answers a call with no result anywhere in the replayed
-history with the same `[ocx] no tool result was recorded for "<name>"` marker. The shape it
-absorbs is ordinary Codex history, not a malformed one: Codex records mid-turn items (a
-`PostToolUse` hook verdict, a context notice) between an assistant `tool_calls` message and that
-call's own result. The strict pair checks (orphan result, duplicate result, result naming another
-tool) still throw on both wires (#4842).
+`buildNativeMessages` defers `user`/`developer` messages while a batch is open; assistant text/thinking
+with no new tool calls is also deferred while results remain outstanding. Deferred messages retain arrival order after recorded results; an unresolved counter avoids rescanning calls per message.
+A new tool-call batch settles its predecessor. Additional results in an open batch join in arrival
+order, preserving images and error markers; known late output uses an attributed user-text carrier
+after any pending batch. Unknown IDs and mismatched names/namespaces still throw; missing results
+retain the unknown-status marker; the replay and tool-continuation tests under `tests/providers/ollama/` cover both paths. See the decision record below.
 
 Forward-mode OpenAI passthrough also repairs replayed `call_id` values longer than the Responses
 API's 64-character limit. Sidechat/fork replay can namespace routed-provider ids beyond that limit,
@@ -223,6 +223,7 @@ serving-identity record. That omission is intentional: binding those routes woul
 conversation's last-serving identity and cause a later main-model turn to strip valid blobs.
 
 > Decision record: [ADR-0051](../decisions/ADR-0051-reasoning-and-tool-result-compatibility.md)
+> Decision record: [ADR-6574](../decisions/ADR-6574-ollama-tool-continuations.md)
 
 DeepSeek's stateless Responses compatibility pass normalizes only unambiguous tool-call batches.
 Calls emitted before the first matched output stay together as one assistant batch, followed by
@@ -478,6 +479,8 @@ the desktop thinking band shows the "Thinking…" placeholder, and raw text appe
 #45 display intent, intentionally reverted 260911) put unsummarized thinking in the desktop band,
 which only fits native OpenAI providers that author real summaries. Diagnosis and codex-rs
 grouping evidence: `devlog/_fin/260709_native_response_pattern/`.
+Provider policy `hideRawReasoning` hides only this raw channel (summaries keep streaming); it controls
+display, not confidentiality ([Responses wire shapes](../transports/responses-wire-shapes.md)).
 
 For models that require a reasoning placeholder, a preserved thinking-only assistant turn with no
 plaintext receives that placeholder even when it has no tool call. Otherwise the Chat serializer
@@ -546,9 +549,9 @@ The flag constrains the model's output, not execution ordering. Sequential tool 
 is enforced by the caller's own loop returning each `tool_result` before issuing the
 next request; this mapping does not provide that.
 
-Claude Opus 5.5 is an upstream exception to the forced-choice mapping: Anthropic rejects
+Claude Opus 5.5, Fable 5.1 and Sonnet 5.5 are upstream exceptions to the forced-choice mapping: Anthropic rejects
 `tool_choice: {type:"any"}` and `{type:"tool",name:...}` for that model, with or without
-adaptive thinking. The Anthropic adapter sends `{type:"auto"}` for those choices so the
+adaptive thinking, for all three. The adapter sends `{type:"auto"}` for those choices so the
 request succeeds, but the caller's forced-tool guarantee cannot be preserved; the prompt
 must provide any required tool-use instruction. Other Claude model families retain the
 normal forced-choice mapping unless their own upstream contract says otherwise.

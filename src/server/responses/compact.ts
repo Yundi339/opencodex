@@ -1,4 +1,5 @@
 import { capturePoolQuotaWriter } from "../../codex/account-store";
+import { previewXaiOauthWireModel } from "./core-normalize";
 import {
   admissionModelDeniedResponse,
   AdmissionModelDeniedError,
@@ -52,7 +53,7 @@ import { createAdapterEventQueue, preflightAdapterEvents } from "../../adapters/
 import {
   applyCodexAuthContextToProvider,
   callerCodexWorkspaceAccountId,
-  createCodexReserveDispatchGuard,
+  createCodexAuthDispatchGuard,
   unwrapUpstreamRetryEvidenceError,
   CodexMainProfileDrainingError,
   headersForCodexAuthContext,
@@ -182,6 +183,8 @@ import {
 import { hasResponsesItemIdRepair, relaySseWithResponsesItemIdRepair } from "../responses-item-id-repair";
 import type { EffectiveSubagentRoster, SpawnAgentSurface } from "../../codex/catalog";
 import { codexAuthContextLogLabel } from "../../codex/account-label";
+import { rebindPoolCreditPolicy } from "../../codex/pool-credit-policy";
+import { clientCancelledResponse } from "./core-errors";
 
 import {
   codexAccountGatedCanonicalWireModel,
@@ -199,6 +202,7 @@ import { linkRequestSessionLane, sessionLaneIdFromRequest } from "../request-log
 import { recallComboForLane } from "./combo-session-recall";
 import { peekConversationSelection, recallConversationSelection, rememberConversationSelection } from "./conversation-selection";
 import { threadModelSettingForRequest } from "./thread-model-settings";
+import { redactHostedImageDisplayPaths } from "../responses-hosted-image-display";
 
 export const COMPACT_RESPONSE_MAX_BYTES = 32 * 1024 * 1024;
 
@@ -436,6 +440,9 @@ async function refreshPoolCompactContext(args: {
       generation: refreshed.generation,
       poolQuotaWriter: capturePoolQuotaWriter(authCtx.accountId, refreshed),
     };
+    // See the core counterpart: the spread dropped the WeakMap-bound credit policy, so a hold
+    // or opt-out landing during the refresh await would go unchecked on the copy.
+    rebindPoolCreditPolicy(authCtx, refreshedAuthCtx);
     const refreshedProvider = applyCodexAuthContextToProvider(
       stripCodexRuntimeProviderFields(provider),
       refreshedAuthCtx,
@@ -464,6 +471,16 @@ async function refreshPoolCompactContext(args: {
     if (isTerminalCompactPoolRefreshFailure(error)) {
       return { ok: false, quarantine: true, response: reauthResponse() };
     }
+    if (req.signal.aborted) {
+      return { ok: false, quarantine: false, response: clientCancelledResponse() };
+    }
+    // See the core counterpart: a policy refusal raised after a successful refresh maps like
+    // the admission path — a reset-bound 429, never a 503 mislabeled as a refresh failure.
+    const policyResponse = mapCodexAuthContextErrorToResponse(error, {
+      now: Date.now(),
+      accountSelector: args.codexAccountNamespace,
+    });
+    if (policyResponse) return { ok: false, quarantine: false, response: policyResponse };
     return {
       ok: false,
       quarantine: false,
@@ -625,6 +642,8 @@ export async function handleResponsesCompact(
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return formatErrorResponse(400, "invalid_request_error", "Invalid compaction request body");
   }
+  // Compaction forwards client history upstream too; keep local artifact paths out of it.
+  redactHostedImageDisplayPaths(body);
   if (!options.compactionRoutingOverride) {
     options = { ...options, compactionRoutingOverride: applyCompactionRoutingOverride(body, req.headers, config, { endpoint: "compact" }) };
   }
@@ -673,7 +692,15 @@ export async function handleResponsesCompact(
     // A compaction override picks the model, not the caller, so the key's scope
     // is applied to what the override resolved to rather than to the selector
     // the client sent.
-    assertRouteAllowedByScope(resolveAdmissionModelScope(config, admission), compactRequestedModel, route);
+    // Routed xAI OAuth compaction must preview its Fast wire model here;
+    // native compact keeps checking the destination it dispatches directly.
+    const callerTier = (raw as Record<string, unknown>).service_tier;
+    assertRouteAllowedByScope(resolveAdmissionModelScope(config, admission), compactRequestedModel, {
+      providerName: route.providerName,
+      modelId: previewXaiOauthWireModel({ options: {
+        serviceTier: compactFastRow ? "priority" : typeof callerTier === "string" ? callerTier : undefined,
+      } }, route, config, "responses"),
+    });
   } catch (err) {
     if (err instanceof AdmissionModelDeniedError) return admissionModelDeniedResponse(err);
     if (err instanceof NoEligiblePolicyCandidateError) {
@@ -694,6 +721,7 @@ export async function handleResponsesCompact(
   logCtx.requestedModel = compactRequestedModel;
   logCtx.model = selectedModelId;
   logCtx.routeDecision = route.routeDecision;
+  logCtx.policyEligibility = route.policyEligibility;
   logCtx.provider = route.codexAccountNamespace
     ? `${route.providerName}-${route.codexAccountNamespace}`
     : route.providerName;
@@ -1032,7 +1060,7 @@ export async function handleResponsesCompact(
           providerName: route.providerName,
           modelId: route.modelId,
           beforeDispatch: isCanonicalOpenAiForwardProvider(sendProvider)
-            ? createCodexReserveDispatchGuard(sendAuthCtx, config, selectedModelId, admission) : undefined,
+            ? createCodexAuthDispatchGuard(sendAuthCtx, config, selectedModelId, admission) : undefined,
         }),
         // Every credential-bearing forward send gets manual redirects, not only
         // pool sends: direct mode carries the caller's credential too (#914).
@@ -1262,7 +1290,8 @@ export async function handleResponsesCompact(
             upstream.headers,
             authCtx.writerGeneration,
             authCtx.kind === "main-pool" ? authCtx.mainQuotaWriter : undefined,
-            { modelId: route.modelId, poolWriter: authCtx.kind === "pool" ? authCtx.poolQuotaWriter : undefined },
+            { modelId: route.modelId, poolWriter: authCtx.kind === "pool" ? authCtx.poolQuotaWriter : undefined,
+              poolResponse: authCtx.kind === "pool" },
           );
         }
         recordCompactPoolOutcome(authCtx, upstream.status, {
@@ -1331,7 +1360,7 @@ export async function handleResponsesCompact(
     if (outcomeCtx.kind === "pool") {
       const { applyAccountQuotaFromUpstreamHeaders } = await import("../../codex/quota");
       applyAccountQuotaFromUpstreamHeaders(outcomeCtx.accountId, upstream.headers, outcomeCtx.writerGeneration,
-        undefined, { modelId: route.modelId, poolWriter: outcomeCtx.poolQuotaWriter });
+        undefined, { modelId: route.modelId, poolWriter: outcomeCtx.poolQuotaWriter, poolResponse: true });
     }
     const retryAfter = upstream.headers.get("retry-after");
     const resetAt = [

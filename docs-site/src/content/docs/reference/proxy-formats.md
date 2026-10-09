@@ -170,6 +170,44 @@ for final text and `session.updated` with `session.status="closed"`.
 This is the native opencodex data-plane shape. The request body must be a JSON object with a
 non-empty `model`. `input` may be a string or an array of Responses items.
 
+### Caller conversation header
+
+For HTTP `POST /v1/responses` and `POST /v1/messages`, a client can send a stable
+`x-session-id` for each conversation. When no `session_id`, `session-id`, or `thread-id`
+header is present, opencodex promotes the marker to `session_id`. Managed Grok identity
+on Responses takes precedence too. Even an empty explicit header suppresses promotion.
+
+Use 1–128 ASCII letters, digits, `.`, `_`, `:`, or `-`, starting with a letter or digit.
+Surrounding whitespace is trimmed; missing or invalid markers are ignored. Loopback
+admission preserves the marker. Authenticated admission derives an opaque identifier
+from the marker and the admitted credential principal, so different credentials do not
+share a newly promoted identifier. Rotation changes this identifier; authenticated
+requests without a trusted principal are left unchanged.
+
+Use distinct markers for distinct conversations. This preserves conversation continuity
+for downstream consumers, but does not guarantee an upstream cache hit or measured savings.
+Chat Completions, WebSocket frames, compact, and count_tokens do not use this promotion.
+
+On canonical ChatGPT-backed Responses dispatch, a non-empty explicit `session_id` wins.
+Otherwise, the first non-empty alias among `session-id`, then `thread-id`, supplies
+`session_id` if its value is safe; an invalid winning alias suppresses weaker identity.
+Empty header values are dropped before this step on every path (Responses auth header
+selection and the Claude Messages and Chat Completions bridges), so an empty header counts as
+absent: an empty `session-id` lets a valid `thread-id` win. The Claude metadata-derived
+session applies only when no non-empty canonical header or alias remains.
+Aliases keep their original names on the wire; their validated raw caller values are forwarded
+like an explicit `session_id`, without the principal scoping used for promoted `x-session-id`.
+This egress conversion does not change ingress affinity. Custom and API-key destinations are
+unchanged, and no identity is invented for requests without a conversation marker.
+
+For third-party clients, keep one caller-owned marker per conversation, including repeated
+`curl` requests. A shared `prompt_cache_key` or identical system/tools prefix is a cache cohort,
+not proof that two requests belong to one conversation. Requests without a conversation marker
+receive no invented stable session. OpenCodex also does not impersonate Codex by synthesizing
+an `originator`; a caller-supplied originator retains its normal forwarding rules. Header
+continuity does not establish a cache hit: compare the upstream's reported cached input tokens
+for your own repeated-prefix requests. An omitted cache-write count is not evidence of no write.
+
 ### Accepted request fields
 
 | Area | Accepted shape |
@@ -212,6 +250,18 @@ With `stream: true`, the response is `text/event-stream`. The bridge emits Respo
 
 With `stream: false` or no `stream`, the same adapter events are collected into one Responses JSON
 object. Both forms preserve the selected model, output items, terminal status, and usage.
+The canonical ChatGPT Codex route still uses `stream: true` on its upstream-only request because that
+destination is SSE-only; OpenCodex boundedly validates and folds the terminal stream back into the
+JSON shape the client requested. This transport coercion does not alter an explicit `store` value.
+The first terminal must be valid; a later terminal cannot replace an invalid first one. Output indices
+must be contiguous and covered by a completed item or the terminal output, so a text/tool delta left
+open by a sparse terminal fails closed rather than becoming partial JSON. The path caps each frame at
+4 MiB, each transcript and reconstruction source at 32 MiB, the stream at 100,000 frames, and
+reconstructed output at 10,000 items. The configured `stallTimeoutSec` governs both the first upstream
+body byte and later silent gaps. When that stall clock is disabled (`0`, including the default for a
+local upstream), it does not expire immediately; only the independent 15-minute buffered-turn ceiling
+remains. An EOF, malformed or oversized frame, read error, stall, cancellation, or missing terminal
+returns an error instead of partial JSON with HTTP 200. Streaming callers are unchanged.
 
 When a provider filters or truncates a response, an unfinished tool call remains `incomplete`
 in both JSON and SSE. Partial output is preserved, and the bridge does not emit an argument
@@ -235,6 +285,10 @@ If native passthrough rewriting fails, including when it exceeds the translation
 buffer budget, the relay reports the failure without waiting for upstream inspection
 to finish. It cancels the upstream work and emits `response.failed` followed by
 `data: [DONE]`; a budget overflow uses the `translation_buffer_limit` error code.
+
+Responses SSE accepts CR, LF and CRLF line endings, including mixed endings and CRLF split across
+network chunks. Tool validation, Chat translation, terminal inspection and WebSocket projection
+use the same event boundaries. A CR-only completion does not wait for the upstream connection to close.
 
 Client-facing Responses SSE frames are limited to 4 MiB per frame, measured in raw bytes before the
 SSE block delimiter. On HTTP, an unterminated upstream frame that exceeds the limit fails closed

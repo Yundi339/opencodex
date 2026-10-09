@@ -18,6 +18,7 @@ import { createTestTranslatorBudget } from "../helpers/translator-budget";
 
 interface ToolOptions {
   hideThinkingSummary?: boolean;
+  hideRawReasoning?: boolean;
   toolParameterSchemas?: Map<string, Record<string, unknown>>;
 }
 
@@ -34,6 +35,7 @@ function legacyMessagesStream(events: AdapterEvent[], options: ToolOptions = {})
     {
       translatorBudget,
       ...(options.hideThinkingSummary ? { hideThinkingSummary: true } : {}),
+      ...(options.hideRawReasoning ? { hideRawReasoning: true } : {}),
       ...(options.toolParameterSchemas ? { toolParameterSchemas: options.toolParameterSchemas } : {}),
       // The Anthropic inbound wire never enforces the declared catalog (#4735).
       enforceDeclaredToolNames: false,
@@ -53,6 +55,7 @@ function directOptions(options: ToolOptions = {}) {
     inputTokenFloor: INPUT_FLOOR,
     translatorBudget: createTestTranslatorBudget(),
     ...(options.hideThinkingSummary ? { hideThinkingSummary: true } : {}),
+    ...(options.hideRawReasoning ? { hideRawReasoning: true } : {}),
     ...(options.toolParameterSchemas ? { toolParameterSchemas: options.toolParameterSchemas } : {}),
   };
 }
@@ -114,7 +117,10 @@ async function legacyFold(events: AdapterEvent[], options: ToolOptions = {}): Pr
       "translation_buffer_limit",
     );
   }
-  return new Response(JSON.stringify(message), { status: isError ? 502 : 200, headers: { "Content-Type": "application/json" } });
+  return new Response(JSON.stringify(message), {
+    status: isError ? (translatedError?.code === "context_length_exceeded" ? 400 : 502) : 200,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 async function expectFoldParity(events: AdapterEvent[], options: ToolOptions = {}) {
@@ -214,6 +220,15 @@ const SCENARIOS: Record<string, { events: AdapterEvent[]; options?: ToolOptions 
     ],
     options: { hideThinkingSummary: true },
   },
+  "raw reasoning hidden by the provider policy keeps summaries": {
+    events: [
+      { type: "reasoning_raw_delta", text: "private cot" },
+      { type: "thinking_delta", thinking: "summary" },
+      { type: "text_delta", text: "Answer" },
+      { type: "done" },
+    ],
+    options: { hideRawReasoning: true },
+  },
   "server-side web search pair": {
     events: [
       { type: "web_search_call_begin", id: "ws1" },
@@ -308,6 +323,21 @@ describe("direct Messages encoder matches bridge + converter (stream)", () => {
 });
 
 describe("direct Messages fold matches bridge + collector (non-stream)", () => {
+  test.each([400, 413, undefined])("context rejection remains terminal with upstream status %s", async status => {
+    const events: AdapterEvent[] = [{ type: "error", status, errorType: "invalid_request_error",
+      code: "context_length_exceeded", message: "Synthetic input limit", retryable: false }];
+    const frames = await expectStreamParity(events);
+    expect(frames).toEqual([{ event: "error", data: { type: "error", error: {
+      type: "invalid_request_error", code: "context_length_exceeded", message: "Synthetic input limit",
+    } } }]);
+    const response = await foldAnthropicMessage(replay(events), directOptions());
+    expect(response.status).toBe(400);
+    expect(response.headers.has("retry-after")).toBe(false);
+    expect(await response.json()).toEqual({ type: "error", error: {
+      type: "invalid_request_error", code: "context_length_exceeded", message: "Synthetic input limit",
+    } });
+  });
+
   for (const [name, scenario] of Object.entries(SCENARIOS)) {
     test(name, async () => {
       await expectFoldParity(scenario.events, scenario.options);

@@ -140,7 +140,8 @@ function emitterStep(outputName: string) {
 }
 
 function renderFilterOutputs(text: string, inputs: { ci: string; native: string }): string {
-  const rendered = text.replace(/\$\{\{\s*steps\.filter\.outputs\.([a-z-]+)\s*\}\}/g, (_match, name: string) => {
+  // A pull_request emitter sees the plain filter value; the nightly override only matters on schedule.
+  const rendered = text.replace(/\$\{\{\s*(?:github\.event_name == 'schedule' && 'true' \|\| )?steps\.filter\.outputs\.([a-z_-]+)\s*\}\}/g, (_match, name: string) => {
     if (name === "ci") return inputs.ci;
     if (name === "native") return inputs.native;
     throw new Error(`unsupported filter output in emitter: ${name}`);
@@ -318,8 +319,12 @@ describe("the native path filter", () => {
       "bun.lock",
       "desktop/**",
       "package.json",
+      "scripts/build-standalone.ts",
+      "scripts/standalone-keyring.ts",
       "src/cli/index.ts",
       "src/lib/bun-runtime.ts",
+      "src/lib/keyring-native.ts",
+      "src/lib/standalone.ts",
       "src/service/**",
     ]);
   });

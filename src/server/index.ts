@@ -281,7 +281,7 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
       // with the later startup sync and warns ONCE about stale app-servers; warning
       // here instead would read a catalog mtime the sync is about to move.
       const outcome = withCatalogWriteSerialization(startupCodexHome, permit =>
-        invalidateCodexModelsCacheWithPermit(permit, startupCodexHome));
+        invalidateCodexModelsCacheWithPermit(permit, startupCodexHome), { intent: "cache", writer: "startup-cache" });
       // A refused permit is not a write; only a completed run that returned true is.
       setStartupCacheInvalidationWrite(outcome.kind === "completed" && outcome.value === true);
     } catch { /* no readable Codex home: nothing to invalidate */ }
@@ -489,21 +489,19 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
     return serveGuiFile(rawPath) !== null;
   }
 
-  // Codex treats empty / non-JSON 503 bodies as "Unknown error" (#452). Keep Retry-After and
-  // the server_is_overloaded code so clients can back off, but always return a JSON envelope.
-  // These two run BEFORE the auth/origin checks, so they need the receiving listener's policy
-  // explicitly (#1102). Reaching for the shared `config` here would attach public-policy CORS
-  // headers to a 503 on the loopback listener — no model runs and no credential is spent, but
-  // it is the one error path that would answer a rebinding origin with its own origin echoed
-  // back.
+  // Codex maps 503 + server_is_overloaded to ServerOverloaded ("model at capacity"), retried
+  // only with retry advice that older clients ignore (#6642); server_restarting is a
+  // retryable UnexpectedStatus in every version and never reads as model capacity.
+  // Keep JSON (empty / non-JSON 503 means "Unknown error", #452) and Retry-After.
+  // Drain and busy run BEFORE auth/origin checks: use the receiving listener's policy
+  // (#1102), because shared public `config` could echo a rebinding origin on loopback.
   function drainingResponse(req: Request, policy: RequestPolicyView): Response {
-    const response = formatErrorResponse(503, "server_error", "Service shutting down");
-    const headers = new Headers(response.headers);
-    for (const [name, value] of Object.entries(corsHeaders(req, policy))) {
-      headers.set(name, value);
-    }
-    headers.set("Retry-After", "5");
-    return new Response(response.body, { status: 503, headers });
+    return withCors(new Response(JSON.stringify({
+      error: { type: "server_error", code: "server_restarting", message: "OpenCodex is restarting; retry this request." },
+    }), {
+      status: 503,
+      headers: { "Content-Type": "application/json", "Retry-After": "5" },
+    }), req, policy);
   }
 
   function serverBusyResponse(req: Request, resource: string, policy: RequestPolicyView): Response {
@@ -668,6 +666,7 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
   let remoteWorkspaceShutdown: (() => Promise<void>) | undefined;
   const managementApiDeps: ManagementApiDeps = {
     ...deps.managementApi,
+    listLowQuotaEvents: limit => backgroundLifecycle?.listLowQuotaEvents(limit) ?? [],
     remoteWorkspaceStopping: () => remoteWorkspaceStopping,
     onRemoteWorkspaceShutdown: shutdown => { remoteWorkspaceShutdown = shutdown; }, linkSupervisor: () => optionalListeners.linkSupervisor(), linkListener: () => optionalListeners,
   };
@@ -683,13 +682,10 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
     return workspaceRuntimeFlight;
   };
   try {
-    backgroundLifecycle = acquireServerBackgroundLifecycle(applyPolicy);
+    backgroundLifecycle = acquireServerBackgroundLifecycle(applyPolicy, config);
     unregisterQuotaAutoRefresh = (deps.registerCodexQuotaAutoRefreshWorker
       ?? registerCodexQuotaAutoRefreshWorker)(config);
-    // External `ocx config set` / direct config.json edits run in other
-    // processes; poll the file so Logs/Usage display prices follow them live.
-    // Started inside the guarded startup transaction so the catch below can
-    // release the owner-scoped lease on any listener failure.
+    // Poll external pricing edits; the startup catch releases this owner-scoped lease.
     userCostOverlayReconciler = startUserCostOverlayReconciler({ liveConfig: config });
     const serveOptions = createServeOptions({
       drainingResponse,
@@ -799,9 +795,7 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
     value: async (closeActiveConnections?: boolean): Promise<void> => {
       remoteWorkspaceStopping = true;
       liveCallBindings.clear();
-      // Disarm the package-tree restart timer before listener teardown: a queued
-      // replacement callback must not call acceptSystemRestart() after stop() has
-      // begun, or it would schedule a drain-and-restart on a stopped server.
+      // Disarm the package-tree restart timer before teardown can schedule another restart.
       if (!packageRefreshStopped) {
         packageRefreshStopped = true;
         stopPackageRefresh();

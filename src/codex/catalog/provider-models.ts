@@ -6,7 +6,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync } from 
 import { delimiter, dirname, join, resolve } from "node:path";
 import { atomicWriteFile, expandUserPath, getConfigDir, websocketsEnabled } from "../../config";
 import { resolveProviderApiKey } from "../../providers/key-store";
-import { getAccountSet } from "../../oauth/store";
+import { captureOAuthAccountSelection, credentialGeneration, getAccountCredentialWithStatus, getAccountSet } from "../../oauth/store";
 import { readKiroAccountModels, kiroObservedContextWindow } from "../../providers/kiro-model-catalog";
 import { CODEX_CONFIG_PATH, CODEX_MODELS_CACHE_PATH, DEFAULT_CATALOG_PATH, readRootTomlString, resolveCodexConfigPath } from "../paths";
 import {
@@ -62,6 +62,7 @@ import { fetchCodeBuddyModels } from "../../adapters/codebuddy/live-models";
 import { resolveProfileByBaseUrl } from "../../adapters/coding-agent/profile";
 import { fetchDevinUsableModels } from "../../adapters/devin/live-models";
 import { resolveDevinApiBaseUrl } from "../../oauth/devin/api-base";
+import { resolveZedModels } from "../../providers/zed";
 import { isCanonicalOpenAiForwardProvider, OPENAI_API_PROVIDER_ID, OPENAI_CODEX_PROVIDER_ID } from "../../providers/openai-tiers";
 import {
   COMBO_NAMESPACE,
@@ -74,6 +75,7 @@ import {
 import type { NormalizedComboConfig } from "../../combos/types";
 import {
   ProviderOutboundPolicyError,
+  ProviderOutboundSendCancelledError,
   providerOutboundGet,
   providerOutboundPost,
   providerRedirectError,
@@ -149,6 +151,9 @@ export function observedModelsAuthResolver(
       return {
         apiKey: observation.snapshot.accessToken,
         observed: true,
+        oauthAccountId: observation.snapshot.accountId,
+        oauthGeneration: observation.snapshot.generation,
+        ...(observation.snapshot.providerUserId ? { oauthProviderUserId: observation.snapshot.providerUserId } : {}),
         ...(observation.snapshot.apiBaseUrl ? { oauthApiBaseUrl: observation.snapshot.apiBaseUrl } : {}),
         ...(observation.snapshot.projectId ? { oauthProjectId: observation.snapshot.projectId } : {}),
       };
@@ -174,6 +179,8 @@ export async function fetchProviderModelsWithAuth(
   // generation, so a request started with the former account cannot later publish its result.
   const cacheGeneration = captureModelCacheGeneration(name);
   const isCurrentCacheGeneration = () => isModelCacheGenerationCurrent(name, cacheGeneration);
+  const anthropicSelection = name === "anthropic" && prov.authMode === "oauth"
+    ? captureOAuthAccountSelection(name) : null;
   if (prov.authMode === "forward") return observed([], "authoritative"); // ChatGPT backend has no /models
   const seedVertexDefault = prov.adapter === "google"
     && prov.googleMode === "vertex"
@@ -256,6 +263,9 @@ export async function fetchProviderModelsWithAuth(
         .then(snapshot => ({
           apiKey: snapshot.accessToken,
           observed: false,
+          oauthAccountId: snapshot.accountId,
+          oauthGeneration: snapshot.generation,
+          ...(snapshot.providerUserId ? { oauthProviderUserId: snapshot.providerUserId } : {}),
           ...(snapshot.apiBaseUrl ? { oauthApiBaseUrl: snapshot.apiBaseUrl } : {}),
           ...(snapshot.projectId ? { oauthProjectId: snapshot.projectId } : {}),
         }))
@@ -263,6 +273,15 @@ export async function fetchProviderModelsWithAuth(
       : { apiKey: await resolveModelsAuthToken(name, prov), observed: false }
     : resolveAuth.resolve(name, prov));
   const apiKey = auth.apiKey;
+  const maySendAnthropicDiscovery = () => {
+    if (name !== "anthropic" || prov.authMode !== "oauth") return true;
+    const selected = captureOAuthAccountSelection(name);
+    const row = auth.oauthAccountId ? getAccountCredentialWithStatus(name, auth.oauthAccountId) : null;
+    return !!anthropicSelection && !!selected && !!row && !row.paused && !row.needsReauth
+      && selected.accountId === anthropicSelection.accountId && selected.revision === anthropicSelection.revision
+      && row.credential.expires > Date.now() && auth.oauthAccountId === selected.accountId
+      && credentialGeneration(row.credential) === auth.oauthGeneration && row.credential.access === apiKey;
+  };
   // A configured default is a real callable selector and must remain discoverable when a
   // compatible provider's live /models request fails (issue #308). Static providers already seed
   // their default selector above when no explicit model list exists.
@@ -325,6 +344,63 @@ export async function fetchProviderModelsWithAuth(
     return observed(withConfiguredRetention(
       stale ? applyConfigHintsToCachedModels(name, prov, stale, contextCap, metadataModelIdCaseFold, captured.effectiveAlias) : configured,
     ), "degraded");
+  }
+  if (name === "zed" && prov.adapter === "zed") {
+    if (!apiKey || !auth.oauthAccountId || !auth.oauthProviderUserId) return observed(configured, "degraded");
+    // Zed's roster and short-lived inference token are both account-scoped. Keep the
+    // catalog cache bound to the same pair so a multi-account switch cannot reuse a stale
+    // roster even when the provider destination is unchanged.
+    const authorityIdentity = createHash("sha256")
+      .update(JSON.stringify([auth.oauthAccountId, apiKey])).digest("hex");
+    const cached = getFreshCached(name, ttlMs, Date.now(), authorityIdentity);
+    if (cached) {
+      return observed(
+        withConfiguredRetention(applyConfigHintsToCachedModels(name, prov, cached, contextCap, metadataModelIdCaseFold, captured.effectiveAlias)),
+        "authoritative",
+      );
+    }
+    const stale = getStaleCached(name, authorityIdentity);
+    if (isModelsFetchCoolingDown(name, undefined, undefined, authorityIdentity) && stale) {
+      return observed(
+        withConfiguredRetention(applyConfigHintsToCachedModels(name, prov, stale, contextCap, metadataModelIdCaseFold, captured.effectiveAlias)),
+        "degraded",
+      );
+    }
+    const zedFetch = (prov as OcxProviderConfig & { fetch?: typeof globalThis.fetch }).fetch;
+    try {
+      const live = await resolveZedModels(
+        // Zed signs with its own user id; the slot id only keys the catalog cache above.
+        { userId: auth.oauthProviderUserId, accessToken: apiKey },
+        { signal: AbortSignal.timeout(8_000), ...(zedFetch ? { fetchFn: zedFetch } : {}) },
+      );
+      const discovered = live.models.map(model => {
+        const reasoningEfforts = sanitizeCodexReasoningEfforts(model.supportedEffortLevels);
+        return {
+          id: model.id,
+          provider: name,
+          ...(model.contextLength ? { contextWindow: model.contextLength } : {}),
+          ...(model.maxOutputTokens ? { maxOutputTokens: model.maxOutputTokens } : {}),
+          ...(model.supportsImages ? { inputModalities: ["text", "image"] } : {}),
+          ...(reasoningEfforts?.length ? { reasoningEfforts } : {}),
+          ...catalogHintsFromProviderConfig(name, prov, model.id, contextCap, metadataModelIdCaseFold, captured.effectiveAlias),
+        } as CatalogModel;
+      });
+      const forCache = withConfiguredRetention(discovered, { retainComboTargets: false });
+      if (!setCached(name, forCache, Date.now(), cacheGeneration, authorityIdentity)) {
+        return observed(withConfiguredRetention(configured), "degraded");
+      }
+      markProviderDiscoveryOk(name, live.models.length);
+      return observed(withConfiguredRetention(forCache, { warnDrops: true }), "authoritative");
+    } catch {
+      if (isCurrentCacheGeneration()) {
+        markModelsFetchFailure(name, undefined, authorityIdentity);
+        markProviderDiscoveryFailed(name, { reason: "provider" });
+      }
+      return observed(
+        withConfiguredRetention(stale ? applyConfigHintsToCachedModels(name, prov, stale, contextCap, metadataModelIdCaseFold, captured.effectiveAlias) : configured),
+        "degraded",
+      );
+    }
   }
   if (prov.adapter === "qoder") {
     if (!apiKey) return observed(configured, "degraded");
@@ -424,6 +500,8 @@ export async function fetchProviderModelsWithAuth(
           // away, and every client that keys an effort control off this field —
           // the Pi-shaped exports — renders no control at all.
           ...(liveResult.efforts[id]?.length ? { reasoningEfforts: liveResult.efforts[id] } : {}),
+          // The family's effective enabled default, matching an unset effort at request time.
+          ...(liveResult.defaultEfforts[id] ? { defaultReasoningEffort: liveResult.defaultEfforts[id] } : {}),
           // The account catalog's per-base supportsImages vote collapses to one
           // modalities value. It spreads before the hints so exact
           // modelCapabilities declarations, the legacy modelInputModalities
@@ -607,7 +685,8 @@ export async function fetchProviderModelsWithAuth(
     // proof is on the URL — not the provider name — because an OAuth/forward
     // name matches any baseUrl by design. Retargeted or renamed custom rows
     // fetch a different URL and keep the rejection.
-    const outboundDependencies = { isCanonicalUrl: isRegistryModelDiscoveryUrl };
+    if (!maySendAnthropicDiscovery()) return observed(withConfiguredRetention(failedDiscoveryConfigured), "degraded");
+    const outboundDependencies = { isCanonicalUrl: isRegistryModelDiscoveryUrl, beforeSend: maySendAnthropicDiscovery };
     const res = request.method === "POST"
       ? await providerOutboundPost(name, prov, url, {
         headers,
@@ -672,20 +751,29 @@ export async function fetchProviderModelsWithAuth(
       const live = antigravity.map(model => applyProviderConfigHints(name, prov, {
         id: model.id,
         provider: name,
-        // CCA only exposes a numeric thinking budget. Until the adapter owns an exact Codex
-        // effort-to-wire mapping for a newly discovered model, do not advertise a false ladder.
-        reasoningEfforts: [],
+        // Only an exact discovered wire map proves a new model's selectable effort ladder.
+        reasoningEfforts: Object.keys(model.effortWireModelIds ?? {}),
+        ...(model.effortWireModelIds ? {
+          antigravityEffortWireModelIds: model.effortWireModelIds,
+          suppressSyntheticMax: true,
+          defaultReasoningEffort: model.effortWireModelIds.medium ? "medium" : "high",
+        } : {}),
         ...(model.contextWindow ? { contextWindow: model.contextWindow } : {}),
         ...(model.inputModalities ? { inputModalities: model.inputModalities } : {}),
       }, contextCap, metadataModelIdCaseFold, captured.effectiveAlias));
       const forCache = withConfiguredRetention(live, { retainComboTargets: false });
-      if (!setCached(name, forCache, Date.now(), cacheGeneration)) {
+      if (!isCurrentCacheGeneration()) {
         return observed(withConfiguredRetention(configured), "degraded");
       }
+      // Save exact family routes before publishing synthetic IDs. These synchronous writes
+      // cannot interleave with a credential-generation change; failure keeps the prior cache.
       registerAntigravityDiscoveredWireModels(prov.baseUrl, antigravity, {
         provider: name,
         cacheGeneration,
       });
+      if (!setCached(name, forCache, Date.now(), cacheGeneration)) {
+        return observed(withConfiguredRetention(configured), "degraded");
+      }
       markProviderDiscoveryOk(name, live.length);
       return observed(withConfiguredRetention(forCache, { warnDrops: true }), "authoritative");
     }
@@ -772,6 +860,9 @@ export async function fetchProviderModelsWithAuth(
     markProviderDiscoveryOk(name, liveModelCount);
     return observed(returned, "authoritative");
   } catch (error) {
+    if (error instanceof ProviderOutboundSendCancelledError) {
+      return observed(withConfiguredRetention(failedDiscoveryConfigured), "degraded");
+    }
     if (error instanceof ProviderOutboundPolicyError) {
       const { models, fallback, shouldLog } = failedDiscoveryFallback({ reason: "blocked" });
       if (shouldLog) {

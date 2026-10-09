@@ -2,18 +2,15 @@
  * Anthropic OAuth on the managed native Messages lane (PF-10, behind
  * `protocols.rollout.managedMessagesNativeOAuth`).
  *
- * Credential. The account is the one the existing OAuth selection chooses for this request, by
- * the same steps the Responses pipeline's transport takes for an unpooled Anthropic OAuth route
- * (`prepareResponsesTransport`): capture the committed selection, resolve the active account's
- * access snapshot (refreshing it through the OAuth owner when it is due), and commit that
- * proposal against the captured selection so a concurrent manual switch wins. Nothing here picks
- * an account of its own, and nothing runs at planning time: the planner and eligibility read
- * config only, and this module is reached from the lane's dispatch alone.
+ * Credential. Shared Anthropic routing chooses the account for the session and model;
+ * the same generation-fenced selection commit as the Responses transport admits it. A lost
+ * commit re-evaluates routing so a concurrent manual switch or policy edit wins. Selection,
+ * token resolution and affinity binding run at dispatch only, never during planning.
  *
- * Pools. A pooled account set (the opt-in Anthropic account pool, or two or more usable accounts,
- * which turns on reactive 429 rotation) is declined before this lane is chosen
- * (`oauth-account-pool`). Should one appear between that decision and dispatch, resolution fails
- * closed rather than serve a pooled account without the pool's rotation and affinity.
+ * Pools. Native Messages uses the OAuth owner's strategy, model allowlist, session affinity,
+ * pause and cooldown admission. Pre-output refusal recovery proposes a replacement account;
+ * this module admits and binds its exact generation before a rebuilt request may send.
+ * A lane-change 409 remains distinct from typed local authentication/pause/cooldown refusals.
  *
  * Tool names. An OAuth request carries client tool names under the Claude OAuth prefix, as the
  * adapter sends them; the answer's `tool_use` names are mapped back here, for exactly the names
@@ -21,13 +18,18 @@
  *
  * No token, account id or body content is logged or returned in an error message.
  */
-import { getValidAccessTokenSnapshot, type OAuthAccessSnapshot } from "../oauth";
+import type { OAuthAccessSnapshot } from "../oauth";
 import {
   commitAnthropicSelectionRouting,
+  captureAnthropicManualSelectionGeneration,
   getAnthropicPoolAccessSnapshot,
-  hasAnthropicFailoverQuorum,
+  getAnthropicAccountHealthSnapshot,
+  resolveAnthropicDispatchAccountId,
+  resolveAnthropicAccountForSession,
+  getEligibleAnthropicAccounts,
   isAnthropicAccountPoolEnabled,
 } from "../oauth/anthropic-routing";
+import { resolveAnthropicModelRoute, routeCandidates, type AnthropicRouteDecision } from "../oauth/anthropic-model-routes";
 import {
   captureOAuthAccountSelection,
   commitOAuthAccountSelection,
@@ -52,9 +54,16 @@ function isRec(value: unknown): value is Rec {
 export interface NativeOAuthBinding {
   readonly selection: Selection;
   readonly snapshot: OAuthAccessSnapshot;
+  /** Anthropic account UUID from the same stored generation, distinct from snapshot.accountId. */
+  readonly providerAccountUuid?: string;
+  readonly routeDecision: AnthropicRouteDecision | null;
+  readonly sessionKey: string | null;
+  readonly model?: string;
+  readonly config: OcxConfig;
+  readonly manualSelectionGeneration: number;
 }
 
-/** The selection moved or became pooled while it was being resolved. Maps to a 409 retry. */
+/** The selection moved or became ineligible while resolving. Maps to a 409 retry. */
 export class NativeOAuthSelectionChangedError extends Error {
   constructor() {
     super("OAuth account selection changed; retry the request");
@@ -62,60 +71,102 @@ export class NativeOAuthSelectionChangedError extends Error {
   }
 }
 
-function pooled(config: OcxConfig): boolean {
-  return isAnthropicAccountPoolEnabled(config) || hasAnthropicFailoverQuorum();
+/** Invalid operator route configuration remains a request refusal, not an auth failure. */
+export class NativeOAuthModelRouteError extends Error {}
+
+function currentRoute(config: OcxConfig, model?: string): AnthropicRouteDecision | null {
+  const resolved = model ? resolveAnthropicModelRoute(config, model) : { decision: null };
+  if (resolved.error) throw new NativeOAuthModelRouteError(`Invalid Anthropic model routes: ${resolved.error}`);
+  return resolved.decision ? { ...resolved.decision, accounts: [...resolved.decision.accounts] } : null;
 }
 
-/**
- * Resolve and commit the account for one native request. Throws the OAuth owner's own errors
- * (login required, refresh failure) unchanged, and `NativeOAuthSelectionChangedError` when the
- * selection could not be committed.
- */
-export async function resolveNativeOAuthBinding(config: OcxConfig): Promise<NativeOAuthBinding> {
-  if (pooled(config)) throw new NativeOAuthSelectionChangedError();
-  let selection: Selection | null = captureOAuthAccountSelection(PROVIDER);
-  let candidate = await getValidAccessTokenSnapshot(PROVIDER);
+function routeIsCurrent(config: OcxConfig, model: string | undefined, decision: AnthropicRouteDecision | null): boolean {
+  return JSON.stringify(currentRoute(config, model)) === JSON.stringify(decision);
+}
+
+export interface NativeOAuthBindingOptions {
+  sessionKey?: string | null;
+  model?: string;
+  /** An account proposed by the shared pre-output refusal recovery policy. */
+  candidateAccountId?: string;
+  /** Selection captured before asynchronous refusal classification or throttle wait. */
+  expectedRecoverySelection?: Selection | null;
+  expectedRecoveryRouteDecision?: AnthropicRouteDecision | null;
+}
+
+/** Resolve the shared pool selector and commit its exact credential generation for dispatch. */
+export async function resolveNativeOAuthBinding(
+  config: OcxConfig,
+  options: NativeOAuthBindingOptions = {},
+): Promise<NativeOAuthBinding> {
+  const sessionKey = options.sessionKey ?? null;
+  const model = options.model;
   for (let attempt = 0; attempt < MAX_SELECTION_ATTEMPTS; attempt++) {
-    if (!selection) break;
-    if (candidate.accountId !== selection.accountId) {
-      // The active account moved between capture and resolution: serve the committed one.
-      selection = captureOAuthAccountSelection(PROVIDER);
-      if (!selection) break;
-      candidate = await getAnthropicPoolAccessSnapshot(selection.accountId);
+    const routeDecision = currentRoute(config, model);
+    const manualSelectionGeneration = captureAnthropicManualSelectionGeneration();
+    const selection = captureOAuthAccountSelection(PROVIDER);
+    // Always ask admission first so pause/login/cooldown retains its typed local refusal.
+    const admittedId = await resolveAnthropicDispatchAccountId(config, sessionKey, routeDecision, model);
+    if (!routeIsCurrent(config, model, routeDecision)) continue;
+    const proposed = resolveAnthropicAccountForSession(sessionKey, config, Date.now(), routeDecision, model);
+    // A lost selection commit discards a recovery proposal: a newer manual/policy choice wins.
+    const recoverySelectionMatches = !!options.expectedRecoverySelection
+      && selection?.accountId === options.expectedRecoverySelection.accountId
+      && selection?.revision === options.expectedRecoverySelection.revision;
+    const recoveryRouteMatches = options.expectedRecoveryRouteDecision === undefined
+      || JSON.stringify(options.expectedRecoveryRouteDecision) === JSON.stringify(routeDecision);
+    const accountId = attempt === 0 && options.candidateAccountId && recoverySelectionMatches && recoveryRouteMatches
+      ? options.candidateAccountId : admittedId;
+    if (!selection) continue;
+    if (!routeCandidates(getEligibleAnthropicAccounts(Date.now(), model), routeDecision).includes(accountId)) {
+      throw new NativeOAuthSelectionChangedError();
     }
+    const candidate = await getAnthropicPoolAccessSnapshot(accountId);
+    if (!routeIsCurrent(config, model, routeDecision)) continue;
     const committed = await commitOAuthAccountSelection(PROVIDER, candidate.accountId, {
       expectedSelection: selection,
       expectedCredentialGeneration: candidate.generation,
       requireUsableAccount: true,
     });
     if (committed) {
+      if (!routeIsCurrent(config, model, routeDecision)
+        || manualSelectionGeneration !== captureAnthropicManualSelectionGeneration()) continue;
       if (!commitAnthropicSelectionRouting(candidate.accountId, selection, committed, {
-        config,
-        sessionKey: null,
+        config, sessionKey, model, routeDecision,
+        reason: accountId === proposed.accountId ? proposed.reason : undefined,
         expectedCredentialGeneration: candidate.generation,
-      })) break;
-      if (pooled(config)) break;
-      return { selection: committed, snapshot: candidate };
+      })) continue;
+      const row = getAccountCredentialWithStatus(PROVIDER, candidate.accountId);
+      if (!row || credentialGeneration(row.credential) !== candidate.generation) continue;
+      const binding = { selection: committed, snapshot: candidate, providerAccountUuid: row.credential.accountId, routeDecision, sessionKey, model, config, manualSelectionGeneration };
+      if (nativeOAuthBindingIsCurrent(binding)) return binding;
     }
-    // A newer manual choice wins over this request's proposal.
-    selection = captureOAuthAccountSelection(PROVIDER);
-    if (!selection) break;
-    candidate = await getAnthropicPoolAccessSnapshot(selection.accountId);
   }
   throw new NativeOAuthSelectionChangedError();
 }
 
 /**
- * Whether a binding may still be sent: the same committed selection, and the same usable,
- * unexpired credential generation. Checked immediately before every physical send.
+ * Whether a binding may still be sent: a live pooled session affinity or the same committed
+ * selection, plus the same usable credential generation. Checked before every physical send.
  */
 export function nativeOAuthBindingIsCurrent(binding: NativeOAuthBinding): boolean {
+  if (binding.manualSelectionGeneration !== captureAnthropicManualSelectionGeneration()
+    || !routeIsCurrent(binding.config, binding.model, binding.routeDecision)) return false;
   const selected = captureOAuthAccountSelection(PROVIDER);
   const row = getAccountCredentialWithStatus(PROVIDER, binding.snapshot.accountId);
-  return selected?.accountId === binding.selection.accountId
-    && selected?.revision === binding.selection.revision
-    && !!row && !row.needsReauth && row.credential.expires > Date.now()
-    && credentialGeneration(row.credential) === binding.snapshot.generation;
+  const sessionRoute = isAnthropicAccountPoolEnabled(binding.config) && binding.sessionKey
+    ? resolveAnthropicAccountForSession(binding.sessionKey, binding.config, Date.now(), binding.routeDecision, binding.model) : null;
+  // Another conversation may move the automatic active pointer without revoking this
+  // session's affinity. Manual selection clears affinity and precedes it in the selector.
+  const selectionCurrent = sessionRoute?.reason === "affinity"
+    && sessionRoute.accountId === binding.snapshot.accountId
+    || (selected?.accountId === binding.selection.accountId && selected?.revision === binding.selection.revision);
+  return selectionCurrent
+    && !!row && !row.paused && !row.needsReauth && row.credential.expires > Date.now()
+    && !getAnthropicAccountHealthSnapshot(binding.snapshot.accountId)
+    && routeCandidates(getEligibleAnthropicAccounts(Date.now(), binding.model), binding.routeDecision).includes(binding.snapshot.accountId)
+    && credentialGeneration(row.credential) === binding.snapshot.generation
+    && row.credential.accountId === binding.providerAccountUuid;
 }
 
 /** Map a `tool_use` block's wire name back to the caller's name; other blocks are untouched. */

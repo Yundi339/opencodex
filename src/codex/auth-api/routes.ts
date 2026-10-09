@@ -6,6 +6,7 @@ import { readUsageSnapshotForManagement } from "../../usage/log";
 import { getAccountQuotaHistory, listAccountQuotas } from "../quota";
 import { deleteCodexAccount } from "../account-lifecycle";
 import { isCodexAccountPaused, setCodexAccountPaused } from "../account-pause";
+import { setAllCodexAccountsCreditsAfterLimit, setCodexAccountCreditsAfterLimit } from "../account-credit-use";
 import { clearCodexAccountPin, isCodexAccountPriorityKey, pinnedCodexAccountId, setCodexAccountPin, setCodexAccountPriority } from "../account-priority";
 import { codexAccountPinDrainReason, codexQuotaScopeForModel, clearCodexAccountCooldown, clearThreadAccountMapForAccount, getEffectiveActiveCodexAccountId, isEffectiveCodexAccountPinned, resetCodexRoutingForManualSelection } from "../routing";
 import { DEFAULT_ACCOUNT_PRIORITY, MAX_ACCOUNT_PRIORITY, MIN_ACCOUNT_PRIORITY, normalizeAccountPoolStickyLimit, normalizeCodexAccountPoolStrategy, parseAccountPoolStickyLimit, parseCodexAccountPoolStrategy, parseAccountPriority } from "../pool-rotation";
@@ -23,6 +24,7 @@ import { inspectResetCredits, consumeResetCredits } from "./reset-credit-service
 import { getRuntimeConfig, saveRuntimeConfig, configuredPoolAccount } from "./runtime-config";
 import { captureConfigTopLevelRollback } from "../../config/rebase-provenance";
 import { getEffectiveCodexAutoSwitchThreshold, isCodexAccountAutoSwitchThresholdKey, parseCodexAutoSwitchThreshold, setCodexAccountAutoSwitchThresholdOverride } from "../account-auto-switch";
+import { withCodexAccountPauseGroup } from "./account-pause-group";
 
 export async function handleCodexAuthAPI(
   req: Request,
@@ -99,19 +101,57 @@ export async function handleCodexAuthAPI(
       || (runtimeConfig.codexAccounts ?? []).some(account => isSelectableCodexPoolAccount(account) && account.id === id);
     if (!exists) return jsonResponse({ error: "Account not found" }, 404);
 
-    setCodexAccountPaused(runtimeConfig, id, body.paused);
-    if (body.paused) {
-      clearThreadAccountMapForAccount(id);
-      selectFallbackAfterPause(runtimeConfig, id);
-    }
-    saveRuntimeConfig(config, runtimeConfig);
-    return jsonResponse({
-      ok: true,
-      id,
-      paused: body.paused,
-      activeCodexAccountId: getEffectiveActiveCodexAccountId(runtimeConfig) ?? null,
-      appliesImmediately: true,
+    const paused = body.paused;
+    return withCodexAccountPauseGroup(runtimeConfig, id, accountIds => {
+      // Publish every exclusion before reconciling: a duplicate must never become the fallback.
+      for (const accountId of accountIds) setCodexAccountPaused(runtimeConfig, accountId, paused);
+      if (paused) {
+        for (const accountId of accountIds) clearThreadAccountMapForAccount(accountId);
+        for (const accountId of accountIds) selectFallbackAfterPause(runtimeConfig, accountId);
+      }
+      saveRuntimeConfig(config, runtimeConfig);
+      return jsonResponse({
+        ok: true,
+        id,
+        paused,
+        affectedAccountIds: accountIds,
+        activeCodexAccountId: getEffectiveActiveCodexAccountId(runtimeConfig) ?? null,
+        appliesImmediately: true,
+      });
     });
+  }
+
+  // Pool accounts and `__main__`, like pause. Spending is opt-in: an account not on the list is
+  // skipped by the next selection while a usage window is full, and a bound thread is released
+  // through the usual block reason, so nothing is cleared here. `{ all }` is the dashboard's
+  // global switch: on lists every current account, off clears the list.
+  if (url.pathname === "/api/codex-auth/accounts/credits" && req.method === "PUT") {
+    const parsed: unknown = await req.json().catch(() => null);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return jsonResponse({ error: "body must be an object" }, 400);
+    }
+    const body = parsed as { id?: unknown; creditsAfterLimit?: unknown; all?: unknown };
+    const runtimeConfig = getRuntimeConfig(config);
+    if (body.all !== undefined) {
+      if (typeof body.all !== "boolean") return jsonResponse({ error: "all must be a boolean" }, 400);
+      const ids = [MAIN_CODEX_ACCOUNT_ID, ...(runtimeConfig.codexAccounts ?? [])
+        .filter(isSelectableCodexPoolAccount)
+        .map(account => account.id)];
+      setAllCodexAccountsCreditsAfterLimit(runtimeConfig, ids, body.all);
+      saveRuntimeConfig(config, runtimeConfig);
+      return jsonResponse({ ok: true, all: body.all, ids: runtimeConfig.creditCodexAccountIds ?? [] });
+    }
+    const id = typeof body.id === "string" ? body.id.trim() : "";
+    if (id !== MAIN_CODEX_ACCOUNT_ID && !isValidCodexAccountId(id)) return jsonResponse({ error: "Invalid account id format" }, 400);
+    if (typeof body.creditsAfterLimit !== "boolean") return jsonResponse({ error: "creditsAfterLimit must be a boolean" }, 400);
+
+    const exists = id === MAIN_CODEX_ACCOUNT_ID
+      || (runtimeConfig.codexAccounts ?? []).some(account => isSelectableCodexPoolAccount(account) && account.id === id);
+    if (!exists) return jsonResponse({ error: "Account not found" }, 404);
+
+    setCodexAccountCreditsAfterLimit(runtimeConfig, id, body.creditsAfterLimit);
+    saveRuntimeConfig(config, runtimeConfig);
+    return jsonResponse({ ok: true, id, creditsAfterLimit: body.creditsAfterLimit });
   }
 
   // Deliberately a route of its own rather than a field on the alias PATCH: aliases

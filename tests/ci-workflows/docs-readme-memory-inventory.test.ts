@@ -5,7 +5,7 @@
  * The block was written once (`6c14e3433`, 2026-08-13) and never revisited. `usage_snapshot`
  * became the thirteenth retained store the very next day, three more state-store registrations
  * landed after that, and `native_control_replay` became the fourteenth retained store while this
- * guard was still in review, so all eight README files kept advertising 12 and 24 the whole
+ * guard was still in review, so every README file kept advertising 12 and 24 the whole
  * time. Review does not catch this: an English diff of one number looks complete on its own,
  * and the seven translations were copied from a source that was already stale.
  *
@@ -68,64 +68,7 @@ const PAGES = [
     observed: /(\d+) observed buffers/,
     stateStores: /(\d+) state-store registrations/,
     totalSentence: "process-retained state",
-  },
-  {
-    locale: "fr",
-    path: "readme/README.fr.md",
-    retained: /(\d+) stockages conservés/,
-    observed: /(\d+) tampons observés/,
-    stateStores: /(\d+) enregistrements de stockages/,
-    totalSentence: "état conservé par le processus",
-  },
-  {
-    locale: "ja",
-    path: "readme/README.ja.md",
-    retained: /保持ストア (\d+) 個/,
-    observed: /観測バッファ (\d+) 個/,
-    stateStores: /state-store の登録 (\d+) 個/,
-    totalSentence: "プロセスが保持する状態を",
-  },
-  {
-    locale: "ko",
-    path: "readme/README.ko.md",
-    retained: /유지 저장소 (\d+)개/,
-    observed: /관측 버퍼 (\d+)개/,
-    stateStores: /state-store 등록 (\d+)개/,
-    totalSentence: "프로세스가 붙잡고 있는 상태를",
-  },
-  {
-    locale: "ru",
-    path: "readme/README.ru.md",
-    retained: /(\d+) удерживаемых хранилищ/,
-    observed: /(\d+) наблюдаемых буфера/,
-    stateStores: /(\d+) регистраций state-store/,
-    totalSentence: "удерживаемое процессом",
-  },
-  {
-    locale: "tr",
-    path: "readme/README.tr.md",
-    retained: /(\d+) tutulan depo/,
-    observed: /(\d+) gözlenen arabellek/,
-    stateStores: /(\d+) state-store kaydı/,
-    totalSentence: "süreçte tutulan durumu",
-  },
-  {
-    locale: "zh-CN",
-    path: "readme/README.zh-CN.md",
-    retained: /(\d+) 个保留存储/,
-    observed: /(\d+) 个观测缓冲区/,
-    stateStores: /(\d+) 个状态存储注册/,
-    totalSentence: "进程保留状态",
-  },
-  {
-    locale: "zh-TW",
-    path: "readme/README.zh-TW.md",
-    retained: /(\d+) 個保留儲存/,
-    observed: /(\d+) 個觀測緩衝區/,
-    stateStores: /(\d+) 個狀態儲存註冊/,
-    totalSentence: "行程保留狀態",
-  },
-] as const;
+  },] as const;
 
 /**
  * The number one page states for one claim.

@@ -14,7 +14,7 @@ description: 供應商設定、憑證、配額與模型目錄指令。
 | 子指令 | 支援的旗標 | 動作 |
 | --- | --- | --- |
 | `list` | `--json`, `--jsonl` | 列出已設定的供應商與剩餘的 registry 項目。 `--jsonl` 為每個已設定的供應商輸出一行 JSON 物件。 |
-| `add <name>` | `--adapter <adapter>`, `--base-url <url>`, `--api-key <key>`, `--default-model <model>`, `--set-default`, `--force`, `--json`, `--sync` | 新增 registry／自訂供應商。`--force` 覆寫；`--sync` 在人類輸出模式下重新整理執行中的代理。 |
+| `add <name>` | `--adapter <adapter>`, `--base-url <url>`, `--api-key <key>`, `--default-model <model>`, `--set-default`, `--force`, `--json`, `--sync` | 儲存至本機。`--force` 允許覆寫；`--sync` 在 JSON 與一般輸出模式下都會嘗試同步。 |
 | `edit <name>` | 供應商欄位旗標, `--json` | 編輯已驗證的即時供應商欄位而不替換金鑰池。 |
 | `test <name>` | `--json` | 探測真實上游模型端點。 |
 | `show <name>` | `--json` | 顯示設定，API 金鑰已遮罩。 |
@@ -24,6 +24,8 @@ description: 供應商設定、憑證、配額與模型目錄指令。
 | `quota` | `--refresh`, `--json` | 讀取供應商配額報告。 |
 | `presets` | `--json` | 列出儀表板供應商預設。 |
 | `account-mode` | `pool`, `direct`, `--json` | 選擇池化或直接的 Codex 帳號路由。 |
+
+預設的 `add`、`remove` 與 `set-default` 修改本機設定。修改執行中的代理需加 `--live`，線上刪除還需 `--yes`。`--sync --json` 同樣會在儲存後嘗試同步；失敗時保留儲存結果，以非零狀態結束，並回傳 `needsSync: true`。`--live` 不能與 `--sync` 同用。pacing 與 snapshot/apply 操作請見[英文指南](/reference/cli/providers-accounts/#snapshot-edit-and-apply-with-a-baseline)。
 
 ```bash
 ocx provider list --json
@@ -76,7 +78,7 @@ priority <provider> <id|alias|main> [first|earlier|normal|later|last|-100..100|r
 pause <provider> <id|alias|main>  將帳號移出自動選擇。
 resume <provider> <id|alias|main>  將暫停的帳號放回自動選擇。
 pause-exhausted <provider>  暫停所有配額已用盡的帳號。
-clear-cooldown <provider> <id|alias|main>  清除上游失敗後設定的冷卻。
+clear-cooldown <openai|anthropic> <id|alias|main>  清除上游失敗後設定的冷卻。
 strategy <provider> [<quota|round-robin|fill-first|reset-first>]  帳號池放置策略；省略取值即讀取目前值。
 sticky <provider> [<1-100>]  已綁定執行緒在同一帳號上保留的請求數；省略取值即讀取目前值。
 remove <provider> <id|alias|main> --yes  在存在檢查後移除已儲存的帳號或金鑰。
@@ -144,19 +146,36 @@ Codex 池選擇套用於清除既有親和性後的下一個請求；進行中�
 
 ### `ocx account pause|resume <provider> <id|alias|main> [--json]`
 
-暫停或恢復 Codex 帳號池或通用 OAuth 供應商池中的單一帳號，包括
-`google-antigravity`。在 Codex 池中，`main` 僅代表 Codex 內建帳號；通用 OAuth 帳號必須用 id 或唯一別名識別。
-已暫停的通用 OAuth 帳號不會參與請求選帳、429 輪替或主動 Token 刷新，也不能手動選取。
+暫停或恢復 Codex、Anthropic 或通用 OAuth 供應商池中的單一帳號，包括
+`google-antigravity`。在 Codex 池中，`main` 僅代表 Codex 內建帳號；OAuth 帳號必須用 id 或唯一別名識別。
+已暫停的 OAuth 帳號不會參與請求選帳、429 輪替或主動 Token 刷新，也不能手動選取。
 若暫停目前使用中的帳號，系統會在有其他可用帳號時切換過去。若全部帳號都已暫停，
 需要該池的請求會回覆 403，直到恢復其中一個帳號。
 
-通用 OAuth 供應商可用帳號 id，或唯一且完全相符／不區分大小寫的別名識別帳號。
+Anthropic 和通用 OAuth 供應商可用帳號 id，或唯一且完全相符／不區分大小寫的別名識別帳號。
 JSON 回應會提供帳號 id、暫停狀態與目前 active 帳號 id。
+
+Anthropic 暫停不受帳號池啟用開關影響，包含工作階段綁定與 429 後繼選帳。
+重新啟動或登入仍保留暫停，憑證與健康狀態不會清除，已送出的請求不會中斷。
+刪除帳號會一併刪除暫停狀態；個別帳號的自動切換門檻不在此功能範圍內。
 
 ```bash
 ocx account pause google-antigravity <account-id-or-alias>
 ocx account resume google-antigravity <account-id-or-alias>
 ```
+
+### `ocx account clear-cooldown <openai|anthropic> <id|alias|main> [--json]`
+
+清除行程本地的失敗冷卻，但不變更已儲存的憑證。Codex 池帳號使用 `openai`，Anthropic
+OAuth 帳號使用 `anthropic`；其他供應商會被拒絕。兩種形式都接受帳號 id 或唯一別名，
+而 `main` 僅適用於 Codex 池。
+
+```bash
+ocx account clear-cooldown anthropic <id-or-alias>
+```
+
+即使沒有作用中的冷卻，命令也會成功，JSON 中的 `cleared` 為 `false`。清除 Anthropic
+冷卻也會推進帳號 generation，因此舊的 quota probe 無法恢復已清除狀態或發布過期的配額資格。
 
 ### `ocx account refresh <provider> [--json]`
 
@@ -168,7 +187,11 @@ ocx account resume google-antigravity <account-id-or-alias>
 
 ### `ocx account auto-switch <provider> <on|off|status|threshold <0-100>> [--json]`
 
-控制 `openai` Codex 帳戶池閾值，或儲存通用 OAuth 帳戶池閾值。`on` 儲存 80%，`off` 儲存 0%，`threshold <n>` 接受 0–100。通用池的閾值只有在 `pool.kernel` 開啟且 `strategy: "fill-first"` 時才參與選擇；旗標關閉時，儲存閾值不會啟用閾值切換。兩種情況下都不會改變供應商啟用設定或停用 429 錯誤後的輪替。通用池的查詢與修改結果使用伺服器確認值。通用池的 `poolEnabled` 是已儲存的供應商設定，`null` 表示未指定，並不代表繼承後的實際狀態。`inert: true` 表示閾值已儲存但未套用，`inert: false` 表示帳戶池正在套用它。沒有 `inert` 欄位表示能力未知，此時同樣不會回報 `enabled: true`。API 金鑰供應商、Anthropic 與無效值會被拒絕。
+控制 `openai` Codex 帳戶池閾值，或儲存通用 OAuth 帳戶池閾值。`on` 儲存 80%，`off` 儲存 0%，`threshold <n>` 接受 0–100。通用池的閾值只有在 `pool.kernel` 開啟且 `strategy: "fill-first"` 時才參與選擇；旗標關閉時，儲存閾值不會啟用閾值切換。兩種情況下都不會改變供應商啟用設定或停用 429 錯誤後的輪替。通用池的查詢與修改結果使用伺服器確認值。通用池的 `poolEnabled` 是已儲存的供應商設定，`null` 表示未指定，並不代表繼承後的實際狀態。`inert: true` 表示閾值已儲存但未套用，`inert: false` 表示帳戶池正在套用它。沒有 `inert` 欄位表示能力未知，此時同樣不會回報 `enabled: true`。API 金鑰供應商與無效值會被拒絕。
+
+### `ocx account auto-switch anthropic … --account <id>`
+
+Anthropic OAuth 使用 `ocx account auto-switch anthropic threshold 90 --account <id>` 儲存帳戶專屬整數 0–100。`off --account <id>` 設為 0，`on --account <id>` 設為 80，`inherit --account <id>` 恢復繼承，`status --account <id>` 唯讀查詢；可加 `--json`。帳戶卡片提供相同控制。未設定/null 繼承 `anthropicAccountPool.autoSwitchThreshold`（預設 80）；0 只停用該帳戶依用量切換。設定在重啟和重新登入後保留，刪除帳戶時移除。手動選擇、affinity、未知或全部耗盡時的後備行為與模型路由限制不變。集區停用時不套用門檻；暫停與 429 復原仍有效。
 
 ```text
 openai: { provider, autoSwitchThreshold: number, enabled: boolean }
@@ -304,15 +327,15 @@ Preview 建置使用 `<OPENCODEX_HOME>/native-main-profiles`。該配置絕不�
 
 `ocx model` 是 `ocx models` 的別名。無子指令時，列出已設定供應商中靜態播種的模型。`--provider` 過濾一個已設定的供應商，而 `--json` 回傳模型中繼資料。`live` 讀取執行中的目錄；`add`、`edit`、`remove` 與 `list-custom` 管理手動目錄項目；`enable`、`disable` 與 `provider` 控制可見性；`selected` 控制供應商允許清單；`context` 控制供應商 context 上限；而 `shadow` 管理背景 shadow-call 攔截。
 
-儀表板提供的每個 per-model 操作在此皆可用，因此無頭安裝永不需要 GUI 來管理目錄。`add`、`remove` 與 `list-custom` 針對設定檔運作並透過目錄同步套用於執行中的代理；其餘與即時管理 API 通訊並需要代理正在執行（`ocx start` 或已安裝的服務）。
+`add` 與 `remove` 預設儲存至本機；`--live` 修改執行中的代理。本機 `--json` 儲存時若無代理，回傳 `sync.status: "not-attempted"`、`needsSync: true`，結束碼為 0。實際嘗試的同步失敗時保留儲存結果，以非零碼結束。`list-custom` 是本機清單。`display-name` 使用原始上游 ID，`order` 使用 picker 的 public ID。完整排列、featured 前綴與 native 順序重設限制請見[英文步驟](/reference/cli/providers-accounts/#display-names-and-picker-identities)。
 
 | 子指令 | 支援的旗標 | 動作 |
 | --- | --- | --- |
 | `list`（預設） | `--provider <name>`, `--json` | 列出已設定供應商中播種的模型。 |
 | `live` | `--provider <name>`, `--json` | 讀取執行中的目錄，包含 runtime 探索的模型。列標記為 `native`/`routed`、`custom` 與 `enabled`/`disabled`。 |
-| `add <provider> <modelId>` | `--display-name <name>`, `--context-window <tokens>`, `--modalities <text,image,audio>` | 註冊供應商目錄未廣告的模型。 |
+| `add <provider> <modelId>` | `--display-name <name>`, `--context-window <tokens>`, `--modalities <text,image,audio>`, `--live`, `--json` | 在本機註冊自訂模型，或使用 `--live` 在執行中的代理上註冊。 |
 | `edit <custom-id>` | `--model-id <id>`, `--display-name <name\|->`, `--context-window <tokens\|0>`, `--modalities <text,image,audio\|->`, `--json` | 編輯自訂模型。`-` 清除欄位；`0` 清除 context window。 |
-| `remove <custom-id\|provider/modelId>` | `--yes` | 刪除自訂模型。stdin 非互動終端時需要 `--yes`。 |
+| `remove <custom-id\|provider/modelId>` | `--yes`, `--live`, `--json` | 刪除自訂模型；使用 `--live` 或 `--json` 時必須加 `--yes`。 |
 | `list-custom` | `--json` | 顯示所有自訂模型及其 `custom-id`（其他子指令所採用）。 |
 | `enable <provider/model\|native-model>` | `--native`, `--json` | 使一個模型對 Codex 可見。 |
 | `disable <provider/model\|native-model>` | `--native`, `--json` | 對 Codex 隱藏一個模型。 |

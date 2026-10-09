@@ -1,3 +1,4 @@
+import type { CodexAccountModelRefusal } from "../../combos/failover";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -5,6 +6,7 @@ import {
   isDeclaredReasoningEffort,
   resolveEffortAtOrBelow,
 } from "../../reasoning-effort";
+import { resolveAdmissionModelScope, routeAllowedByScope } from "../admission-model-scope";
 import { recordAttemptRequestedEffort } from "../request-log";
 import {
   CODEX_TEXT_GUARDED_BUDGET_POLICY,
@@ -30,6 +32,7 @@ import {
   concreteComboRequestBody,
   comboDefaultEffort,
   isComboTargetInCooldown,
+  snapshotComboQuotaCooldowns,
   noteComboSuccess,
   noteProviderCapacityVerdict,
   finishProviderProbe,
@@ -40,7 +43,8 @@ import {
   advanceComboAfterFailure,
   comboFailureCooldownScope,
   JEV_PROVIDER_ID,
-  resolveJevDecision,
+  jevDecisionBackendFor,
+  resolveJevComboDecision,
   type ComboPick,
   type JevCandidate,
   type JevDecision,
@@ -59,6 +63,16 @@ import {
 import { hasUnreadableEncryptedAgentTask } from "./encrypted-payload";
 import { routeConcreteModel, comboRouteDecisionTrace } from "../../router";
 import { memoryModelRouteReason } from "./memory-models";
+import { poolAccountProviderLabel } from "../../providers/label";
+import { getAccountSet } from "../../oauth/store";
+import {
+  formatAnthropicProviderForLog,
+  getAnthropicAccountHealthSnapshot,
+  getAnthropicPoolRetryAfterSeconds,
+  getEligibleAnthropicAccounts,
+} from "../../oauth/anthropic-routing";
+import { codexAccountLogLabel } from "../../codex/account-label";
+import { codexQuotaScopeForModel, getCodexQuotaHealthSnapshot } from "../../codex/routing";
 import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
 import type { AgentTaskRecoveryFailureReason } from "./agent-task-recovery";
 import {
@@ -67,6 +81,8 @@ import {
   recoverEncryptedAgentTaskWithResult,
 } from "./agent-task-recovery";
 import { isThreadSpawnRequest, supportedLadderFor } from "../effort-policy";
+import { applyDroidResponsesReasoningDefault } from "../droid-reasoning-default";
+import { isPlainObject } from "../../lib/plain-data";
 import {
   clientCancelledResponse,
   comboUnavailable,
@@ -102,6 +118,8 @@ import { streamingContextOverflowResponse, jsonContextOverflowResponse } from ".
 import { mandatoryResponsesReasoningReplayUnavailable } from "./core-replay";
 import { isReplayRefusalCode, settleOperatorReplacement } from "../../lib/upstream-retry";
 import { createComboProtocolLanes, dispatchNativeComboChild } from "./core-combo-native";
+import { createJevModelInvoker } from "./jev-model-invoke";
+import { comboRequestedEffortLabel } from "./combo-requested-effort";
 import { clientWireOf } from "../inference/client-wire";
 import {
   COMBO_DEGENERATE_CODE,
@@ -226,6 +244,49 @@ function comboFirstByteTimeoutResponse(provider: string, timeoutMs: number): Res
  */
 export const COMBO_TARGET_BASE_SENDS = CODEX_TEXT_GUARDED_BUDGET_POLICY.baseSendAllowance;
 
+function cooledPoolAccountLabel(config: OcxConfig, providerName: string, modelId: string, label: string | undefined): string | undefined {
+  if (!label) return undefined;
+  if (providerName === "anthropic") {
+    const matches = getAccountSet("anthropic")?.accounts.filter(account =>
+      formatAnthropicProviderForLog("anthropic", account.id) === label) ?? [];
+    return matches.length === 1 && getAnthropicAccountHealthSnapshot(matches[0]!.id) ? label : undefined;
+  }
+  const provider = config.providers[providerName];
+  if (!provider || !isCanonicalOpenAiForwardProvider(provider)) return undefined;
+  const matches = (config.codexAccounts ?? []).filter(account =>
+    `${providerName}-${codexAccountLogLabel(account)}` === label);
+  return matches.length === 1
+    && getCodexQuotaHealthSnapshot(matches[0]!.id, codexQuotaScopeForModel(modelId))
+    ? label : undefined;
+}
+
+
+/**
+ * True only for the Anthropic OAuth pool's OWN "all accounts cooled" 429. Its Retry-After is the
+ * earliest per-account cooldown restated (`getAnthropicPoolRetryAfterSeconds`), which the pool
+ * keeps enforcing locally, so it must not also park the combo target: an account added, resumed or
+ * cleared a minute later would otherwise sit ignored until the target expired, up to the 24h
+ * server-delay ceiling.
+ *
+ * Provenance, not just current state: the target must be the OAuth pool, no account may have been
+ * identified for the failure, and the pool must be holding the wait right now. An upstream 429 on
+ * a pool account always cools and names that account, and an API-key provider never qualifies, so
+ * a genuine upstream Retry-After still parks the target in full.
+ */
+export function isAnthropicPoolLocalRefusal(
+  config: OcxConfig,
+  providerName: string,
+  status: number,
+  failedAccount: string | undefined,
+  now = Date.now(),
+): boolean {
+  return providerName === "anthropic"
+    && config.providers[providerName]?.authMode === "oauth"
+    && status === 429
+    && failedAccount === undefined
+    && getEligibleAnthropicAccounts(now).length === 0
+    && getAnthropicPoolRetryAfterSeconds(now) !== null;
+}
 
 /**
  * A combo's execution policy is DECLARED by the combo, not inherited from the single-target
@@ -401,6 +462,7 @@ export async function executeComboResponses(
     config,
     logCtx,
     admission: options.admission,
+    droidDefaultEffort: options.droidDefaultEffort,
     comboId,
     targets: combo.targets,
   });
@@ -504,8 +566,8 @@ export async function executeComboResponses(
     }
   };
   const adoptFailedChildLog = (childLog: RequestLogContext): void => {
-    // Attempts remain the complete physical history; the logical row mirrors the most recent
-    // failed target so an exhausted combo still has useful top-level reasoning diagnostics.
+    // Attempts remain the complete physical history; the logical row mirrors the failed
+    // target whose response is returned, including an earlier quota refusal on exhaustion.
     Object.assign(logCtx, childLog, {
       requestedModel,
       model: requestedModel,
@@ -737,16 +799,33 @@ export async function executeComboResponses(
     const decisionStartedAt = Date.now();
     let decision: JevDecision;
     try {
-      decision = await resolveJevDecision({
+      decision = await resolveJevComboDecision({
         body,
         candidates: choices.map(choice => choice.candidate),
         fallback,
         config,
+        isDestinationAllowed: (providerName, modelId) => routeAllowedByScope(
+          resolveAdmissionModelScope(config, options.admission), { providerName, modelId },
+        ),
+        ...(combo.decisionProvider ? { decisionProvider: combo.decisionProvider } : {}),
+        ...(combo.decisionModel
+          ? {
+            decisionModel: combo.decisionModel,
+            invokeModel: createJevModelInvoker({
+              req,
+              config,
+              options,
+              handleResponses: requestDispatchers.handleResponses,
+            }),
+          }
+          : {}),
+        ...(combo.decisionTimeoutMs !== undefined ? { timeoutMs: combo.decisionTimeoutMs } : {}),
         signal: options.abortSignal,
       });
     } catch (error) {
       if (options.abortSignal?.aborted) return clientCancelledResponse();
       decision = {
+        backend: jevDecisionBackendFor(combo),
         ...fallback,
         gate: "network",
         latencyMs: Math.max(0, Date.now() - decisionStartedAt),
@@ -765,6 +844,7 @@ export async function executeComboResponses(
       },
       gate: decision.gate,
       latencyMs: decision.latencyMs,
+      backend: decision.backend,
       ...(decision.confidence !== undefined ? { confidence: decision.confidence } : {}),
       ...(decision.chosenProbability !== undefined
         ? { chosenProbability: decision.chosenProbability }
@@ -772,6 +852,7 @@ export async function executeComboResponses(
       ...(decision.usage ? { usage: decision.usage } : {}),
     });
     console.debug("[combo] JEV decision", {
+      backend: decision.backend,
       targetKey: decision.targetKey,
       effort: decision.effort,
       gate: decision.gate,
@@ -800,13 +881,9 @@ export async function executeComboResponses(
     && isDeclaredReasoningEffort(originalRequestedEffortValue)
     ? originalRequestedEffortValue
     : undefined;
-  const restoreOriginalRequestedEffort = (childLog: RequestLogContext): void => {
+  const restoreOriginalRequestedEffort = (childLog: RequestLogContext, forcedEffort?: string | null): void => {
     if (originalRequestedEffort === undefined) return;
-    const normalizedRequestedEffort = childLog.requestedEffort;
-    const transitionIndex = normalizedRequestedEffort?.indexOf("->") ?? -1;
-    childLog.requestedEffort = transitionIndex >= 0
-      ? `${originalRequestedEffort}${normalizedRequestedEffort!.slice(transitionIndex)}`
-      : originalRequestedEffort;
+    childLog.requestedEffort = comboRequestedEffortLabel(originalRequestedEffort, childLog.requestedEffort, forcedEffort);
     recordAttemptRequestedEffort(childLog);
   };
 
@@ -822,6 +899,41 @@ export async function executeComboResponses(
   // is gone, so carry the loop's own classification decision instead of re-deriving a
   // weaker one from the status alone (#4149).
   let lastFailureClassifiesOverflow = false;
+  // The first quota/rate-limit refusal of the ladder. A fallback that then refuses its own
+  // credential or plan (401/403, or a 400 the ladder hopped past) says nothing about why the
+  // request failed: the primary target ran out. Returning that fallback refusal told clients
+  // "OpenAI account pool has no usable account credential" while every Claude account was spent.
+  let quotaFailure: Response | undefined;
+  let quotaFailedChildLog: RequestLogContext | undefined;
+  // Snapshotted before dispatch: a 401/403 inside this ladder cools its own provider, and that
+  // fresh cooldown is not a reason the request found no target.
+  const quotaCooldownSnapshot = snapshotComboQuotaCooldowns(config, comboId);
+  const exhaustedFailure = (): Response => {
+    const returnsQuota = lastFailure && [400, 401, 403].includes(lastFailure.status) && quotaFailure;
+    const failedChildLog = returnsQuota ? quotaFailedChildLog : lastFailedChildLog;
+    if (failedChildLog) adoptFailedChildLog(failedChildLog);
+    if (!lastFailure || ![400, 401, 403].includes(lastFailure.status)) return lastFailure!;
+    if (quotaFailure) return quotaFailure;
+    // The quota-refused target was cooled before this request picked, so the ladder never saw
+    // its refusal. The cooldown, with its Retry-After, is still the honest answer.
+    let quotaCooldownUntil: number | undefined;
+    const now = Date.now();
+    for (const { target, cooldownUntil } of quotaCooldownSnapshot) {
+      if (cooldownUntil <= now) continue;
+      try {
+        if (!targetEligible(target)) continue;
+      } catch {
+        // An eligibility check can exhaust the translator budget; it is not quota evidence.
+        continue;
+      }
+      quotaCooldownUntil = Math.min(quotaCooldownUntil ?? cooldownUntil, cooldownUntil);
+    }
+    const remainingQuotaCooldownMs = quotaCooldownUntil === undefined ? 0 : quotaCooldownUntil - Date.now();
+    return remainingQuotaCooldownMs > 0
+      ? comboUnavailableResponse(`No available targets for combo: ${comboId}`, {
+        retryAfter: String(Math.max(1, Math.ceil(remainingQuotaCooldownMs / 1000))),
+      }) : lastFailure;
+  };
   let lastAttempted = new Set<string>();
   let ladderStopReason: "budget" | "no-eligible-target" | undefined;
   while (pick) {
@@ -853,8 +965,7 @@ export async function executeComboResponses(
       // return the last real upstream answer with its status, headers and any quota body
       // intact rather than to mint a synthetic error, and a later target only exists because
       // an earlier one already recorded one.
-      if (lastFailedChildLog) adoptFailedChildLog(lastFailedChildLog);
-      return lastFailure!;
+      return exhaustedFailure();
     }
     const targetSendBudget = comboSendScope
       ? comboTargetSendBudget(comboSendScope, combo.targets.length - 1 - comboTargetsDispatched)
@@ -872,8 +983,13 @@ export async function executeComboResponses(
       modelId: targetRoute.modelId,
     });
     const initialJevDecision = firstComboTarget ? jevDecision : undefined;
+    const childInput = options.droidDefaultEffort && isPlainObject(body) ? { ...body } : body;
+    applyDroidResponsesReasoningDefault(childInput, options.droidDefaultEffort, {
+      provider: targetRoute.provider,
+      modelId: targetRoute.modelId,
+    });
     const childBody = concreteComboRequestBody(
-      body,
+      childInput,
       pick.target,
       initialJevDecision ? initialJevDecision.effort : comboDefaultEffort(config, comboId),
       initialJevDecision?.effort === null ? [] : targetReasoningEfforts,
@@ -936,6 +1052,7 @@ export async function executeComboResponses(
     const completedTarget = { provider: pick.target.provider, model: pick.target.model };
     const writerGeneration = pick.writerGeneration;
     let consumedChildFailure: ConsumedComboFailure | undefined;
+    let preflightModelRefusal: CodexAccountModelRefusal | undefined;
     const callbackGate = createChildPassthroughCallbackGate({
       ...options,
       onResponseComplete: model => {
@@ -1087,7 +1204,8 @@ export async function executeComboResponses(
         throw settled.error;
       } else {
         response = settled.value;
-        restoreOriginalRequestedEffort(childLog);
+        // Native Chat rebuilds its own body and does not apply the initial JEV effort.
+        restoreOriginalRequestedEffort(childLog, nativeChild ? undefined : initialJevDecision?.effort);
       }
     } catch (error) {
       callbackGate.discard();
@@ -1151,6 +1269,7 @@ export async function executeComboResponses(
             classificationText: `combo attempt first-byte timeout: no output within ${firstByteDeadlineMs}ms`,
           };
         }
+        preflightModelRefusal = preflight.codexModelRefusal;
       } else {
         response = preflight.response;
         if (nativePassthrough) markNativePassthroughSseResponse(response);
@@ -1208,6 +1327,7 @@ export async function executeComboResponses(
     try {
       failure = consumedChildFailure
         ?? await consumeComboFailure(response, options.abortSignal);
+      if (preflightModelRefusal !== undefined) failure = { ...failure, codexModelRefusal: preflightModelRefusal };
     } catch (error) {
       if (options.abortSignal?.aborted) {
         retainCancelledAttempt();
@@ -1234,6 +1354,10 @@ export async function executeComboResponses(
     );
     attemptRetained = true;
     lastFailure = failure.response;
+    if (!quotaFailure && (lastFailure.status === 429 || lastFailure.status === 402)) {
+      quotaFailure = lastFailure;
+      quotaFailedChildLog = childLog;
+    }
     lastFailedChildLog = childLog;
     // A replacement that answers 200 is unmarked, and its zero-output failure only exists once
     // preflight has rebuilt the stream as a fresh Response. A spent grant never hops: a status the
@@ -1272,6 +1396,7 @@ export async function executeComboResponses(
       ? (replayRefusal && refusalHops <= COMBO_REFUSAL_HOPS ? "hop" : "stop")
       : comboFailureDecision(failure.response.status, failure.classificationText, {
         code: failure.upstreamCode,
+        codexModelRefusal: failure.codexModelRefusal,
       });
     if (failure.nonReplayable && baseDecision === "hop") {
       console.warn(
@@ -1373,9 +1498,21 @@ export async function executeComboResponses(
     });
     const failedTargetKey = targetKey(pick.target);
     let failedTargetCooldownRecorded = false;
+    // The dispatch rewrote this to name the pool account that actually served the turn.
+    const failedAccount = cooledPoolAccountLabel(
+      config,
+      pick.target.provider,
+      pick.target.model,
+      poolAccountProviderLabel(childLog.provider, pick.target.provider),
+    );
+    // The target still cools on the pool's own refusal (the anti-hammer guard), but for the local
+    // fallback rather than the pool's restated per-account Retry-After.
+    const poolLocalRefusal = isAnthropicPoolLocalRefusal(
+      config, pick.target.provider, failure.response.status, failedAccount, failureNow,
+    );
     lastAttempted = new Set(attemptedTargets);
     const nextPick = advanceComboAfterFailure(config, pick, {
-      retryAfter: failure.retryAfter,
+      retryAfter: poolLocalRefusal ? undefined : failure.retryAfter,
       resetAt: failure.resetAt,
       cooldownMs: combo.cooldownMs,
       now: failureNow,
@@ -1384,6 +1521,7 @@ export async function executeComboResponses(
       status: failure.response.status,
       code: failure.upstreamCode,
       message: failureMessage,
+      failedAccount,
       onCooldownRecorded: target => {
         failedTargetCooldownRecorded ||= targetKey(target) === failedTargetKey;
       },
@@ -1488,6 +1626,7 @@ export async function executeComboResponses(
       adoptFailedChildLog(childLog);
     }
   }
+  const failure = exhaustedFailure();
   if (
     lastFailure?.status === 413
     && lastFailureClassifiesOverflow
@@ -1527,5 +1666,5 @@ export async function executeComboResponses(
       { retryAfter: comboCooldownRetryAfterSeconds(comboId) },
     );
   }
-  return lastFailure!;
+  return failure;
 }

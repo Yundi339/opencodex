@@ -258,12 +258,17 @@ Aside 프로필 변경은 이때도 한 가지를 저장합니다. 확인을 보
 | `GET, PUT, PATCH /api/oauth/accounts/pool` | Anthropic과 일반 OAuth provider의 기존 pool policy입니다. `/api/pool/settings`로 대체되었고 기존 클라이언트를 위해 유지합니다 | 400 codex 또는 API 키 provider, 잘못된 policy |
 | `POST /api/oauth/accounts/clear-cooldown` | OAuth 계정 하나의 런타임 cooldown을 지웁니다 | 400 잘못된 provider/account |
 | `PUT /api/oauth/accounts/alias` | OAuth 계정 alias를 설정하거나 지웁니다 | 400 잘못된 provider/account/alias |
+| `PUT /api/oauth/accounts/pause` | Anthropic 또는 일반 OAuth 계정을 정지·재개합니다. Body `{ provider, accountId, paused }`. 활성 계정을 정지하면 사용 가능한 다른 계정이 있을 때 전환합니다. | 400 지원하지 않는 provider 또는 잘못된 body; 404 계정 없음; `oauth_mutation_busy` |
 | `GET, POST, DELETE /api/providers/keys` | 마스킹된 provider key를 나열, 추가/활성화, 또는 제거합니다 | 400 잘못된 입력; 404 provider/key 없음 |
 | `PUT /api/providers/keys/active` | provider의 활성 key를 선택합니다 | 400 잘못된 입력; 404 provider/key 없음 |
 | `PUT /api/providers/keys/alias` | provider-key alias를 설정하거나 지웁니다 | 400 잘못된 입력; 404 provider/key 없음 |
 | `GET, POST, PATCH, DELETE /api/keys` | 데이터 평면 admission key를 나열, 생성, 수정, 또는 삭제합니다 | 400 잘못된 본문/id; 404 key 없음 |
 
 자격 증명 목록 응답은 의도적으로 마스킹됩니다. OAuth access token과 완전한 provider API key는 대시보드 클라이언트에 반환되지 않습니다.
+
+#### Anthropic OAuth: `pause` / `resume`
+
+CLI 명령은 Anthropic OAuth 계정을 id 또는 유일한 alias로 일시 정지하거나 재개합니다. alias는 정확히 일치하는 값을 먼저 찾고, 없으면 대소문자를 구분하지 않고 찾습니다. 대시보드와 같은 `PUT /api/oauth/accounts/pause`에 `{ provider: "anthropic", accountId, paused }`를 보냅니다. 계정에 저장되는 `paused` 상태는 `GET /api/oauth/accounts`에도 표시됩니다. 사전 계정 전환 풀이 꺼져 있어도 정지된 계정은 선택, 세션 바인딩, 429 대체 후보에서 제외됩니다. 모든 계정이 정지되면 하나를 재개할 때까지 요청은 403을 반환합니다. 이미 전송한 요청은 유지하며 자격 증명과 건강 상태를 지우지 않습니다. 재시작·재로그인 후에도 정지는 유지되고, 계정을 삭제하면 함께 제거됩니다. 계정별 전환 임계값은 이 기능에 포함되지 않습니다.
 
 ### 제공자
 
@@ -327,7 +332,7 @@ OpenAI도 같은 규칙을 따르며, 스위치를 켠다고 별도의 922k 모�
 | --- | --- | --- |
 | `GET, POST, DELETE /api/codex-auth/accounts` | Codex account를 나열/갱신하거나 삭제합니다. POST는 비활성화된 호환성 endpoint로만 유지되며, 성공한 DELETE는 `catalogRefreshPending`를 포함합니다. | POST는 항상 403 `manual_import_disabled`; DELETE 입력이 잘못되면 400 |
 | `PUT /api/codex-auth/accounts/alias` | 계정 alias를 설정하거나 지웁니다 | 400 잘못된 account/alias |
-| `PUT /api/codex-auth/accounts/pause` | 계정 하나를 일시 중지하거나 재개합니다 | 400 잘못된 account/state; 404 누락된 account |
+| `PUT /api/codex-auth/accounts/pause` | 계정과 동일한 로그인 정보를 가진 기존 메인/풀 항목을 수동으로 일시 중지하거나 재개합니다. `affectedAccountIds`를 반환합니다 | 400 잘못된 계정/상태; 404 계정 없음; 503 메인 계정의 로그인 정보가 사용 중이거나 읽을 수 없음 |
 | `PUT /api/codex-auth/accounts/pause-exhausted` | quota가 소진된 account를 일시 중지합니다 | mutation-lock 실패는 503이 됩니다 |
 | `POST /api/codex-auth/accounts/clear-cooldown` | account 하나 또는 모든 account의 runtime cooldown을 지웁니다 | 400 잘못된 id |
 | `GET, PUT /api/codex-auth/active` | 활성 account를 읽거나 선택합니다 | 400 잘못되었거나 누락된 account; 409 paused/legacy-row 충돌 |
@@ -375,3 +380,25 @@ account의 selector binding은 남아 있어 계정이 없을 때 exact route가
 ## 원격 세션과 데이터 키 교체
 
 `POST /api/keys/rotate {id}`는 최대 10분의 전환을 시작하며 새 데이터 키를 한 번만 반환합니다. `POST /api/keys/rotate/commit {id,rotationId}`는 확정하고, `DELETE /api/keys/rotate {id,rotationId}`는 취소합니다. 모두 관리 인증이 필요하며 데이터 키로 호출할 수 없습니다. `POST /api/session/logout`은 현재 `gui-session`, 일치하는 Origin, CSRF가 필요합니다. 관리자 토큰은 403을 받고 동의 세션을 만들거나 교환할 수 없습니다.
+
+## Anthropic 계정 사용량 임계값
+
+`PUT /api/oauth/accounts/auto-switch`
+
+Anthropic OAuth 전용. `{ provider: "anthropic", accountId, threshold }`: 정수 0–100, null은 상속, 누락은 오류. 재시작 후 유지되고 계정 삭제 시 제거됩니다.
+
+계정 DTO는 `autoSwitchThresholdOverride`(정수/null), `autoSwitchThreshold`(풀 기본값), `effectiveAutoSwitchThreshold`를 포함합니다. 0은 사용량 전환만 끄며 pause·429 복구는 유지합니다.
+
+HTTP: 400 invalid/unsupported; 404 missing account; `oauth_mutation_busy` on lock contention.
+
+### Forced Claude Code subagent model
+
+The Subagents page offers **Force all subagents onto one model**, off by default. Select an exposed roster-style id, such as `combo/tev-auto`, then enable the switch. The roster is offered first; unavailable saved roster entries cannot be force targets.
+
+`ocx agent subagents force combo/tev-auto` sets `claudeCode.subagentModelForce`; `ocx agent subagents force -` clears it. `ocx agent status` reports the setting. `GET /api/subagent-models` returns `force`, `forceAvailable`, and `forceStatus`; `PUT` accepts `{ "force": "combo/tev-auto" }` or `{ "force": null }` without changing the roster. Omitting `force` leaves it unchanged. Invalid or unexposed targets are rejected on write; stale targets are reported and skipped at launch.
+
+This takes effect on the **next routed `ocx claude` launch**, injecting `CLAUDE_CODE_SUBAGENT_MODEL` as an explicit proxy alias (with `[1m]` only for an authoritative million-token window; native Claude targets use a reversible native alias) and `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`. Each nonempty shell-exported variable independently wins. Native launches inject neither variable; plain `claude` is not affected. No plugin files or `settings.json` are modified by this setting.
+
+Claude Code **2.1.257 or newer** is required for FORCE. Plugin and built-in agents (including Explore/Plan) and per-call model arguments are overridden. Forks and subagent skills with `model: inherit` keep the main conversation model. The main loop and Haiku/small-fast sidecars are unaffected. Existing roster files remain available.
+
+The dashboard warns about old or unknown CLI versions, unavailable targets, and either variable already present in `settings.json` → `env` (which overrides launch env). Detection is read-only and server-local: it cannot inspect another launch shell, another machine, or project-local settings. An unknown result is not proof of force support.

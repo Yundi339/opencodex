@@ -54,12 +54,13 @@ import {
   headersForCodexAuthContext,
   applyCodexAuthContextToProvider,
   stripCodexRuntimeProviderFields,
-  createCodexReserveDispatchGuard,
+  createCodexAuthDispatchGuard,
+  CodexPoolAccountCreditsOffError,
 } from "../../codex/auth-context";
 import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } from "../../codex/catalog/native-models";
 import { isRequestExecutionBudget } from "../../lib/request-execution-budget";
 import type { SingleUseDispatchPermit } from "../../lib/request-execution-budget";
-import { hasForwardableCodexBearer } from "../auth-cors";
+import { codexRouteCredentialOwnership, type CodexCredentialOwnershipOptions } from "./core-auth";
 import { bindRouteReasoningReplayScope } from "./core-replay";
 import {
   conversationStateBindingFromAuth,
@@ -127,7 +128,8 @@ export function codexWsQuotaObserver(authCtx: CodexAuthContext, provider: OcxPro
   const mainWriter = authCtx.kind === "main-pool" ? authCtx.mainQuotaWriter : undefined;
   return headers => {
     if (credentialGeneration !== undefined && !isCodexAccountGenerationLive(accountId, credentialGeneration)) return;
-    applyCapturedCodexQuota(accountId, headers, writerGeneration, mainWriter, { modelId, poolWriter: authCtx.kind === "pool" ? authCtx.poolQuotaWriter : undefined });
+    applyCapturedCodexQuota(accountId, headers, writerGeneration, mainWriter, { modelId, poolWriter: authCtx.kind === "pool" ? authCtx.poolQuotaWriter : undefined,
+      poolResponse: authCtx.kind === "pool" });
   };
 }
 
@@ -359,7 +361,7 @@ export interface CodexPoolAccountRetryArgs {
   route: Pick<RouteResult, "providerName" | "modelId" | "provider" | "staticPolicy">;
   parsed: OcxParsedRequest;
   logCtx: RequestLogContext;
-  options: {
+  options: CodexCredentialOwnershipOptions & {
     admission?: DataPlaneAdmission;
     codexAuthPolicy?: CodexAuthPolicyConfig;
     visionDescribeTerminal?: boolean;
@@ -395,6 +397,8 @@ export interface CodexPoolAccountRetryArgs {
   connectMs: number;
   passthroughEstimate?: number;
   stream: boolean;
+  /** Keep a buffered canonical client on HTTP/SSE after moving to another Pool account. */
+  httpOnly?: boolean;
   onResponse?: (
     response: Response,
     authCtx: CodexAuthContext,
@@ -535,7 +539,7 @@ export async function retryCodexPoolOnAlternateAccount(
 ): Promise<CodexPoolAccountRetryResult> {
   const {
     callerAuthHeaders, config, route, parsed, logCtx, options, firstAuthCtx, firstResponse,
-    outcomeStatus, upstream, connectMs, passthroughEstimate, stream,
+    outcomeStatus, upstream, connectMs, passthroughEstimate, stream, httpOnly,
   } = args;
   const inboundWire = options.inboundWire ?? "responses";
   const entitlementResolver = options.resolveCodexModelEntitlements ?? resolveCodexModelEntitlements;
@@ -638,10 +642,13 @@ export async function retryCodexPoolOnAlternateAccount(
         "pool",
         {
           excludeAccountId: firstAuthCtx.accountId,
+          signal: options.abortSignal,
           admission: options.admission,
           codexAuthPolicy: options.codexAuthPolicy,
           modelId: route.modelId,
-          requestScopedMainCredential: hasForwardableCodexBearer(callerAuthHeaders, config),
+          requestScopedMainCredential: codexRouteCredentialOwnership(callerAuthHeaders, config, {
+            provider: route.provider, codexAccountMode: "pool",
+          }, options).requestScopedMainCredential,
           beginCodexAccountSelection: codexAccountSelectionForTurn(options.turnAdmissionLease),
           resolveCodexModelEntitlements: entitlementResolver,
         },
@@ -715,7 +722,8 @@ export async function retryCodexPoolOnAlternateAccount(
       firstResponse.headers,
       firstAuthCtx.writerGeneration,
       firstAuthCtx.kind === "main-pool" ? firstAuthCtx.mainQuotaWriter : undefined,
-      { modelId: route.modelId, poolWriter: firstAuthCtx.kind === "pool" ? firstAuthCtx.poolQuotaWriter : undefined },
+      { modelId: route.modelId, poolWriter: firstAuthCtx.kind === "pool" ? firstAuthCtx.poolQuotaWriter : undefined,
+        poolResponse: firstAuthCtx.kind === "pool" },
     );
   }
   const deferFirstOutcome = shouldDeferCodexResetDerivedCooldown(
@@ -738,12 +746,21 @@ export async function retryCodexPoolOnAlternateAccount(
   // Only a combo reset-derived outcome is deferred. Retry-After, defaults, and
   // ordinary requests must block the first account before the alternate send.
   if (!deferFirstOutcome) recordFirstOutcome();
-  const retryHeaders = headersForCodexAuthContext(callerAuthHeaders, retryAuthCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission);
-  const retryProvider = applyCodexAuthContextToProvider(
-    stripCodexRuntimeProviderFields(route.provider),
-    retryAuthCtx,
-    "pool",
-  );
+  let retryHeaders: Headers;
+  let retryProvider: ReturnType<typeof applyCodexAuthContextToProvider>;
+  try {
+    retryHeaders = headersForCodexAuthContext(callerAuthHeaders, retryAuthCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission);
+    retryProvider = applyCodexAuthContextToProvider(stripCodexRuntimeProviderFields(route.provider), retryAuthCtx, "pool");
+  } catch (error) {
+    if (!(error instanceof CodexPoolAccountCreditsOffError)) throw error;
+    // Body/entitlement reads above can outlive credit consent. No alternate will send:
+    // release its reservation and probes, then let the owner map the policy refusal.
+    accountMovePermit?.release();
+    releaseCodexAuthContextProbeLease(firstAuthCtx);
+    releaseCodexAuthContextProbeLease(retryAuthCtx);
+    await firstResponse.body?.cancel().catch(() => undefined);
+    return { kind: "transport", error, authCtx: retryAuthCtx };
+  }
   const retryAdapter = resolveAdapter(
     resolveWireProtocolOverride(route.providerName, route.modelId, retryProvider, inboundWire, route.staticPolicy),
     config.cacheRetention,
@@ -777,6 +794,7 @@ export async function retryCodexPoolOnAlternateAccount(
   }
   const request = await retryAdapter.buildRequest(parsed, {
     headers: retryHeaders,
+    providerName: route.providerName,
     translatorBudget: options.translatorBudget,
   });
   recordAdapterReasoning(logCtx, request);
@@ -876,11 +894,12 @@ export async function retryCodexPoolOnAlternateAccount(
           connectMs,
           stream,
           providerFetch(route.provider, options.codexWsRuntimeIdentity, {
+            httpOnly,
             providerName: route.providerName,
             modelId: route.modelId,
             onCodexWsQuota: codexWsQuotaObserver(retryAuthCtx, route.provider, route.modelId),
             beforeDispatch: isCanonicalOpenAiForwardProvider(route.provider)
-              ? createCodexReserveDispatchGuard(retryAuthCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined,
+              ? createCodexAuthDispatchGuard(retryAuthCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined,
           }),
           // Credential-bearing forward send: never follow a redirect into a
           // dead-host rejection after the credential was seen (#914).

@@ -10,6 +10,7 @@ import {
   normalizeNonBlankStringArray,
   normalizeAutoReviewModelOverrides,
   modelCapabilitiesConfigError,
+  contextTierRecordConfigError,
   mergeModelCapabilities,
 } from "../provider-validation";
 import { isValidCodexAccountNamespaceTarget } from "../../codex/account-namespace-match";
@@ -40,7 +41,11 @@ import {
   isHostedToolUnsupportedForModel,
 } from "../../responses/hosted-tool-policy";
 import { getConfigDir } from "../paths";
-import { COMPACTION_TRIGGERS } from "./compaction-triggers";
+import { COMPACTION_TRIGGERS, validCompactionSourceModels } from "./compaction-triggers";
+
+// The chatgptDesktop leaf lives in its own zod-only module so the `ocx chatgpt` command can explain
+// a dropped block without loading this file's provider and account validators.
+export { chatgptDesktopConfigIssue, chatgptDesktopSchema } from "./chatgpt-desktop";
 
 /** One definition of "usable secret", shared by the schema and the warnings. */
 export function isUsableApiKeySecret(value: unknown): value is string {
@@ -49,6 +54,8 @@ export function isUsableApiKeySecret(value: unknown): value is string {
 
 export const compactionRoutingSchema = z.object({
   model: z.string().trim().min(1),
+  sourceModels: z.array(z.string()).refine(validCompactionSourceModels,
+    "sourceModels requires unique exact selectors or provider/* patterns").optional(),
   reasoningEffort: z.string().refine(value => pinnedReasoningEffortConfigError(value) === null).optional(),
   triggers: z.array(z.enum(COMPACTION_TRIGGERS)).nonempty()
     .refine(values => new Set(values).size === values.length, "triggers must not repeat a value")
@@ -92,7 +99,7 @@ export const retryOn429PolicySchema = z.object({
  * both retry layers, so the ceiling is deliberately lower than `retryOn429`'s: 10 total sends
  * against an already-failing provider is already generous.
  */
-const transientRetryOn5xxPolicySchema = z.object({
+export const transientRetryOn5xxPolicySchema = z.object({
   enabled: z.boolean().optional(),
   attempts: z.number().int().min(1).max(10).optional(),
 }).strict();
@@ -280,6 +287,10 @@ const providerNoProxySchema = z.unknown().superRefine((value, ctx) => {
  */
 export const providerConfigSchema = z.object({
   modelCapabilities: modelCapabilitiesSchema.optional(),
+  modelContextTiers: z.unknown().superRefine((value, ctx) => {
+    const error = contextTierRecordConfigError(value);
+    if (error) ctx.addIssue({ code: "custom", message: error });
+  }).optional().transform(value => value as OcxProviderConfig["modelContextTiers"]),
   pinnedReasoningEffort: pinnedReasoningEffortSchema.optional(),
   modelPinnedReasoningEfforts: modelPinnedEffortsSchema.optional(),
   // Validated rather than left to passthrough: an unrecognized strategy would otherwise
@@ -290,6 +301,7 @@ export const providerConfigSchema = z.object({
   autoReviewModelOverrides: autoReviewModelOverridesSchema.optional(),
   adapter: z.string().min(1),
   baseUrl: z.string().min(1),
+  tlsProfile: z.literal("antigravity-browser").optional(),
   alias: z.string().optional(),
   modelAliases: z.record(z.string(), z.string()).optional(),
   modelDisplayNames: modelDisplayNamesSchema.optional(),
@@ -319,6 +331,8 @@ export const providerConfigSchema = z.object({
   modelSupportsServiceTier: z.record(z.string().min(1), z.boolean()).optional(),
   modelSuppressSyntheticMax: z.record(z.string().min(1), z.boolean()).optional(),
   preserveResponsesReasoningContent: z.boolean().optional(),
+  preserveResponsesInputItemIds: z.boolean().optional(),
+  preserveResponsesMessageMetadata: z.boolean().optional(),
   dropResponsesReasoningItems: z.boolean().optional(),
   modelReasoningEffortsAuthoritative: z.boolean().optional(),
   decodesNativeCompactionBlobs: z.boolean().optional(),
@@ -378,6 +392,7 @@ export const providerConfigSchema = z.object({
   // accepted, persisted, and then silently resolved to the `code_mode_only` default — the
   // operator asked for shell mode, got code mode, and was told nothing (#2106).
   codexToolMode: z.enum(["code_mode_only", "shell"]).optional(),
+  projectContext: z.enum(["off", "on"]).optional(),
   responsesItemIdRepair: z.object({
     message: z.array(z.string().min(1)).optional(),
     reasoning: z.array(z.string().min(1)).optional(),
@@ -385,6 +400,7 @@ export const providerConfigSchema = z.object({
     repairInvalidIds: z.boolean().optional(),
   }).strict().optional(),
   responsesSnapshotRepair: z.boolean().optional(),
+  hideRawReasoning: z.boolean().optional(),
   // Invalid blocks degrade to "absent" rather than failing the whole config load: an unusable
   // bridge block must never send an operator through invalid-config recovery for an opt-in
   // feature that is off by default. The management write boundary still rejects it loudly.
@@ -392,7 +408,11 @@ export const providerConfigSchema = z.object({
   xaiResponsesXSearch: z.boolean().optional(),
   xaiResponsesDefaultVersion: z.number().int().positive().optional().catch(undefined),
   zaiResponsesDefaultVersion: z.number().int().positive().optional().catch(undefined),
-}).passthrough();
+}).passthrough().superRefine((provider, ctx) => {
+  if (provider.projectContext !== undefined && provider.adapter !== "command-code") {
+    ctx.addIssue({ code: "custom", path: ["projectContext"], message: "projectContext is supported only by the command-code adapter" });
+  }
+});
 
 
 export { providerRelativeSendPathConfigError } from "../provider-relative-send-path";
@@ -961,6 +981,26 @@ export const clientConnectionSchema = z.object({
 export const codexPoolSchema = z.object({
   excludedPlans: z.array(z.string().trim().min(1)).optional(),
   startIdleWindows: z.boolean().optional(),
+  lowQuotaProtection: z.object({
+    enabled: z.boolean(),
+    threshold: z.number().finite().min(1).max(100),
+    actions: z.object({
+      pause: z.boolean(),
+      notify: z.boolean(),
+    }).strict(),
+    windows: z.object({
+      short: z.boolean(),
+      weekly: z.boolean(),
+    }).strict(),
+  }).strict().superRefine((policy, ctx) => {
+    if (!policy.enabled) return;
+    if (!policy.actions.pause && !policy.actions.notify) {
+      ctx.addIssue({ code: "custom", path: ["actions"], message: "enabled low-quota protection needs an action" });
+    }
+    if (!policy.windows.short && !policy.windows.weekly) {
+      ctx.addIssue({ code: "custom", path: ["windows"], message: "enabled low-quota protection needs a window" });
+    }
+  }).optional(),
 }).strict();
 
 /**
@@ -1028,6 +1068,7 @@ export const quotaResetNotifySchema = z.object({
 
 /**
  * Catalog auto-refresh section (issue #3630).
+ * Missing section or enabled flag uses the hourly default-on scheduler.
  *
  * `.strict()` like its neighbour: a typo in an optional feature section should surface as a
  * rejected write rather than a silently ignored key that leaves the operator believing they

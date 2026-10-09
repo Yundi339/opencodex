@@ -8,6 +8,7 @@ import {
   earliestComboCooldown,
   isComboTargetBreakerOpen,
   isComboTargetInCooldown,
+  snapshotComboQuotaCooldowns as snapshotTargetQuotaCooldowns,
   comboBreakerPolicy,
   comboTargetDeferred,
   isProviderCapacityHeld,
@@ -97,6 +98,17 @@ function targetProviderQuotaExhausted(config: OcxConfig, target: OcxComboTarget,
 
 function targetProviderIsUsable(config: OcxConfig, target: OcxComboTarget, now: number): boolean {
   return targetProviderIsRoutable(config, target) && !targetProviderQuotaExhausted(config, target, now);
+}
+
+/** Capture usable providers' quota cooldowns; request eligibility is deferred to exhaustion. */
+export function snapshotComboQuotaCooldowns(
+  config: OcxConfig,
+  comboId: string,
+  now = Date.now(),
+): Array<{ target: NormalizedComboTarget; cooldownUntil: number }> {
+  const targets = getCombo(config, comboId)?.targets.filter(target =>
+    targetProviderIsUsable(config, target, now)) ?? [];
+  return snapshotTargetQuotaCooldowns(comboId, targets, now);
 }
 
 function quotaWindowExhausted(percent: number | undefined, resetAt: number | undefined, now: number): boolean {
@@ -498,13 +510,28 @@ export function advanceComboAfterFailure(
     status?: number;
     code?: string | null;
     message?: string;
+    /** Account-qualified provider label of the account this failure came from, when a pool resolved one. */
+    failedAccount?: string;
   } = {},
 ): ComboPick | null {
   noteComboFailure(pick.comboId, pick.target, pick.writerGeneration);
   const combo = getCombo(config, pick.comboId);
+  // A 429 from a pooled provider names the ACCOUNT that is spent, not the target. The pool
+  // records that account's own cooldown and rotates past it, so cooling the target here blacks
+  // out the accounts that still answer: on 2026-09-28 one Anthropic account replied
+  // `Retry-After: 318747` (88.5h) and anthropic/claude-opus-5-5 left selection for four hours
+  // while four of five accounts still returned 200.
+  //
+  // Only a pool-resolved account qualifies, and an unidentified account still cools the target --
+  // including the pool's OWN "all accounts are cooled" 429, which refuses locally before it picks
+  // one. That is what keeps this from trading a blackhole for a hammer: when nothing else is
+  // holding the target back, the target cooldown still does.
+  const accountScoped = options.cooldownScope === "target"
+    && options.status === 429
+    && options.failedAccount !== undefined;
   // "none" records no cooldown at all: the failure described the request, not the target, so
   // the target must stay immediately selectable for the next (differently shaped) request.
-  if (options.cooldownScope !== "none") {
+  if (options.cooldownScope !== "none" && !accountScoped) {
     const cooldownTargets = options.cooldownScope === "provider" && combo
       ? combo.targets.filter(target => target.provider === pick.target.provider)
       : [pick.target];

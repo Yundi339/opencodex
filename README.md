@@ -16,6 +16,35 @@ each threshold, and how to rebase it onto a newer upstream release live in
 
 ## Install
 
+Installs come from this fork's own releases, and one command is enough:
+
+```bash
+npm install -g https://github.com/skyhua0224/opencodex/releases/latest/download/opencodex-skyhua.tgz
+ocx setup
+ocx start
+```
+
+That URL is the newest release's tarball: `releases/latest/download` follows the same
+non-prerelease channel `ocx update` uses, and every cut attaches the package under that version-free
+name next to its `opencodex-<version>.tgz`. The tarball bundles its own Bun runtime, so the machine
+needs nothing beyond `npm`/Node; the package keeps the upstream scope name
+(`@bitkyc08/opencodex`), which is why the command names a file instead of a registry package.
+
+To pin an exact cut instead, copy the tag from the Releases page -- the asset is
+`opencodex-<version>.tgz`:
+
+```bash
+npm install -g https://github.com/skyhua0224/opencodex/releases/download/v<version>/opencodex-<version>.tgz
+```
+
+An installed copy updates itself from the same releases with `ocx update` (`--tag preview` follows
+prereleases), and `OCX_UPDATE_SPEC` is the hook for publishing under another npm scope or registry
+later without touching code. Remove an install with `ocx uninstall`, then
+`npm uninstall -g @bitkyc08/opencodex`.
+
+Working on the fork itself instead — clone, then install from the checkout, and pull the same way
+afterwards:
+
 ```bash
 git clone https://github.com/skyhua0224/opencodex.git
 cd opencodex
@@ -192,7 +221,7 @@ Sol drives the session and calls a Kimi K3 subagent.
 </table>
 
 <p align="center">
-  <a href="README.md">English</a> · <a href="readme/README.fr.md">Français</a> · <a href="readme/README.ko.md">한국어</a> · <a href="readme/README.zh-CN.md">简体中文</a> · <a href="readme/README.zh-TW.md">繁體中文</a> · <a href="readme/README.ru.md">Русский</a> · <a href="readme/README.ja.md">日本語</a> · <a href="readme/README.tr.md">Türkçe</a> · 📖 <a href="https://opencodex.me/"><b>Full documentation →</b></a>
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · 📖 <a href="https://opencodex.me/"><b>Full documentation →</b></a>
 </p>
 
 opencodex is a lightweight local proxy that translates Codex's Responses API into whatever your
@@ -271,6 +300,10 @@ See [SPONSORS.md](./SPONSORS.md).
 <tr>
 <td width="180"><a href="https://www.packyapi.com/register?aff=k5KT"><img src="assets/sponsors/packycode.png" alt="PackyCode" width="150"></a></td>
 <td>Thanks to <a href="https://www.packyapi.com/register?aff=k5KT">PackyCode</a> for sponsoring this project! PackyCode is a stable, high-performance API relay provider, offering relay services for Claude Code, Codex, Gemini, and more. With automatic failover, smart routing, and unlimited concurrency, it turns AI into a real productivity tool. <a href="https://www.packyapi.com/register?aff=k5KT">Register via this link</a> and get started! Pick <code>PackyCode</code> in the Add provider picker or run <code>ocx provider add packycode</code>.<br><sub>PackyCode 是一家稳定、高效的 API 中转服务商，提供 Claude Code、Codex、Gemini 等多种中转服务。具备自动故障转移、智能路由和无限并发等多种功能，让 AI 编程成为真正的生产力工具。<a href="https://www.packyapi.com/register?aff=k5KT">点此链接注册</a>，立即开始使用！</sub></td>
+</tr>
+<tr>
+<td width="180"><a href="https://tokenlab.sh/r/OPENCODEX"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/sponsors/tokenlab-dark.png"><img src="assets/sponsors/tokenlab-light.png" alt="TokenLab" width="150"></picture></a></td>
+<td>Thanks to <a href="https://tokenlab.sh/r/OPENCODEX">TokenLab</a> for sponsoring this project! TokenLab gives coding agents one API key for leading models, supporting OpenAI Responses and Chat Completions, Anthropic Messages, and Gemini's native API formats, with streaming and tool calling. It also provides an MCP server and agent Skills for easy integration. Choose your delivery mode and pay as you go. Pick <code>TokenLab</code> in the Add provider picker or run <code>ocx provider add tokenlab</code>.<br><sub>TokenLab 为编程智能体提供统一的多模型 API，一枚 API Key 即可接入主流模型，支持 OpenAI Responses、Chat Completions、Anthropic Messages 和 Gemini 原生 API 格式，以及流式输出和工具调用。同时提供 MCP 服务器和 Agent Skills，方便接入现有工作流；交付模式可选，按量付费。</sub></td>
 </tr>
 </tbody>
 </table>
@@ -474,12 +507,17 @@ network failures, or invalid decisions fail open to the first currently eligible
 cancellation still cancels the request. Automated tests use a mocked TypeSafe endpoint and do not
 validate a live JEV account.
 
+A JEV Combo can instead ask a self-hosted decision model, such as Ollama's keyless `tev1`: add a
+`jev-decision` provider whose `baseUrl` is the full `/v1/systemone` endpoint and set the Combo's
+`decisionProvider` to it. TypeSafe credentials are never sent there. Details:
+[System One-compatible server](https://opencodex.me/guides/combos/#system-one-compatible-server).
+
 ## Providers & adapters
 
 <!-- sponsors:main-first-mention -->
 OpenAI (ChatGPT login or API key), Anthropic, Google Gemini, xAI, Kimi, Azure OpenAI, Ollama
 (local + Cloud), Cursor (experimental), and every OpenAI-compatible endpoint — plus DeepSeek,
-Groq, OpenRouter, Together, Fireworks, Cerebras, Mistral, Hugging Face, NVIDIA NIM, MiniMax,
+Groq, OpenRouter, OpenGateway, Together, Fireworks, Cerebras, Mistral, Hugging Face, NVIDIA NIM, MiniMax,
 Qwen Cloud, Qoder Global and CN (official PAT + CLI), SiliconFlow, and more. Full list: `ocx init` or the
 [provider docs](https://opencodex.me/guides/providers/).
 
@@ -580,6 +618,53 @@ See **[Contributing](./CONTRIBUTING.md)**.
 Contributor work that landed through a maintainer carry or reimplementation,
 where the commit does not name its original author, is recorded in
 **[CREDITS.md](./CREDITS.md)**.
+
+## Cutting a release
+
+Versions are `<upstream base>-skyhua.<n>` and the asset is named after the version, so
+`v2.69.0-skyhua.7` publishes `opencodex-2.69.0-skyhua.7.tgz`. Pack through
+`tools/fork-release-pack.sh` rather than a bare `npm pack`: the dashboard lives in `gui/dist`,
+which the repository does not track, and the script builds it when missing, refuses to hand out a
+tarball without it, and prints the digest. [FORK-NOTES.md](./FORK-NOTES.md) §12 carries the rest of
+the reasoning.
+
+```bash
+# 1. version and commit
+$EDITOR package.json                       # "version": "<base>-skyhua.<n>"
+git commit -am "release: <base>-skyhua.<n>"
+git push origin main && git push github main
+
+# 2. pack (builds gui/dist when missing; refuses a tarball without it)
+tools/fork-release-pack.sh /tmp/ocx-pack
+
+# 3. tag both mirrors
+git tag -a v<base>-skyhua.<n> -m "<what changed>"
+git push origin v<base>-skyhua.<n>         # gitea-lan
+git push github v<base>-skyhua.<n>         # github
+
+# 4. publish, with the tarball attached
+gh release create v<base>-skyhua.<n> -R skyhua0224/opencodex --latest \
+  --title "v<base>-skyhua.<n>" --notes-file /tmp/notes.md \
+  /tmp/ocx-pack/opencodex-<version>.tgz /tmp/ocx-pack/opencodex-skyhua.tgz
+```
+
+Four properties of the cut are load-bearing, and each fails quietly: the release must carry the
+tarball (`ocx update` reads its digest, and a release without it leaves every installed copy where
+it is), the version-free alias `opencodex-skyhua.tgz` must ride along (it is what the one-command
+install above resolves through `releases/latest/download`), it must be a normal release rather than
+a prerelease (`--latest` skips prereleases, so `ocx update` would not see it), and the tarball must
+contain the built dashboard. `tools/fork-release-pack.sh` writes both assets and prints the command
+to attach them. Verify the cut the way a user would:
+
+```bash
+npm install -g "https://github.com/skyhua0224/opencodex/releases/download/v<version>/opencodex-<version>.tgz"
+ocx --version                                # prints <version>
+curl -s http://127.0.0.1:10100/ | head -c 15 # "<!doctype html>" means the dashboard shipped
+```
+
+The tag alone reaches Gitea over SSH; its release object answers API calls with "Only signed in
+user is allowed to call APIs" unless an admin token is passed, so a Gitea release needs that token
+or a couple of clicks on the tag page.
 
 ## Disclaimer
 
