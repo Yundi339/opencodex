@@ -511,6 +511,7 @@
       "documents": [
         "src/lib/",
         "src/server/",
+        "src/service/",
         "src/service-manager-probe.ts",
         "src/sidecar/",
         "src/update/"

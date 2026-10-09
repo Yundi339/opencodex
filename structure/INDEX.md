@@ -162,7 +162,7 @@ A source area can be described by more than one doc, because these docs are orga
 | `src/server/management/companion-routes.ts` | [`desktop-shell.md`](desktop-shell.md) |
 | `src/service-manager-probe.ts` | [`ops/service-and-sidecars.md`](ops/service-and-sidecars.md) |
 | `src/service.ts` | [`runtime.md`](runtime.md)<br>[`ops/docs-and-release.md`](ops/docs-and-release.md) |
-| `src/service/` | [`runtime.md`](runtime.md) |
+| `src/service/` | [`runtime.md`](runtime.md)<br>[`ops/service-and-sidecars.md`](ops/service-and-sidecars.md) |
 | `src/sidecar/` | [`ops/service-and-sidecars.md`](ops/service-and-sidecars.md) |
 | `src/stall-timeout.ts` | [`runtime.md`](runtime.md) |
 | `src/storage/` | [`runtime.md`](runtime.md) |
