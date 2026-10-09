@@ -794,10 +794,10 @@ export const SLOW_SHED_ATTEMPT_MS = 25_000;
  * does not apply to this class, exactly as it does not for capacity.
  *
  * Paced rather than immediate: the limiter counts requests in a window, so resending on the same
- * second spends another request against the same window. Three rungs keep a turn alive for half a
- * minute without turning one rejection into a burst.
+ * second spends another request against the same window. Four rungs keep a turn alive for about
+ * ninety seconds without turning one rejection into a burst.
  */
-export const RATE_LIMIT_RETRY_DELAYS_MS: readonly number[] = [2_000, 8_000, 20_000];
+export const RATE_LIMIT_RETRY_DELAYS_MS: readonly number[] = [2_000, 8_000, 20_000, 45_000];
 
 /** Longest `Retry-After` honoured on a 429 before the answer is handed back untouched. */
 export const RATE_LIMIT_RETRY_AFTER_CEILING_MS = 60_000;
