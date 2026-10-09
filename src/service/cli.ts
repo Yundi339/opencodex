@@ -23,6 +23,7 @@ import type { ServiceBackend } from "./state";
 import { unitPath } from "./systemd";
 import { inspectWindowsSchedulerServiceStatus, schtasksErrorDetail, probeWindowsSchedulerTask } from "./windows-scheduler";
 import type { WindowsSchedulerTaskProbe } from "./windows-scheduler";
+import { killWindowsServiceWrapperProcesses, stopWindows } from "./windows-ops";
 import { win32 } from "node:path";
 import { serviceDiagnosticsSummary } from "./diagnostics";
 import { runServiceClaim } from "./claim";
@@ -249,6 +250,18 @@ export async function serviceCommand(...args: (string | undefined)[]): Promise<v
     // existing registration had been restarted, not repaired (#4914).
     let repairError: unknown;
     try {
+      // Task Scheduler's /end stops the task instance but its cmd/wscript wrapper can survive
+      // and leave the old Bun child listening. Reclaim that child before repair rewrites assets
+      // or starts the task again, otherwise restart reports success while serving old code.
+      const repairBackend = parsed.backend ?? (process.platform === "win32" ? readServiceBackend() : "scheduler");
+      if (process.platform === "win32" && repairBackend === "scheduler") {
+        const scheduler = probeWindowsSchedulerTask(TASK);
+        if (scheduler.status === "present") {
+          try { stopWindows(); } catch { /* repairService re-verifies the registration */ }
+          try { killWindowsServiceWrapperProcesses(); } catch { /* tracked cleanup below still runs */ }
+          await stopTrackedProxyForServiceCommand();
+        }
+      }
       await repairService({ verb });
     } catch (error) {
       repairError = error;
