@@ -840,17 +840,6 @@ export async function preparePassthroughExchange(
       transientSendPolicy()?.attempts,
       sendBudgetState.sendsUsed,
     );
-    /**
-     * The canonical forward capacity ladder is additional to the ordinary transient budget.
-     * When no `transientRetryOn5xx` policy exists, the ordinary cap is therefore zero, but the
-     * current leg still needs one base slot before `fetchWithTransientRetry` can enter its
-     * capacity-only deferrals. Passing zero used to make that helper throw before it inspected
-     * the 502/503/504 ladder, which is why native forward failures were logged with sendCount=1.
-     */
-    const transientAttemptsForCurrentLeg = (): number => {
-      const remaining = remainingTransientSendBudget(transientSendAttempts());
-      return capacityAbsorbDelays(route.provider)?.length ? Math.max(1, remaining) : remaining;
-    };
     const configuredTransientSendBudgetExhausted = (): boolean =>
       transientSendPolicy() !== null && transientSendAttempts() === 0;
     /**
@@ -1097,7 +1086,7 @@ export async function preparePassthroughExchange(
             .then(adoptObservedResponse);
         },
         { abortSignal: upstream.signal, label: safeHostLabel(request.url),
-          attempts: transientAttemptsForCurrentLeg(), onSendsConsumed: noteTransientSends,
+          attempts: remainingTransientSendBudget(transientSendAttempts()), onSendsConsumed: noteTransientSends,
           claimAmbiguousResend: claimPreHeaderResend,
           // The FIRST send of a native request needs the capacity ladder too. It was missing here
           // while the four recovery legs already had it, and the consequence was exact: a native
@@ -1367,7 +1356,7 @@ export async function preparePassthroughExchange(
             ).then(adoptObservedResponse);
           },
           { abortSignal: upstream.signal, label: safeHostLabel(request.url),
-            attempts: transientAttemptsForCurrentLeg(),
+            attempts: remainingTransientSendBudget(transientSendAttempts()),
             onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend,
             // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
             // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
@@ -1500,7 +1489,7 @@ export async function preparePassthroughExchange(
               route.provider.authMode === "forward")
               .then(adoptObservedResponse);
           },
-          { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: transientAttemptsForCurrentLeg(),
+          { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: remainingTransientSendBudget(transientSendAttempts()),
             onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend,
             // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
             // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
@@ -1640,7 +1629,7 @@ export async function preparePassthroughExchange(
               route.provider.authMode === "forward")
               .then(adoptObservedResponse);
           },
-          { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: transientAttemptsForCurrentLeg(),
+          { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: remainingTransientSendBudget(transientSendAttempts()),
             onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend,
             // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
             // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
