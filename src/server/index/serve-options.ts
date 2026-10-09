@@ -40,6 +40,7 @@ import {
 import { websocketsEnabled } from "../../config";
 import { metricsExportEnabled } from "../../config/feature-flags";
 import { grokDefaultReasoningEffort } from "../../grok/effort";
+import { gateRoutedModelsToVisibleRows } from "../../providers/new-model-policy";
 import { OPENAI_CODEX_PROVIDER_ID } from "../../providers/openai-tiers";
 import { providerCodexAccountMode } from "../../providers/registry";
 import {
@@ -977,7 +978,10 @@ export function createServeOptions(ctx: ServeOptionsContext) {
           desktopNativeCandidates: desktopVisibleNativeSlugs(config),
         });
         const desktopNativeSlugs = desktopInputs.nativeSlugs;
-        const goOrdered = desktopInputs.routedModels;
+        // The picker must not outrun the dashboard: a discovery id the new-model policy has
+        // not reconciled (or that the operator disabled) stays out of every client list here,
+        // exactly as the on-disk sync already treats it.
+        const goOrdered = gateRoutedModelsToVisibleRows(config, desktopInputs.routedModels);
         // Claude Code / Claude Desktop gateway model discovery (GET /v1/models with
         // Anthropic-style headers; 003 G1-G8 + devlog 131). Entries use the official
         // ModelInfo shape incl. capabilities (effort ladder / thinking) — Desktop 3P can
