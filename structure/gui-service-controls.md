@@ -46,8 +46,10 @@ spawns.
 `durableBunRuntime()` at report time answers "what would this process pick right now", which is
 a different question from "what was the service started with" — and the two diverge exactly when
 the answer matters, such as a `doctor` run in a shell whose `OPENCODEX_BUN_PATH` differs from the
-installed service's. Read-back goes through `reportedBunRuntimeSource()`, which allowlists the
-three values and returns `undefined` for anything else.
+installed service's. Read-back goes through `reportedBunRuntimeSource()`: the value is returned
+only when the allowlisted source is paired with a recorded `OCX_BUN_RUNTIME_PATH` that names this
+process's own executable, and `undefined` in every other case — an allowlisted source value
+alone proves nothing.
 
 **Backward compatibility: absent is a real answer.** A service installed before this marker
 existed reports no provenance, the endpoint omits the field, and consumers must say the origin is

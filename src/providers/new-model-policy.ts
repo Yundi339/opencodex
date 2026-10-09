@@ -1,3 +1,4 @@
+import { COMBO_NAMESPACE } from "../combos";
 import type { OcxConfig } from "../types";
 import { routedSlug, slugEquals } from "./slug-codec";
 import {
@@ -113,6 +114,10 @@ export function applyNewModelPolicy(options: {
   };
 }
 
+/**
+ * The provider's explicit new-model choice wins; an absent choice inherits the global
+ * discovery policy, which itself defaults to on.
+ */
 export function effectiveNewModelPolicy(
   config: Pick<OcxConfig, "modelDiscovery" | "providers">,
   provider: string,
@@ -143,7 +148,7 @@ export interface RoutedVisibilityRow {
  * baseline has never met is not offered yet.
  */
 export function gateRoutedModelsToVisibleRows<T extends RoutedVisibilityRow>(
-  config: Pick<OcxConfig, "disabledModels" | "modelDiscovery" | "providers">,
+  config: Pick<OcxConfig, "combos" | "disabledModels" | "modelDiscovery" | "providers">,
   rows: readonly T[],
 ): T[] {
   const disabled = new Set(config.disabledModels ?? []);
@@ -152,7 +157,11 @@ export function gateRoutedModelsToVisibleRows<T extends RoutedVisibilityRow>(
     if (disabled.has(`${row.provider}/${row.id}`) || disabled.has(row.id)) return false;
     const selected = config.providers[row.provider]?.selectedModels;
     if (selected?.length && !selected.includes(row.id)) return false;
-    if (effectiveNewModelPolicy(config, row.provider) === "off") {
+    // A configured combo has no provider discovery behind it, so no baseline ever meets it:
+    // the off-policy known-model check must not sweep it away with unreconciled arrivals.
+    const configuredCombo = row.provider === COMBO_NAMESPACE
+      && !!config.combos && Object.hasOwn(config.combos, row.id);
+    if (effectiveNewModelPolicy(config, row.provider) === "off" && !configuredCombo) {
       const known = config.modelDiscovery?.knownModels?.[row.provider]?.ids ?? [];
       if (!known.includes(row.id)) return false;
     }

@@ -1026,7 +1026,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
         if (wantsAnthropicList && !url.searchParams.has("client_version")) {
           if (wantsDesktopConfig) {
             const models = config.claudeCode?.enabled === false ? [] : generateDesktop3pModels(
-              desktopInputs.nativeSlugs, desktopInputs.routedModels,
+              desktopInputs.nativeSlugs, goOrdered,
               config.claudeCode?.desktopProfile, desktopInputs.nativeContextCap,
             );
             const response = jsonResponse({ version: 1, models }, 200, req, policy);
@@ -1037,7 +1037,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
           // Build Desktop 3P registry so inbound alias resolution works for subsequent requests.
           buildDesktop3pRegistry(
             desktopNativeSlugs,
-            desktopInputs.routedModels,
+            goOrdered,
             config.claudeCode?.desktopProfile,
             desktopInputs.nativeContextCap,
           );

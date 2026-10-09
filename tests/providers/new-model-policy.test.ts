@@ -38,7 +38,19 @@ describe("new-model policy", () => {
     const gated = gateRoutedModelsToVisibleRows(config, [
       row("zai", "glm-5.3"), row("zai", "glm-5.3-flash"), row("zai", "glm-5.2"),
     ]);
-    expect(gated.map(r => r.id)).toEqual(["glm-5.3", "glm-5.3-flash"]);
+  expect(gated.map(r => r.id)).toEqual(["glm-5.3", "glm-5.3-flash"]);
+  });
+
+  test("a configured combo stays visible under an off policy with no combo baseline", () => {
+    const config = gateConfig({
+      modelDiscovery: { newModelPolicy: "off" },
+      providers: {},
+      combos: { fastlane: { strategy: "standard" } },
+    });
+    const gated = gateRoutedModelsToVisibleRows(config, [
+      row("combo", "fastlane"),
+    ]);
+    expect(gated.map(r => r.id)).toEqual(["fastlane"]);
   });
   test("bootstraps without hiding the existing catalog", () => {
     const r = applyNewModelPolicy({ provider: "openrouter", discoveredIds: ["a", "b"], policy: "off", now });
