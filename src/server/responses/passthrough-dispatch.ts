@@ -132,6 +132,7 @@ import {
   isOpenCodeGoDestination,
   rateLimitRetryPolicyFor,
   rateLimitRetryDelayMs,
+  resetReplayPolicyFor,
   transientRetryPolicyFor,
 } from "../../providers/key-failover";
 import type { AttemptRecoveryKind } from "../../usage/log";
@@ -840,6 +841,13 @@ export async function preparePassthroughExchange(
       transientSendPolicy()?.attempts,
       sendBudgetState.sendsUsed,
     );
+    // The reset-replay grant rides on top of the transient budget: a replacement the
+    // ambiguous-resend gate authorizes draws one of these sends, so the operator-configured
+    // grant is actually spendable instead of being refused by a budget that never funded it.
+    const visibleSendAttempts = (): number => (isCanonicalOpenAiForwardProvider(route.provider)
+      ? remainingTransientSendBudget(transientSendAttempts())
+        + (resetReplayPolicyFor(route.provider)?.replacements ?? 0)
+      : remainingTransientSendBudget(transientSendAttempts()));
     const configuredTransientSendBudgetExhausted = (): boolean =>
       transientSendPolicy() !== null && transientSendAttempts() === 0;
     /**
@@ -1086,7 +1094,7 @@ export async function preparePassthroughExchange(
             .then(adoptObservedResponse);
         },
         { abortSignal: upstream.signal, label: safeHostLabel(request.url),
-          attempts: remainingTransientSendBudget(transientSendAttempts()), onSendsConsumed: noteTransientSends,
+          attempts: visibleSendAttempts(), onSendsConsumed: noteTransientSends,
           claimAmbiguousResend: claimPreHeaderResend,
           // The FIRST send of a native request needs the capacity ladder too. It was missing here
           // while the four recovery legs already had it, and the consequence was exact: a native
@@ -1356,7 +1364,7 @@ export async function preparePassthroughExchange(
             ).then(adoptObservedResponse);
           },
           { abortSignal: upstream.signal, label: safeHostLabel(request.url),
-            attempts: remainingTransientSendBudget(transientSendAttempts()),
+            attempts: visibleSendAttempts(),
             onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend,
             // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
             // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
@@ -1489,7 +1497,7 @@ export async function preparePassthroughExchange(
               route.provider.authMode === "forward")
               .then(adoptObservedResponse);
           },
-          { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: remainingTransientSendBudget(transientSendAttempts()),
+          { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: visibleSendAttempts(),
             onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend,
             // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
             // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
@@ -1629,7 +1637,7 @@ export async function preparePassthroughExchange(
               route.provider.authMode === "forward")
               .then(adoptObservedResponse);
           },
-          { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: remainingTransientSendBudget(transientSendAttempts()),
+          { abortSignal: upstream.signal, label: safeHostLabel(request.url), attempts: visibleSendAttempts(),
             onSendsConsumed: noteTransientSends, claimAmbiguousResend: claimPreHeaderResend,
             // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
             // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
@@ -1974,7 +1982,7 @@ export async function preparePassthroughExchange(
           {
             abortSignal: upstream.signal,
             label: safeHostLabel(request.url),
-            attempts: remainingTransientSendBudget(transientSendAttempts()),
+            attempts: visibleSendAttempts(),
             // The whole decision, including the stage the preflight observed and the grant the
             // pre-header helper shares. A committed stage refuses here without touching the
             // allowance, which is what keeps a turn that already emitted output from draining
