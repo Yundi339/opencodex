@@ -419,7 +419,14 @@ export async function prepareAdapterExchange(
               onSendsConsumed: noteTransientSends,
             }
             : canonicalForwardRow
-              ? { attempts: 1, onSendsConsumed: noteTransientSends }
+              ? {
+                // The reset-replay grant rides INSIDE this budget: a replacement the gate
+                // authorizes draws one of these sends, so the grant the operator configured
+                // is actually spendable instead of being refused by a reset-only budget of
+                // one. Rows without retryOnReset keep the historical single send.
+                attempts: 1 + (resetReplayPolicyFor(route.provider)?.replacements ?? 0),
+                onSendsConsumed: noteTransientSends,
+              }
               : {}),
           ...(canonicalForwardRow
             ? { retrySlowCapacity: true, retryCapacityDeferralsMs: CAPACITY_RETRY_DELAYS_MS }
