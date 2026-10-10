@@ -123,6 +123,7 @@ import {
   prepareSameTarget429Wait,
   sleepWithAbort,
 } from "../../lib/upstream-retry";
+import { capacityLadderDelays } from "../../lib/capacity-ladder";
 import { mapCodexAuthContextErrorToResponse } from "./codex-auth-error";
 import { classifyTransportFailureKind, transportErrorCode } from "../../lib/upstream-reachability";
 import { recordCodexUpstreamOutcome } from "../../codex/routing";
@@ -240,6 +241,10 @@ function applyResponseGuards(
 }
 
 function capacityAbsorbDelays(provider: OcxProviderConfig): readonly number[] | undefined {
+  // The operator ladder replaces the rung list for every provider it covers: a shed
+  // window does not care which model a session pinned, and the opt-in is explicit.
+  const operatorLadder = capacityLadderDelays();
+  if (operatorLadder !== null) return operatorLadder;
   if (isCanonicalOpenAiForwardProvider(provider)) return CAPACITY_RETRY_DELAYS_MS;
   return process.env.OCX_CAPACITY_ABSORB_ALL === "1" ? CAPACITY_RETRY_DELAYS_MS : undefined;
 }

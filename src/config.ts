@@ -16,6 +16,7 @@ import {
 } from "./config/rebase-provenance";
 import { getConfigDir, getConfigPath, hardenConfigDir } from "./config/paths";
 import { configureResetStorm } from "./lib/reset-storm";
+import { configureCapacityLadder } from "./lib/capacity-ladder";
 export { DEFAULT_SUBAGENT_MODELS } from "./config/subagent-models";
 export {
   AtomicWriteResidualTempError,
@@ -335,6 +336,7 @@ export function loadConfig(): OcxConfig {
   // idempotent, and called on every read so a live config save takes effect without a
   // restart -- including the reset-to-default paths, which must disarm a configured storm.
   configureResetStorm(config.resetStorm);
+  configureCapacityLadder(config.capacityRetry);
   return config;
 }
 

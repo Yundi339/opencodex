@@ -48,6 +48,7 @@ import {
   prepareSameTarget429Wait,
   sleepWithAbort,
 } from "../../lib/upstream-retry";
+import { capacityLadderDelays } from "../../lib/capacity-ladder";
 import { describeUpstreamConnectFailure } from "./upstream-error";
 import type { OpaqueBlobRecoveryGuard } from "./core-opaque-recovery";
 import type { AttemptRecoveryKind } from "../../usage/log";
@@ -429,7 +430,7 @@ export async function prepareAdapterExchange(
               }
               : {}),
           ...(canonicalForwardRow
-            ? { retrySlowCapacity: true, retryCapacityDeferralsMs: CAPACITY_RETRY_DELAYS_MS }
+            ? { retrySlowCapacity: true, retryCapacityDeferralsMs: capacityLadderDelays() ?? CAPACITY_RETRY_DELAYS_MS }
             : {}),
         },
       );

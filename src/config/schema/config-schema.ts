@@ -118,6 +118,13 @@ export const configSchema = z.object({
     maxConcurrentReplacements: z.number().int().min(1).max(16).optional(),
     queueDeadlineMs: z.number().int().min(250).max(120000).optional(),
   }).strict().optional().catch(undefined),
+  // Operator-extensible capacity-absorption ladder (src/lib/capacity-ladder.ts): extra
+  // paced resends of the SAME turn so a session rides out a longer shed window instead
+  // of stopping. Malformed hand edits degrade to the built-in measured ladder.
+  capacityRetry: z.object({
+    enabled: z.boolean().optional(),
+    delaysMs: z.array(z.number().int().min(1000).max(600000)).min(1).max(8).optional(),
+  }).strict().optional().catch(undefined),
   // Kept raw on purpose: `.catch(undefined)` would turn a mistyped `enabled` into "inherit",
   // which can reopen a surface the operator meant to close. src/protocols/settings.ts parses it
   // and fails closed instead.

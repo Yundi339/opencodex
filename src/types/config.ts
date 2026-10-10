@@ -1,6 +1,7 @@
 import type { OcxProviderConfig } from "./provider";
 import type { CodexAccount } from "./accounts";
 import type { ResetStormConfig } from "../lib/reset-storm";
+import type { CapacityRetryConfig } from "../lib/capacity-ladder";
 
 export interface AnthropicModelRoute {
   name: string;
@@ -517,6 +518,8 @@ export interface OcxConfig {
   metricsExport?: { enabled?: boolean };
   /** Cross-lane connection-reset storm coordination for reset-replacement sends. */
   resetStorm?: ResetStormConfig;
+  /** Operator-extensible capacity-absorption ladder for weight-shaped shed windows. */
+  capacityRetry?: CapacityRetryConfig;
   /** Opt in to one identical-turn retry when a Responses completion has no text or tool call. */
   emptyCompletionRetry?: boolean;
   /** Suppress allowlisted client-facing Codex transport hints; provider enforcement is unchanged. */
