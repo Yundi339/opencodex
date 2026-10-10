@@ -217,12 +217,15 @@ describe("fetchWithResetRetry storm coordination", () => {
       const ordinal = (laneSends.get(lane) ?? 0) + 1;
       laneSends.set(lane, ordinal);
       const isReplacement = ordinal >= 2;
-      if (isReplacement) {
+      // Only sends under a still-active storm are gated; after the lift the remaining
+      // lanes intentionally proceed ungated, so they must not count against the cap.
+      const gated = isReplacement && coordinator.stormActive("upstream.test");
+      if (gated) {
         replacementInFlight += 1;
         replacementPeak = Math.max(replacementPeak, replacementInFlight);
       }
       await new Promise(resolve => setTimeout(resolve, 10));
-      if (isReplacement) replacementInFlight -= 1;
+      if (gated) replacementInFlight -= 1;
       successfulSends += 1;
       if (successfulSends <= 4) throw resetError();
       return new Response("ok", { status: 200 });
