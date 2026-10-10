@@ -83,7 +83,7 @@ export interface ResetReplayPolicy {
   enabled?: boolean;
   /**
    * Replacement sends one LOGICAL request may make, across every leg and every combo child
-   * (1..2, default 1).
+   * (1..4, default 1).
    *
    * Not a per-leg retry count and not a send budget. A request that resets before the head and
    * again after it draws on this one number, and each replacement still has to fit inside the
