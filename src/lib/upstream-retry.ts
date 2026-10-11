@@ -509,6 +509,17 @@ export interface ResetRetryOptions {
   /** Total upstream sends allowed, including the first one. Not a per-layer retry count. */
   attempts?: number;
   /**
+   * Paced waits for an upstream 429, as the waits before each resend.
+   *
+   * Paces the outer transient lane 429 lane AND the one place the reset layer itself
+   * re-sends: an operator replacement that is answered 429 (measured 2026-10-11 15:35-18:29:
+   * reset -> operator replacement -> 429 settled as the replay refusal, five turns dead). A 429
+   * proves the replacement never ran, so before the refusal settles it is absorbed here, each
+   * resend drawing the operator replacement grant. Absent or empty keeps 429 exactly as it
+   * was -- settled as the refusal.
+   */
+  retryRateLimitDeferralsMs?: readonly number[];
+  /**
    * Reports how many upstream sends this call actually consumed, so a caller that spans
    * several legs of one request (initial send, then a 429/account-recovery refetch) can
    * keep them on ONE budget instead of handing each leg a fresh one.
@@ -573,6 +584,9 @@ export interface TransientRetryOptions extends ResetRetryOptions {
    * means the origin is busy, a 429 means this requester is over a limit. Both arrive before
    * anything has run, both are spent as ADDITIONAL sends, and neither widens `attempts`. An empty
    * list keeps 429 exactly as it was -- a non-transient status the caller owns.
+    *
+    * Declared on {@link ResetRetryOptions}: the same list also paces the reset layer own
+    * replacement-429 absorption.
    */
   retryRateLimitDeferralsMs?: readonly number[];
   /**
@@ -699,6 +713,8 @@ export async function fetchWithResetRetry(
   // settles as the refusal or an unambiguous answer: a second send of a possibly-executed turn
   // is already out, and handing the client anything it would retry compounds it.
   let spentOperatorReplacement = false;
+  /** Paced 429 absorbs spent on the operator replacement own answer, across the whole call. */
+  let replacement429Absorbs = 0;
   // One stable identity per leg (see ResetRetryOptions.stormLaneId), and the same origin
   // label the retry warn log prints as the coordination scope.
   const stormLane = opts.stormLaneId ?? "leg-" + String(resetStormLegCounter++);
@@ -727,7 +743,28 @@ export async function fetchWithResetRetry(
       // send under an active storm counts as the probe that lifts it for every queued lane.
       resetStorm().noteSendSuccess(stormScope);
       stormGate?.release();
-      return spentOperatorReplacement ? settleOperatorReplacement(response) : response;
+      if (!spentOperatorReplacement) return response;
+      const replacementDelays = opts.retryRateLimitDeferralsMs ?? [];
+      let res = response;
+      while (res.status === 429 && replacement429Absorbs < replacementDelays.length) {
+        if (opts.abortSignal?.aborted || opts.claimAmbiguousResend?.() !== true) break;
+        const instructed = retryAfterDelayMs(res.headers);
+        if (instructed !== undefined && instructed > RETRY_AFTER_CEILING_MS) break;
+        const waitMs = instructed ?? replacementDelays[replacement429Absorbs]!;
+        replacement429Absorbs += 1;
+        console.warn(
+          "[upstream-retry] operator replacement answered 429 -- absorbing: waiting " + waitMs + "ms before resend (" + replacement429Absorbs + "/" + replacementDelays.length + ")",
+        );
+        cancelResponseBodyBestEffort(res);
+        await sleepWithAbort(waitMs, opts.abortSignal);
+        const absorbGate = await resetStorm().acquireReplacementSlot(stormScope, opts.abortSignal);
+        if (absorbGate === "defer") return settleOperatorReplacement(res);
+        opts.onSendsConsumed?.(1);
+        res = await doFetch();
+        resetStorm().noteSendSuccess(stormScope);
+        absorbGate?.release();
+      }
+      return settleOperatorReplacement(res);
     } catch (err) {
       stormGate?.release();
       if (opts.abortSignal?.aborted) throw err;
