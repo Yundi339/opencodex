@@ -18,6 +18,7 @@
 import { withSsePreludeDeclineRetry } from "./sse-prelude-retry";
 
 import { clearableDeadline } from "./abort";
+import { BOUNDED_BODY_MAX_BYTES, BOUNDED_BODY_TIMEOUT_MS, readBoundedResponseBytes } from "./bounded-body";
 import { redactSecretString } from "./redact";
 import { resetStorm } from "./reset-storm";
 
@@ -226,7 +227,10 @@ const TRANSIENT_RETRY_SLOW_ATTEMPT_MS = 15_000;
  * Upstream statuses treated as transient: gateway errors and Cloudflare 52x.
  * 500 is included per the OpenAI SDK default (auto-retries >=500; Tier-2 proven in
  * devlog/260716_ocx_claude_sol_502_midstream/02). 507 was observed in the 48h ledger
- * but is deliberately excluded (storage-class, not gateway-transient).
+ * but is deliberately excluded here (storage-class, not gateway-transient). The one
+ * 507 shape the capacity lane below may still absorb is the origin's own
+ * retry-buffer overflow verdict, confirmed by body marker -- see
+ * peekOriginRetryBufferOverflow.
  */
 export function isTransientUpstreamStatus(status: number): boolean {
   return status === 500 || status === 502 || status === 503 || status === 504
@@ -843,6 +847,45 @@ export const RATE_LIMIT_RETRY_DELAYS_MS: readonly number[] = [2_000, 8_000, 20_0
 /** Longest `Retry-After` honoured on a 429 before the answer is handed back untouched. */
 export const RATE_LIMIT_RETRY_AFTER_CEILING_MS = 60_000;
 
+/** The origin's own answer when its edge could not buffer the request to retry it upstream. */
+const ORIGIN_RETRY_BUFFER_LIMIT_MARKER = "exceeded request buffer limit";
+
+/**
+ * Peek a 507 body for the origin retry-buffer overflow verdict.
+ *
+ * Measured 2026-10-11 13:24 (+08): a 490k-token gpt-6.1-sol turn was answered 507 with this
+ * body in 10.3s, and the client's immediate resend of the same turn succeeded -- the overflow
+ * is a "not now" about the request's transient edge buffering, not about storage durability,
+ * which is why it may ride the capacity lane while every other 507 keeps its exclusion.
+ * The read is bounded to an error-body budget; a body that says anything else (or one that
+ * cannot be read) is handed back with its status and, when the bytes were retained, its body.
+ */
+async function peekOriginRetryBufferOverflow(
+  res: Response,
+  signal?: AbortSignal,
+): Promise<{ overflow: boolean; response: Response }> {
+  try {
+    const bounded = await readBoundedResponseBytes(res, {
+      signal,
+      maxBytes: BOUNDED_BODY_MAX_BYTES,
+      inactivityTimeoutMs: BOUNDED_BODY_TIMEOUT_MS,
+    });
+    const overflow = !bounded.oversized
+      && new TextDecoder("utf-8", { fatal: false }).decode(bounded.bytes).includes(ORIGIN_RETRY_BUFFER_LIMIT_MARKER);
+    if (overflow) return { overflow: true, response: res };
+    const headers = new Headers(res.headers);
+    headers.delete("content-length");
+    headers.delete("content-encoding");
+    return {
+      overflow: false,
+      response: new Response(bounded.bytes, { status: res.status, statusText: res.statusText, headers }),
+    };
+  } catch {
+    // An unreadable body must not change the verdict: keep the status, lose the bytes.
+    return { overflow: false, response: res };
+  }
+}
+
 export async function fetchWithTransientRetry(
   doFetch: ReplayableFetch,
   opts: TransientRetryOptions = {},
@@ -934,8 +977,15 @@ export async function fetchWithTransientRetry(
     // A 429 only enters this loop when the caller opted into a rate-limit ladder; without one it
     // keeps its old meaning (a non-transient status the caller owns) and returns here.
     const rateLimited = res.status === 429 && rateLimitDelays.length > 0;
-    if (res.ok || (!isTransientUpstreamStatus(res.status) && !rateLimited) || isNonReplayableResponse(res)) {
-      return wrapSseDeclineRetry(res);
+    let originRetryBufferOverflow = false;
+    let settled = res;
+    if (res.status === 507 && !isNonReplayableResponse(res) && capacityDelays.length > 0) {
+      const peek = await peekOriginRetryBufferOverflow(res, opts.abortSignal);
+      originRetryBufferOverflow = peek.overflow;
+      settled = peek.response;
+    }
+    if (res.ok || (!isTransientUpstreamStatus(res.status) && !rateLimited && !originRetryBufferOverflow) || isNonReplayableResponse(res)) {
+      return wrapSseDeclineRetry(settled);
     }
     // Checked before cancelResponseBodyBestEffort so an already-aborted caller never receives
     // a response whose body we just cancelled.
@@ -943,7 +993,7 @@ export async function fetchWithTransientRetry(
     // Capacity lane, checked BEFORE the slow gate: the canonical backend's shed answers arrive in
     // anywhere from 1s to 36s (measured 2026-09-23), so gating on elapsed time missed the fast
     // half of them entirely.
-    if ((res.status === 502 || res.status === 503 || res.status === 504)
+    if ((res.status === 502 || res.status === 503 || res.status === 504 || originRetryBufferOverflow)
       && capacityRetriesUsed < capacityDelays.length) {
       const attemptMs = Date.now() - attemptStart;
       const slowShedMs = opts.slowShedAttemptMs ?? SLOW_SHED_ATTEMPT_MS;
@@ -951,7 +1001,7 @@ export async function fetchWithTransientRetry(
         console.warn(
           `[upstream-retry] capacity ${res.status}${opts.label ? ` (${opts.label})` : ""} after ${(attemptMs / 1000).toFixed(1)}s of queueing — slow weight-shaped shed; skipping the remaining ${capacityDelays.length - capacityRetriesUsed} rung(s) and handing the answer back`,
         );
-        return res;
+        return settled;
       }
       const waitMs = capacityDelays[capacityRetriesUsed]!;
       capacityRetriesUsed += 1;
@@ -1011,6 +1061,8 @@ export async function fetchWithTransientRetry(
     // capacity rungs below have not been spent: the extra sends exist for "the origin said not now"
     // and must never widen the general transient ladder (a forward pool that retries its own 429s
     // and 500s is the amplification the send budget was built to stop).
+    // The overflow rungs are spent: hand the retained answer back, body intact.
+    if (originRetryBufferOverflow) return settled;
     if (sent >= budget) return res;
     if (Date.now() - attemptStart > slowAttemptMs) {
       // The ChatGPT backend's capacity verdicts arrive SLOWLY: on 2026-09-23 one conversation was

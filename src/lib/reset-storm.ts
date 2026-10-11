@@ -114,7 +114,7 @@ export interface ResetStormCoordinator {
   noteSendSuccess(scope: string): void;
   stormActive(scope: string): boolean;
   config(): ResetStormConfig;
-  /** Live-reconfigures knobs in place; declared-storm state is kept. */
+  /** Live-reconfigures knobs; an absent block restores the inert defaults (disarm). */
   configure(partial?: Partial<ResetStormConfig>): void;
 }
 
@@ -200,7 +200,10 @@ export function createResetStormCoordinator(overrides?: {
     },
 
     configure(partial?: Partial<ResetStormConfig>): void {
-      config = resolveResetStormConfig({ ...config, ...partial });
+      // Replace, not merge: loadConfig() re-reads config.json as the single source of
+      // truth on every read, so an operator who deletes the block must land on the
+      // inert defaults, and a stale enabled flag must never outlive its block.
+      config = resolveResetStormConfig(partial);
     },
 
     recordReset(scope: string, lane: string): void {
