@@ -13,6 +13,7 @@ import type { ResponsesEffects } from "./response-effects";
 import type { ResponsesSendBudget } from "./request-send-budget";
 import { transientSendCapFor } from "./request-send-budget";
 import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
+import { capacityWindowActive } from "../../providers/capacity-window";
 import { isLocalUpstream } from "../../lib/local-upstream";
 import { codexSafetyBufferingFilterOptions, terminalStatusFromParsed } from "../relay";
 import { imageGenToolCallAliases } from "../responses-image-gen-repair";
@@ -238,9 +239,33 @@ function applyResponseGuards(
   });
 }
 
-function capacityAbsorbDelays(provider: OcxProviderConfig): readonly number[] | undefined {
-  if (isCanonicalOpenAiForwardProvider(provider)) return CAPACITY_RETRY_DELAYS_MS;
+/**
+ * The capacity ladder's rungs for this leg.
+ *
+ * While the provider-scoped capacity window is active (three ladder-exhausted failures inside
+ * four minutes), the ladder is trimmed to a single short rung: the window is shared knowledge
+ * now, and every further request paying for five refusals against the same open window is pure
+ * loss (2026-10-12: 100-409s per request, eight conversations, one hour). One short rung keeps
+ * the recovery promise -- the first request after the backend recovers succeeds and the window
+ * ages out four minutes behind it.
+ */
+const CAPACITY_WINDOW_DELAYS_MS: readonly number[] = [4_000];
+
+function capacityAbsorbDelays(
+  providerName: string | undefined,
+  provider: OcxProviderConfig,
+): readonly number[] | undefined {
+  if (isCanonicalOpenAiForwardProvider(provider)) {
+    return providerName !== undefined && capacityWindowActive(providerName)
+      ? CAPACITY_WINDOW_DELAYS_MS
+      : CAPACITY_RETRY_DELAYS_MS;
+  }
   return process.env.OCX_CAPACITY_ABSORB_ALL === "1" ? CAPACITY_RETRY_DELAYS_MS : undefined;
+}
+
+/** The rate-limit 429 ladder, unchanged by the capacity window. */
+function rateLimitAbsorbDelays(provider: OcxProviderConfig): readonly number[] | undefined {
+  return capacityAbsorbDelays(undefined, provider);
 }
 
 
@@ -1096,7 +1121,7 @@ export async function preparePassthroughExchange(
           // canonical forward row; the ladder's sends are additional to the budget and unlock only
           // on 502/503/504.
           retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
-          retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider), retryRateLimitDeferralsMs: capacityAbsorbDelays(route.provider), retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider),
+          retryCapacityDeferralsMs: capacityAbsorbDelays(route.providerName, route.provider), retryRateLimitDeferralsMs: rateLimitAbsorbDelays(route.provider), retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider),
           onCapacityWait: waitMs => { absorbedWaitMs += waitMs; },
           // The OpenCode Go destination stalls-then-drops inference sends (ambiguous
           // pre-header resets surfacing as refused 429s); its subscription traffic is
@@ -1224,7 +1249,7 @@ export async function preparePassthroughExchange(
             // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
             // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
             retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
-            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider), retryRateLimitDeferralsMs: capacityAbsorbDelays(route.provider),
+            retryCapacityDeferralsMs: capacityAbsorbDelays(route.providerName, route.provider), retryRateLimitDeferralsMs: rateLimitAbsorbDelays(route.provider),
             retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider) },
         );
       } catch (err) {
@@ -1361,7 +1386,7 @@ export async function preparePassthroughExchange(
             // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
             // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
             retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
-            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider), retryRateLimitDeferralsMs: capacityAbsorbDelays(route.provider),
+            retryCapacityDeferralsMs: capacityAbsorbDelays(route.providerName, route.provider), retryRateLimitDeferralsMs: rateLimitAbsorbDelays(route.provider),
             retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider) },
         );
       } catch (err) {
@@ -1494,7 +1519,7 @@ export async function preparePassthroughExchange(
             // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
             // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
             retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
-            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider), retryRateLimitDeferralsMs: capacityAbsorbDelays(route.provider),
+            retryCapacityDeferralsMs: capacityAbsorbDelays(route.providerName, route.provider), retryRateLimitDeferralsMs: rateLimitAbsorbDelays(route.provider),
             retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider) },
         );
       } catch (err) {
@@ -1634,7 +1659,7 @@ export async function preparePassthroughExchange(
             // Slow capacity verdicts (ChatGPT backend overload) still deserve one resend; see
             // retrySlowCapacity in lib/upstream-retry.ts. Canonical OpenAI lane only.
             retrySlowCapacity: isCanonicalOpenAiForwardProvider(route.provider),
-            retryCapacityDeferralsMs: capacityAbsorbDelays(route.provider), retryRateLimitDeferralsMs: capacityAbsorbDelays(route.provider),
+            retryCapacityDeferralsMs: capacityAbsorbDelays(route.providerName, route.provider), retryRateLimitDeferralsMs: rateLimitAbsorbDelays(route.provider),
             retrySsePreludeDecline: isCanonicalOpenAiForwardProvider(route.provider) },
         );
       } catch (err) {

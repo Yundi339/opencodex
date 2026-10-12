@@ -6,12 +6,14 @@ import { attemptAccountChanged, sealRequestAttemptIdentity } from "./request-log
 export { sealRequestAttemptIdentity };
 import { readBoundedResponseBody } from "../lib/bounded-body";
 import {
+  isOverloadVerdictText,
   noteThreadOverloadVerdict,
   noteThreadRestrictionVerdict,
   noteThreadTurnDuration,
   noteThreadUpstreamCut,
   shouldArmUpstreamCut,
 } from "./ws-thread-transport";
+import { noteProviderCapacityShed } from "../providers/capacity-window";
 import type { ResponsesTerminalStatus } from "../bridge";
 import {
   classifyError,
@@ -1465,6 +1467,14 @@ export function addFinalRequestLog(
   // 499, which is not a verdict about the route, so the guard excludes it by construction.
   if (shouldArmUpstreamCut(effectiveStatus, logCtx.transportPhase, logCtx.firstOutputMs)) {
     noteThreadUpstreamCut(logCtx.conversationId, { status: effectiveStatus, midStream: true });
+  }
+  // Provider-scoped memory of a shed window. This request exhausted its capacity ladder --
+  // evidence that the PROVIDER is shedding right now -- and the next request should not pay
+  // for the same five refusals (2026-10-12: eight conversations burned 100-409s each inside
+  // one hour against the same open window). Counting only the terminal failure is what keeps
+  // the judgement honest: an absorbed shed that ended in 200 never reaches this seam.
+  if (effectiveStatus >= 500 && isOverloadVerdictText(logCtx.upstreamError)) {
+    noteProviderCapacityShed(logCtx.provider);
   }
   // Same seam, the other shape: this conversation is much slower than its OWN recent normal. Only
   // successful turns feed both the baseline and the verdict -- a cancelled turn is the user
