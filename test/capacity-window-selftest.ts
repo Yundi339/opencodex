@@ -23,13 +23,14 @@ function check(label: string, ok: boolean, detail = "") {
 
 const T0 = 1_800_000_000_000;
 
-// Two failures are not a window; three are.
+// One failure is not a window; two are (2026-10-13: the shelf fails in clusters spread over
+// several minutes, and the old three-in-four-minutes rule never activated on the observed
+// sequence 10:30:35 / 10:30:37 / 10:36:16 / 10:39:04).
 clearCapacityWindowsForTests();
 noteProviderCapacityShed("openai", T0);
+check("one shed failure does not open the window", !capacityWindowActive("openai", T0 + 500));
 noteProviderCapacityShed("openai", T0 + 1_000);
-check("two shed failures do not open the window", !capacityWindowActive("openai", T0 + 2_000));
-noteProviderCapacityShed("openai", T0 + 3_000);
-check("three shed failures open the window", capacityWindowActive("openai", T0 + 4_000));
+check("two shed failures open the window", capacityWindowActive("openai", T0 + 2_000));
 
 // The judgement is per provider: a sibling never inherits the window.
 check("sibling provider is unaffected", !capacityWindowActive("ciii-codex", T0 + 4_000));
@@ -38,14 +39,13 @@ check("sibling provider is unaffected", !capacityWindowActive("ciii-codex", T0 +
 noteProviderCapacityShed("openai", T0 + 200_000);
 check("a later failure refreshes the window", capacityWindowActive("openai", T0 + 230_000));
 
-// ...and four quiet minutes close it, restoring the full ladder.
-check("window ages out after four quiet minutes", !capacityWindowActive("openai", T0 + 200_000 + 4 * 60_000 + 1_000));
+// ...and eight quiet minutes close it, restoring the full ladder.
+check("window ages out after eight quiet minutes", !capacityWindowActive("openai", T0 + 200_000 + 8 * 60_000 + 1_000));
 check("and stays closed", !capacityWindowActive("openai", T0 + 200_000 + 10 * 60_000));
 
 // Fresh failures after the quiet period open it again.
 noteProviderCapacityShed("openai", T0 + 900_000);
 noteProviderCapacityShed("openai", T0 + 901_000);
-noteProviderCapacityShed("openai", T0 + 902_000);
 check("the window can reopen", capacityWindowActive("openai", T0 + 903_000));
 
 // An unmatched provider name is never active.

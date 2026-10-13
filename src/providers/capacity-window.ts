@@ -21,10 +21,28 @@
  * the last failure the full ladder is back.
  */
 
-/** Capacity failures inside this window that keep the window active. */
-const CAPACITY_WINDOW_MS = 4 * 60_000;
-/** Ladder-exhausted failures needed to declare the window active. */
-const CAPACITY_WINDOW_MIN_SHEDS = 3;
+/**
+ * Capacity failures inside this window that keep the window active.
+ *
+ * Widened from four minutes on 2026-10-13: the shelf that motivated this module fails in
+ * CLUSTERS spread over several minutes, not inside one four-minute block. Measured that
+ * morning, 10:30:35 / 10:30:37 / 10:36:16 / 10:39:04 -- every gap under seven minutes, and
+ * the old window expired between each pair, so it never activated and the 10:36/10:39 turns
+ * still paid the full ladder (107s and 99s) to learn what the failures a few minutes earlier
+ * had already said.
+ */
+const CAPACITY_WINDOW_MS = 8 * 60_000;
+/**
+ * Ladder-exhausted failures needed to declare the window active.
+ *
+ * Two, down from three: the first refusal is unavoidable information, but a second
+ * ladder-exhausted failure inside the window is already the pattern, and every further
+ * request paying the full ladder while the provider is provably shedding is the cost this
+ * module exists to remove. The recovery promise does not change -- a window-active request
+ * still sends and still keeps one short rung, so the first request after recovery succeeds
+ * and the window ages out behind the last failure.
+ */
+const CAPACITY_WINDOW_MIN_SHEDS = 2;
 
 const sheds = new Map<string, number[]>();
 /** Last observed window state per provider, so the mode transition logs once, not per request. */
