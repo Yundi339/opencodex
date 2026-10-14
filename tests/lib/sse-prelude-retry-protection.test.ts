@@ -7,12 +7,14 @@
  */
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { withSsePreludeDeclineRetry } from "../../src/lib/sse-prelude-retry";
+import { fetchWithTransientRetry } from "../../src/lib/upstream-retry";
 
 const PRELUDE = 'data: {"type":"response.created"}\n\n';
 const PROTECTION_ERROR = 'data: {"type":"error","code":"screening_unavailable","message":"response protection is unavailable"}\n\n';
 const DELTA = 'data: {"type":"response.output_text.delta","delta":"hi"}\n\n';
 const OK_DONE = 'data: {"type":"response.completed","response":{"status":"completed"}}\n\n';
 const encoder = new TextEncoder();
+const SERVER_ERROR = 'data: {"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"An error occurred while processing your request."}}}\n\n';
 
 function sseResponse(frames: string[]): Response {
   const stream = new ReadableStream<Uint8Array>({
@@ -34,6 +36,64 @@ afterEach(() => {
 });
 
 describe("sse prelude decline: screening-gate verdict", () => {
+  test("the native opt-in retries inside HTTP 200 and accounts for physical sends", async () => {
+    silenceWarn();
+    let sends = 0, charged = 0;
+    const response = await fetchWithTransientRetry(async () => {
+      sends++;
+      return sseResponse(sends === 1 ? [PRELUDE, SERVER_ERROR] : [PRELUDE, DELTA, OK_DONE]);
+    }, {
+      attempts: 1, retrySsePreludeDecline: true, retryCapacityDeferralsMs: [1],
+      onSendsConsumed: count => { charged += count; },
+    });
+    expect(await response.text()).toBe(PRELUDE + DELTA + OK_DONE);
+    expect(sends).toBe(2);
+    expect(charged).toBe(2);
+  });
+
+  test.each([
+    SERVER_ERROR,
+    'data: {"type":"error","code":"server_error","message":"temporary failure"}\n\n',
+    'data: {"type":"error","message":"An error occurred while processing your request."}\n\n',
+    SERVER_ERROR.trimEnd(),
+  ])("absorbs an explicit server failure before content: %s", async error => {
+    silenceWarn();
+    let sends = 0;
+    const out = await withSsePreludeDeclineRetry(sseResponse([PRELUDE, error]), {
+      delaysMs: [1], stallMs: 0,
+      resend: async () => { sends++; return sseResponse([PRELUDE, DELTA, OK_DONE]); },
+    }).text();
+    expect(sends).toBe(1);
+    expect(out).toBe(PRELUDE + DELTA + OK_DONE);
+  });
+
+  test.each([SERVER_ERROR, SERVER_ERROR.trimEnd()])("exhaustion preserves the terminal failure: %s", async error => {
+    silenceWarn();
+    let sends = 0;
+    const out = await withSsePreludeDeclineRetry(sseResponse([PRELUDE, error]), {
+      delaysMs: [1, 1], stallMs: 0,
+      resend: async () => { sends++; return sseResponse([error]); },
+    }).text();
+    expect(sends).toBe(2);
+    expect(out).toBe(error);
+  });
+
+  test.each([
+    DELTA + SERVER_ERROR,
+    'data: {"type":"error","code":"insufficient_quota","message":"An error occurred while processing your request."}\n\n',
+    'data: {"type":"response.failed","response":{"status":"failed","error":{"code":"invalid_request_error"}}}\n\n',
+    'data: {"type":"response.failed","response":{"error":{"code":"server_error"},"output":[{"type":"function_call","arguments":"{}"}]}}\n\n',
+    'data: {"type":"response.completed","response":{"status":"completed","output_text":"server_error: An error occurred while processing your request."}}\n\n',
+  ])("does not replay output or non-server failures: %s", async frames => {
+    let sends = 0;
+    const out = await withSsePreludeDeclineRetry(sseResponse([PRELUDE, frames]), {
+      delaysMs: [1], stallMs: 0,
+      resend: async () => { sends++; return sseResponse([OK_DONE]); },
+    }).text();
+    expect(sends).toBe(0);
+    expect(out).toBe(PRELUDE + frames);
+  });
+
   test("a protection decline before any content is absorbed and the turn re-dialled", async () => {
     silenceWarn();
     let sends = 0;

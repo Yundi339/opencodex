@@ -186,6 +186,7 @@ function doneFrameCarriesPayload(frameText: string): boolean {
  * capacity text alone, which is the shape the backend uses when it declines a turn.
  */
 function isDeclineFrame(frameText: string, type: string | undefined): boolean {
+  if (isServerErrorFrame(frameText, type)) return true;
   if (!isCapacityDecline(frameText)) return false;
   // A body with no event framing can be a whole JSON answer rather than a stream, and an answer is
   // allowed to contain these words (this investigation's own replies do). Without a frame type the
@@ -203,6 +204,25 @@ function isDeclineFrame(frameText: string, type: string | undefined): boolean {
   } catch {
     return false;
   }
+}
+
+/** Only explicit error fields authorize recovery; quoted error text is ordinary output. */
+function isServerErrorFrame(text: string, type: string | undefined): boolean {
+  if (type !== undefined && type !== "error" && type !== "response.failed") return false;
+  try {
+    const data = text.split("\n").filter(line => line.startsWith("data:")).map(line => line.slice(5).trim()).join("\n");
+    const event = JSON.parse(data || text);
+    const response = event?.response;
+    if (response?.output?.length > 0 || response?.usage != null) return false;
+    const error = type === "error" ? event.error ?? event : response?.error ?? event?.error;
+    if (!error || typeof error !== "object" || Array.isArray(error)) return false;
+    if (type === undefined && response && response.status !== "failed") return false;
+    const code = error.code ?? (error.type === "error" ? undefined : error.type);
+    if (code != null && code !== "server_error" && code !== "internal_server_error"
+      && code !== "upstream_server_error") return false;
+    return code != null || (typeof error.message === "string"
+      && error.message.startsWith("An error occurred while processing your request."));
+  } catch { return false; }
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -337,8 +357,15 @@ export function withSsePreludeDeclineRetry(
             if (!contentSeen && buffer.byteLength > 0) {
               const trailing = decodeFrame(buffer);
               if (isDeclineFrame(trailing, frameType(trailing))) {
+                const declinedFrame = buffer;
                 buffer = new Uint8Array(0);
-                if (await retryDecline(null)) continue;
+                if (rung >= options.delaysMs.length) {
+                  if (!released) flushHeld();
+                  emit(declinedFrame);
+                  release();
+                  return;
+                }
+                if (await retryDecline(declinedFrame)) continue;
                 return;
               }
               // Not a decline: this is the whole body (a non-streaming answer) or the tail of one,
