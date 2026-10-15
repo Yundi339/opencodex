@@ -3,7 +3,7 @@ import {
   createTranslatorBudget, finalizeTranslatorBudgetResponse, translatorLiveBudgetCountForTests,
   translatorObservedBufferSnapshot,
 } from "../../src/lib/translator-budget";
-import { finalizeOwnedTranslatorBudget } from "../../src/server/responses/core-lifetime";
+import { finalizeAccountLease, finalizeOwnedTranslatorBudget } from "../../src/server/responses/core-lifetime";
 import {
   markNativePassthroughSseResponse, isNativePassthroughSseResponse,
   markEagerRelaySseResponse, isEagerRelaySseResponse,
@@ -83,6 +83,37 @@ for (const [kind, wrap] of [
     await expect(broken.text()).rejects.toThrow("producer failed");
     expect(translatorLiveBudgetCountForTests()).toBe(baseline);
     errorController.abort();
+  });
+}
+
+for (const outcome of ["resolve", "reject"] as const) {
+  test(`Responses account lease releases before a held producer cancellation ${outcome}s`, async () => {
+    let settle!: () => void;
+    let releases = 0;
+    let cancellations = 0;
+    let cancellationSettled = false;
+    const held = new Promise<void>((resolve, reject) => {
+      settle = outcome === "resolve" ? resolve : () => reject(new Error("producer cancellation failed"));
+    });
+    const source = markPreinspectedJsonResponse(new Response(new ReadableStream({
+      cancel() { cancellations++; return held; },
+    }), { status: 503, headers: { "x-fixture": "preserved" } }));
+    const wrapped = finalizeAccountLease(source, () => { releases++; });
+    const cancelled = wrapped.body!.cancel("client gone").then(() => { cancellationSettled = true; });
+    try {
+      await Promise.resolve();
+      expect(releases).toBe(1);
+      expect(cancellations).toBe(1);
+      expect(cancellationSettled).toBe(false);
+      expect(wrapped.status).toBe(503);
+      expect(wrapped.headers.get("x-fixture")).toBe("preserved");
+      expect(isPreinspectedJsonResponse(wrapped)).toBe(true);
+    } finally {
+      settle();
+      await cancelled;
+    }
+    expect(releases).toBe(1);
+    expect(cancellationSettled).toBe(true);
   });
 }
 

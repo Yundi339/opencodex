@@ -64,15 +64,12 @@ export async function handleResponses(
       sendBudget: options.sendBudget ?? createInferenceSendBudget(req, logCtx),
     }, handleResponsesInner);
     const finalResponse = ownsBudget
-      ? finalizeOwnedTranslatorBudget(response, translatorBudget, {
-        turnStateWhere: {
-          provider: logCtx.provider,
-          model: logCtx.model,
-          comboId: logCtx.comboId,
-          direction: "response",
-          transport: "http",
-        },
-        signal: abortSignal,
+      ? finalizeOwnedTranslatorBudget(response, translatorBudget, abortSignal, {
+        provider: logCtx.provider,
+        model: logCtx.model,
+        comboId: logCtx.comboId,
+        direction: "response",
+        transport: "http",
       })
       : response;
     if (!accountLoad.lease) { release(); return finalResponse; }

@@ -45,29 +45,32 @@ export const UPSTREAM_JSON_BODY_READ_OPTIONS = {
 export function finalizeOwnedTranslatorBudget(
   response: Response,
   budget: TranslatorBudget,
-  options: { turnStateWhere?: TurnStateWhere; signal?: AbortSignal } = {},
+  // Positional on purpose: upstream 2.86 calls this (and the Rust async-contract fixture
+  // exercises it) as (response, budget, signal). The fork observer rides the fourth slot.
+  signal?: AbortSignal,
+  turnStateWhere?: TurnStateWhere,
 ): Response {
   if (!response.body) {
     budget.dispose();
     return response;
   }
   const reader = response.body.getReader();
-  const turnStateSniffer = options.turnStateWhere ? createTurnStateSniffer(options.turnStateWhere) : undefined;
-  if (options.turnStateWhere) {
-    observeTurnStateUpstreamStatus(response.status, options.turnStateWhere);
-    observeTurnStateResponseHeaders(response.headers, options.turnStateWhere);
+  const turnStateSniffer = turnStateWhere ? createTurnStateSniffer(turnStateWhere) : undefined;
+  if (turnStateWhere) {
+    observeTurnStateUpstreamStatus(response.status, turnStateWhere);
+    observeTurnStateResponseHeaders(response.headers, turnStateWhere);
   }
   let finalized = false;
   const finalize = () => {
     if (finalized) return;
     finalized = true;
-    options.signal?.removeEventListener("abort", finalize);
+    signal?.removeEventListener("abort", finalize);
     budget.dispose();
   };
   // 2.86 reliability rule: an abort releases accounting even when no consumer ever
   // pulls or cancels this body.
-  if (options.signal?.aborted) finalize();
-  else options.signal?.addEventListener("abort", finalize, { once: true });
+  if (signal?.aborted) finalize();
+  else signal?.addEventListener("abort", finalize, { once: true });
   const body = new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
@@ -88,7 +91,12 @@ export function finalizeOwnedTranslatorBudget(
     },
     async cancel(reason) {
       try { turnStateSniffer?.finish(); } catch { /* observer never breaks the relay */ }
-      try { await reader.cancel(reason); } finally { finalize(); }
+      // Release accounting BEFORE awaiting the producer  cancel: a producer that holds its
+      // cancel (the Rust async-contract fixture does exactly that) otherwise keeps the budget
+      // alive for as long as the hold lasts. Measured 2026-10-15 -- the ordering upstream 2.86
+      // ships; the fork  earlier ordering regressed it.
+      finalize();
+      try { await reader.cancel(reason); } catch { /* relay already released */ }
     },
   });
   const finalizedResponse = carryResponseMarkers(response, new Response(body, {
@@ -114,7 +122,12 @@ export function finalizeAccountLease(response: Response, release: () => void): R
         else controller.enqueue(next.value);
       } catch (error) { finish(); controller.error(error); }
     },
-    async cancel(reason) { try { await reader.cancel(reason); } finally { finish(); } },
+    async cancel(reason) {
+      // Same ordering rule as the budget path: the slot must be released even when the
+      // producer holds its cancel.
+      finish();
+      try { await reader.cancel(reason); } catch { /* slot already released */ }
+    },
   });
   const wrapped = carryResponseMarkers(response, new Response(body, {
     status: response.status,
