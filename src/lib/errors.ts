@@ -32,14 +32,18 @@ export function upstreamErrorMessageFromPayload(payload: unknown): string | unde
   const json = payload as {
     type?: unknown;
     message?: unknown;
-    error?: { message?: unknown };
+    /** Object form is the OpenAI envelope; flat string is xAI's invalid-argument shape
+     *  (code + error-as-string, e.g. {"code":"invalid-argument","error":"Invalid reasoning effort."}).
+     *  Without the string branch that family of 400s landed with an empty upstreamError and the
+     *  operator saw a bare "Provider error 400" with no reason (measured 2026-10-14). */
+    error?: { message?: unknown } | string;
     last_error?: { message?: unknown };
     response?: {
       error?: { message?: unknown };
       incomplete_details?: { message?: unknown };
     };
   };
-  const messages = [json.error?.message,
+  const messages = [typeof json.error === "string" ? json.error : json.error?.message,
     json.last_error?.message,
     json.response?.error?.message,
     json.response?.incomplete_details?.message,

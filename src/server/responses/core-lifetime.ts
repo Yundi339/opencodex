@@ -2,18 +2,15 @@ import type { TranslatorBudget } from "../../lib/translator-budget";
 import { finalizeTranslatorBudgetResponse } from "../../lib/translator-budget";
 import { isNonReplayableResponse, markResponseNonReplayable } from "../../lib/upstream-retry";
 import {
-  isNativePassthroughSseResponse,
-  markNativePassthroughSseResponse,
-  isEagerRelaySseResponse,
-  markEagerRelaySseResponse,
-  isPreinspectedJsonResponse,
-  markPreinspectedJsonResponse,
-} from "../relay";
+  createTurnStateSniffer,
+  observeTurnStateResponseHeaders,
+  observeTurnStateUpstreamStatus,
+  type TurnStateWhere,
+} from "../turn-state-observer";
+import { carryResponseMarkers } from "../../lib/response-markers";
+import { runTurnAdapterSseResponses } from "../sse-response-markers";
 
-// runTurn adapters own an event queue and perform their combo preflight before
-// bridging. A second byte-stream reader would reinterpret that transport's
-// already-committed event boundary and can replay custom adapter work.
-export const runTurnAdapterSseResponses = new WeakSet<Response>();
+export { runTurnAdapterSseResponses } from "../sse-response-markers";
 
 
 // Whole-body policy for non-streaming upstream JSON responses (see the application/json
@@ -39,15 +36,67 @@ export const UPSTREAM_JSON_BODY_READ_OPTIONS = {
 
 
 
-export function finalizeOwnedTranslatorBudget(response: Response, budget: TranslatorBudget, signal?: AbortSignal): Response {
-  const finalizedResponse = finalizeTranslatorBudgetResponse(response, budget, signal);
-  if (isNativePassthroughSseResponse(response)) {
-    markNativePassthroughSseResponse(finalizedResponse);
+/**
+ * The adapter answered with its own SSE body, already in the client's protocol.
+ *
+ * Owned here rather than in the shared marker carry so that this module and the carry do not
+ * import each other; every wrapper in this file restates it alongside the rest.
+ */
+export function finalizeOwnedTranslatorBudget(
+  response: Response,
+  budget: TranslatorBudget,
+  options: { turnStateWhere?: TurnStateWhere; signal?: AbortSignal } = {},
+): Response {
+  if (!response.body) {
+    budget.dispose();
+    return response;
   }
-  if (isEagerRelaySseResponse(response)) {
-    markEagerRelaySseResponse(finalizedResponse);
+  const reader = response.body.getReader();
+  const turnStateSniffer = options.turnStateWhere ? createTurnStateSniffer(options.turnStateWhere) : undefined;
+  if (options.turnStateWhere) {
+    observeTurnStateUpstreamStatus(response.status, options.turnStateWhere);
+    observeTurnStateResponseHeaders(response.headers, options.turnStateWhere);
   }
-  if (isPreinspectedJsonResponse(response)) markPreinspectedJsonResponse(finalizedResponse);
+  let finalized = false;
+  const finalize = () => {
+    if (finalized) return;
+    finalized = true;
+    options.signal?.removeEventListener("abort", finalize);
+    budget.dispose();
+  };
+  // 2.86 reliability rule: an abort releases accounting even when no consumer ever
+  // pulls or cancels this body.
+  if (options.signal?.aborted) finalize();
+  else options.signal?.addEventListener("abort", finalize, { once: true });
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const result = await reader.read();
+        if (result.done) {
+          try { turnStateSniffer?.finish(); } catch { /* observer never breaks the relay */ }
+          finalize();
+          controller.close();
+        } else {
+          try { turnStateSniffer?.feed(result.value); } catch { /* observer never breaks the relay */ }
+          controller.enqueue(result.value);
+        }
+      } catch (error) {
+        try { turnStateSniffer?.finish(); } catch { /* observer never breaks the relay */ }
+        finalize();
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      try { turnStateSniffer?.finish(); } catch { /* observer never breaks the relay */ }
+      try { await reader.cancel(reason); } finally { finalize(); }
+    },
+  });
+  const finalizedResponse = carryResponseMarkers(response, new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  }));
+  if (runTurnAdapterSseResponses.has(response)) runTurnAdapterSseResponses.add(finalizedResponse);
   return finalizedResponse;
 }
 
@@ -67,11 +116,12 @@ export function finalizeAccountLease(response: Response, release: () => void): R
     },
     async cancel(reason) { try { await reader.cancel(reason); } finally { finish(); } },
   });
-  const wrapped = new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
-  if (isNonReplayableResponse(response)) markResponseNonReplayable(wrapped);
-  if (isNativePassthroughSseResponse(response)) markNativePassthroughSseResponse(wrapped);
-  if (isEagerRelaySseResponse(response)) markEagerRelaySseResponse(wrapped);
-  if (isPreinspectedJsonResponse(response)) markPreinspectedJsonResponse(wrapped);
+  const wrapped = carryResponseMarkers(response, new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  }));
+  if (runTurnAdapterSseResponses.has(response)) runTurnAdapterSseResponses.add(wrapped);
   return wrapped;
 }
 

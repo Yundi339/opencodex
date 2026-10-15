@@ -68,6 +68,7 @@ import { mapCodexAuthContextErrorToResponse } from "./codex-auth-error";
 import type { OcxParsedRequest } from "../../types";
 import { buildToolBridgeMaps } from "./collaboration";
 import { parseRequest } from "../../responses/parser";
+import { observeTurnStateRequestBody } from "../turn-state-observer";
 import { anthropicSessionKeyFromParts } from "../../oauth/anthropic-routing";
 import { configuredAnthropicInstance } from "../../providers/anthropic-instance";
 import { isTranslatorBudgetExceededError } from "../../lib/translator-budget";
@@ -439,6 +440,14 @@ export async function prepareResponsesRequest(
     if (options.inboundWire === "anthropic") {
       parsed._nativeReasoningReplay = options.nativeReasoningReplay;
       parsed._nativeReasoningMint = options.nativeReasoningMint;
+    }
+    if (!options.comboAttempt) {
+      observeTurnStateRequestBody(body, req.headers, {
+        provider: logCtx.provider,
+        model: parsed.modelId,
+        direction: "request",
+        transport: options.inboundTransport ?? "http",
+      });
     }
     parsed._promptCacheKeyIsSharedCohort = options.promptCacheKeyIsSharedCohort;
     // The body may have been rebuilt since the inbound observation (previous-response
