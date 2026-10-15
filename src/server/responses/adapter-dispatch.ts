@@ -547,7 +547,7 @@ export async function prepareAdapterExchange(
                 : { onSendsConsumed: deferredInitial?.report ?? initialReporter }),
             }
             : canonicalForwardRow
-              ? { attempts: 1, onSendsConsumed: noteTransientSends }
+              ? { attempts: 1, onSendsConsumed: transientSendReporter() }
               : {}),
           ...(canonicalForwardRow
             ? { retrySlowCapacity: true, retryCapacityDeferralsMs: CAPACITY_RETRY_DELAYS_MS }

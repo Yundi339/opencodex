@@ -1,12 +1,8 @@
 import { createHmac, randomBytes } from "node:crypto";
-<<<<<<< ours
 import { codexWsReuseAcrossTurnsEnabled } from "../../config/codex-ws-reuse-setting";
-||||||| base
-=======
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getConfigDir } from "../../config/paths";
->>>>>>> theirs
 import { registerOptionalShutdownHook } from "../../lib/optional-shutdown-hooks";
 import { CODEX_RESPONSES_HTTP_URL, CODEX_WS_FRAME_HEADERS } from "./codex-ws-request";
 import { CODEX_WS_ID_MAX_BYTES } from "./codex-ws-correlation";
@@ -15,15 +11,10 @@ import { CodexWsSession } from "./codex-ws-session";
 export const CODEX_WS_POOL_MAX_SESSIONS = 32;
 export const CODEX_WS_POOL_IDLE_MS = 30_000;
 export const CODEX_WS_POOL_MAX_AGE_MS = 5 * 60_000;
-<<<<<<< ours
 export const CODEX_WS_POOL_WAIT_MS = 750;
 /** Retained sockets per account+thread while cross-turn reuse is on. */
 export const CODEX_WS_POOL_SCOPE_LIMIT = 2;
 const CODEX_WS_POOL_WAIT_DEPTH = 2;
-const MUTABLE_HEADERS = new Set<string>(CODEX_WS_FRAME_HEADERS);
-||||||| base
-const MUTABLE_HEADERS = new Set<string>(CODEX_WS_FRAME_HEADERS);
-=======
 /**
  * Cross-turn reuse windows -- the socket survives the end of the turn that opened it.
  *
@@ -83,15 +74,10 @@ const MUTABLE_HEADERS = new Set<string>([
 const IDENTITY_FIELD_RAW_LIMIT_BYTES = 1024;
 /** Total budget for the immutable field set, so the digest input is bounded no matter the caller. */
 const IDENTITY_FIELDS_TOTAL_LIMIT_BYTES = 256 * 1024;
->>>>>>> theirs
 let processKey: Buffer | undefined;
 let poolSequence = 0;
 
-<<<<<<< ours
 export interface CodexWsReuseIdentity { key: string; scope: string; routeTag: string }
-||||||| base
-export interface CodexWsReuseIdentity { key: string; scope: string }
-=======
 /** Hashed turn label, so a reuse can be classified without holding a turn id in memory. */
 function turnToken(account: string, thread: string, turn: string): string {
   return digest(["turn", account, thread, turn]);
@@ -127,7 +113,10 @@ let crossTurnReuses = 0;
  * The check is read per call, so both switches take effect on the next turn without a restart.
  */
 export function codexWsCrossTurnReuseEnabled(): boolean {
-  return envFlag("OCX_WS_CROSS_TURN_REUSE", false) && Date.now() >= crossTurnBreakerUntil;
+  // Upstream 2.86 ships a config switch (codexWsReuseAcrossTurnsEnabled); the fork keeps its env
+  // switch. Either channel enables reuse; the fork breaker still gates both.
+  return (codexWsReuseAcrossTurnsEnabled() || envFlag("OCX_WS_CROSS_TURN_REUSE", false))
+    && Date.now() >= crossTurnBreakerUntil;
 }
 
 export function codexWsCrossTurnFirstFrameMs(): number {
@@ -150,7 +139,7 @@ export interface CodexWsCrossTurnStats {
 export function codexWsCrossTurnStats(): CodexWsCrossTurnStats {
   return {
     enabled: codexWsCrossTurnReuseEnabled(),
-    configured: envFlag("OCX_WS_CROSS_TURN_REUSE", false),
+    configured: envFlag("OCX_WS_CROSS_TURN_REUSE", false) || codexWsReuseAcrossTurnsEnabled(),
     breakerUntil: crossTurnBreakerUntil,
     attempts: crossTurnOutcomes.length,
     failures: crossTurnOutcomes.filter(ok => !ok).length,
@@ -225,7 +214,6 @@ export function noteCodexWsCrossTurnResult(ok: boolean, detail: CodexWsCrossTurn
 }
 
 export interface CodexWsReuseIdentity { key: string; scope: string; turn: string }
->>>>>>> theirs
 function value(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0
     && !/[\u0000-\u001f\u007f]/.test(value) && Buffer.byteLength(value) <= CODEX_WS_ID_MAX_BYTES;
@@ -270,16 +258,6 @@ export function codexWsReuseIdentity(url: string, headers: Record<string, string
   }
   if (body.service_tier !== undefined && !value(body.service_tier)) return refuse("bad-service-tier");
   const immutable = Object.entries(headers).filter(([name]) => !MUTABLE_HEADERS.has(name)).sort(([a], [b]) => a.localeCompare(b));
-<<<<<<< ours
-  if (immutable.length > 128 || immutable.some(([, field]) => !value(field))
-    || immutable.reduce((bytes, [name, field]) => bytes + Buffer.byteLength(name) + Buffer.byteLength(field), 0) > 32 * 1024) return null;
-  const reuseAcrossTurns = codexWsReuseAcrossTurnsEnabled();
-  const scope = digest(reuseAcrossTurns ? [url, account, thread] : [url, account, thread, turn]);
-||||||| base
-  if (immutable.length > 128 || immutable.some(([, field]) => !value(field))
-    || immutable.reduce((bytes, [name, field]) => bytes + Buffer.byteLength(name) + Buffer.byteLength(field), 0) > 32 * 1024) return null;
-  const scope = digest([url, account, thread, turn]);
-=======
   if (immutable.length > 128) return refuse("immutable-count:" + immutable.length);
   // Name and size only: a header value never reaches the debug ledger, not even hashed.
   const unusable = immutable.find(([, field]) => !usableField(field));
@@ -297,18 +275,13 @@ export function codexWsReuseIdentity(url: string, headers: Record<string, string
   // when the feature is off or the breaker is open.
   const crossTurn = codexWsCrossTurnReuseEnabled();
   const scope = crossTurn ? digest([url, account, thread]) : digest([url, account, thread, turn]);
->>>>>>> theirs
   const lite = metadata.ws_request_header_x_openai_internal_codex_responses_lite;
   if (lite !== undefined && lite !== "true" && lite !== "false") return refuse("bad-lite-flag");
   // `dialUrl` is the socket destination after plugin rewrites; absent means the canonical one.
-<<<<<<< ours
   const routeTag = digest(["route", authorization, proxy ?? null, dialUrl ?? null]);
-  return { scope, routeTag, key: digest([scope, authorization, body.model, body.service_tier ?? null, lite ?? null, immutable, proxy ?? null, dialUrl ?? null]) };
-||||||| base
-  return { scope, key: digest([scope, authorization, body.model, body.service_tier ?? null, lite ?? null, immutable, proxy ?? null, dialUrl ?? null]) };
-=======
   const identity = {
     scope,
+    routeTag,
     turn: turnToken(account, thread, turn),
     key: digest([scope, authorization, body.model, body.service_tier ?? null, lite ?? null,
       immutable.map(([name, field]) => [name,
@@ -325,17 +298,9 @@ export function codexWsReuseIdentity(url: string, headers: Record<string, string
     headers: Object.fromEntries(immutable.map(([name, field]) => [name, digest([name, field]).slice(0, 8)])),
   });
   return identity;
->>>>>>> theirs
 }
 
-<<<<<<< ours
-interface Entry { identity: CodexWsReuseIdentity; session: CodexWsSession; createdAt: number; idleAt: number; retired: boolean }
-interface Waiter { key: string; resolve: (session: CodexWsSession | null) => void; timer: ReturnType<typeof setTimeout>; onAbort: () => void; signal?: AbortSignal }
-interface PoolOptions { now?: () => number; maxSessions?: number; idleMs?: number; maxAgeMs?: number; waitMs?: number }
-||||||| base
-interface Entry { identity: CodexWsReuseIdentity; session: CodexWsSession; createdAt: number; idleAt: number; retired: boolean }
-interface PoolOptions { now?: () => number; maxSessions?: number; idleMs?: number; maxAgeMs?: number }
-=======
+
 interface Entry {
   identity: CodexWsReuseIdentity;
   session: CodexWsSession;
@@ -345,15 +310,16 @@ interface Entry {
   /** True when the socket was opened while cross-turn reuse was on, so it uses the wider windows. */
   crossTurn: boolean;
 }
+interface Waiter { key: string; resolve: (session: CodexWsSession | null) => void; timer: ReturnType<typeof setTimeout>; onAbort: () => void; signal?: AbortSignal }
 interface PoolOptions {
   now?: () => number;
   maxSessions?: number;
   idleMs?: number;
   maxAgeMs?: number;
+  waitMs?: number;
   crossTurnIdleMs?: number;
   crossTurnMaxAgeMs?: number;
 }
->>>>>>> theirs
 
 /** Bounded retained sockets only. Busy/capacity misses keep the existing one-shot path. */
 export class CodexWsPool {
@@ -366,22 +332,15 @@ export class CodexWsPool {
   private readonly maxSessions: number;
   private readonly idleMs: number;
   private readonly maxAgeMs: number;
-<<<<<<< ours
   private readonly waitMs: number;
-||||||| base
-=======
   private readonly crossTurnIdleMs: number;
   private readonly crossTurnMaxAgeMs: number;
->>>>>>> theirs
   constructor(options: PoolOptions = {}) {
     this.now = options.now ?? Date.now;
     this.maxSessions = options.maxSessions ?? CODEX_WS_POOL_MAX_SESSIONS;
     this.idleMs = options.idleMs ?? CODEX_WS_POOL_IDLE_MS;
     this.maxAgeMs = options.maxAgeMs ?? CODEX_WS_POOL_MAX_AGE_MS;
-<<<<<<< ours
     this.waitMs = options.waitMs ?? CODEX_WS_POOL_WAIT_MS;
-||||||| base
-=======
     this.crossTurnIdleMs = options.crossTurnIdleMs ?? CODEX_WS_CROSS_TURN_IDLE_MS;
     this.crossTurnMaxAgeMs = options.crossTurnMaxAgeMs ?? CODEX_WS_CROSS_TURN_MAX_AGE_MS;
   }
@@ -395,7 +354,6 @@ export class CodexWsPool {
     return entry.crossTurn
       ? { idleMs: this.crossTurnIdleMs, maxAgeMs: this.crossTurnMaxAgeMs }
       : { idleMs: this.idleMs, maxAgeMs: this.maxAgeMs };
->>>>>>> theirs
   }
 
   acquire(identity: CodexWsReuseIdentity, url: string, headers: Record<string, string>, proxy?: string): CodexWsSession | null {
@@ -443,18 +401,15 @@ export class CodexWsPool {
     this.retireSiblings(identity);
     const existing = this.entries.get(identity.key);
     if (existing) {
-<<<<<<< ours
-      if (existing.retired) return { session: null, busy: false };
-      if (existing.session.busy) return { session: null, busy: true };
-      if (existing.session.reserve()) { this.arm(); return { session: existing.session, busy: false }; }
-||||||| base
-      if (existing.retired || existing.session.busy) return null;
-      if (existing.session.reserve()) { this.arm(); return existing.session; }
-=======
-      if (existing.retired || existing.session.busy) {
+      if (existing.retired) {
         noteIdentityDebug({ event: "pool-acquire", hit: false, scope: identity.scope.slice(0, 8),
-          reason: existing.retired ? "retired" : "busy", size: this.entries.size });
-        return null;
+          reason: "retired", size: this.entries.size });
+        return { session: null, busy: false };
+      }
+      if (existing.session.busy) {
+        noteIdentityDebug({ event: "pool-acquire", hit: false, scope: identity.scope.slice(0, 8),
+          reason: "busy", size: this.entries.size });
+        return { session: null, busy: true };
       }
       // Handing a socket to a later turn is the experiment: label it on the session so every
       // settle that follows can be attributed, and give the exchange a bounded window to hear
@@ -470,25 +425,20 @@ export class CodexWsPool {
         noteIdentityDebug({ event: "pool-acquire", hit: true, scope: identity.scope.slice(0, 8),
           sameTurn: existing.identity.turn === identity.turn, exchanges: existing.session.reused });
         this.arm();
-        return existing.session;
+        return { session: existing.session, busy: false };
       }
       noteIdentityDebug({ event: "pool-acquire", hit: false, scope: identity.scope.slice(0, 8),
         reason: "reserve-failed", size: this.entries.size });
->>>>>>> theirs
       this.remove(existing);
-<<<<<<< ours
     } else if (codexWsReuseAcrossTurnsEnabled() && this.scopeCount(identity.scope) >= CODEX_WS_POOL_SCOPE_LIMIT) {
       const oldest = [...this.entries.values()]
         .filter(entry => entry.identity.scope === identity.scope && !entry.session.busy)
         .sort((left, right) => left.idleAt - right.idleAt)[0];
       if (!oldest) return { session: null, busy: false };
       this.remove(oldest);
-||||||| base
-=======
     } else {
       noteIdentityDebug({ event: "pool-acquire", hit: false, scope: identity.scope.slice(0, 8),
         reason: "no-entry", size: this.entries.size });
->>>>>>> theirs
     }
     if (this.entries.size >= this.maxSessions) {
       const oldest = [...this.entries.values()].filter(entry => !entry.session.busy).sort((a, b) => a.idleAt - b.idleAt)[0];
