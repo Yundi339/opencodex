@@ -61,6 +61,13 @@ clearManualAffinityArmCacheForTests();
 const restriction = "This account only allows Codex official clients";
 check("the restriction text is recognised", isRestrictionVerdictText(restriction));
 check("a load message is not a restriction", isRestrictionVerdictText("Our servers are currently overloaded") === false);
+// 2026-10-15: content-review verdicts are NOT restrictions. The cyber classifier's text contains
+// "cyber", and matching it here used to re-roll a conversation's routing identity for a verdict
+// about CONTENT -- an action that cannot help and reset the identity of every flagged session.
+check("the cyber content verdict is not a restriction",
+  isRestrictionVerdictText("This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request.") === false);
+check("a policy code is not a restriction",
+  isRestrictionVerdictText("Your request was rejected by the content policy") === false);
 check("a non-restriction message does nothing", (() => {
   noteThreadRestrictionVerdict(key, "invalid request", t0);
   return threadAffinityResetActive(key, t0 + 1000) === false;

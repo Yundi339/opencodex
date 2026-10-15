@@ -1,4 +1,5 @@
 import { createHmac, randomBytes } from "node:crypto";
+import { codexWsReuseAcrossTurnsEnabled } from "../../config/codex-ws-reuse-setting";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getConfigDir } from "../../config/paths";
@@ -10,6 +11,10 @@ import { CodexWsSession } from "./codex-ws-session";
 export const CODEX_WS_POOL_MAX_SESSIONS = 32;
 export const CODEX_WS_POOL_IDLE_MS = 30_000;
 export const CODEX_WS_POOL_MAX_AGE_MS = 5 * 60_000;
+export const CODEX_WS_POOL_WAIT_MS = 750;
+/** Retained sockets per account+thread while cross-turn reuse is on. */
+export const CODEX_WS_POOL_SCOPE_LIMIT = 2;
+const CODEX_WS_POOL_WAIT_DEPTH = 2;
 /**
  * Cross-turn reuse windows -- the socket survives the end of the turn that opened it.
  *
@@ -72,6 +77,7 @@ const IDENTITY_FIELDS_TOTAL_LIMIT_BYTES = 256 * 1024;
 let processKey: Buffer | undefined;
 let poolSequence = 0;
 
+export interface CodexWsReuseIdentity { key: string; scope: string; routeTag: string }
 /** Hashed turn label, so a reuse can be classified without holding a turn id in memory. */
 function turnToken(account: string, thread: string, turn: string): string {
   return digest(["turn", account, thread, turn]);
@@ -107,7 +113,10 @@ let crossTurnReuses = 0;
  * The check is read per call, so both switches take effect on the next turn without a restart.
  */
 export function codexWsCrossTurnReuseEnabled(): boolean {
-  return envFlag("OCX_WS_CROSS_TURN_REUSE", false) && Date.now() >= crossTurnBreakerUntil;
+  // Upstream 2.86 ships a config switch (codexWsReuseAcrossTurnsEnabled); the fork keeps its env
+  // switch. Either channel enables reuse; the fork breaker still gates both.
+  return (codexWsReuseAcrossTurnsEnabled() || envFlag("OCX_WS_CROSS_TURN_REUSE", false))
+    && Date.now() >= crossTurnBreakerUntil;
 }
 
 export function codexWsCrossTurnFirstFrameMs(): number {
@@ -130,7 +139,7 @@ export interface CodexWsCrossTurnStats {
 export function codexWsCrossTurnStats(): CodexWsCrossTurnStats {
   return {
     enabled: codexWsCrossTurnReuseEnabled(),
-    configured: envFlag("OCX_WS_CROSS_TURN_REUSE", false),
+    configured: envFlag("OCX_WS_CROSS_TURN_REUSE", false) || codexWsReuseAcrossTurnsEnabled(),
     breakerUntil: crossTurnBreakerUntil,
     attempts: crossTurnOutcomes.length,
     failures: crossTurnOutcomes.filter(ok => !ok).length,
@@ -269,8 +278,10 @@ export function codexWsReuseIdentity(url: string, headers: Record<string, string
   const lite = metadata.ws_request_header_x_openai_internal_codex_responses_lite;
   if (lite !== undefined && lite !== "true" && lite !== "false") return refuse("bad-lite-flag");
   // `dialUrl` is the socket destination after plugin rewrites; absent means the canonical one.
+  const routeTag = digest(["route", authorization, proxy ?? null, dialUrl ?? null]);
   const identity = {
     scope,
+    routeTag,
     turn: turnToken(account, thread, turn),
     key: digest([scope, authorization, body.model, body.service_tier ?? null, lite ?? null,
       immutable.map(([name, field]) => [name,
@@ -289,6 +300,7 @@ export function codexWsReuseIdentity(url: string, headers: Record<string, string
   return identity;
 }
 
+
 interface Entry {
   identity: CodexWsReuseIdentity;
   session: CodexWsSession;
@@ -298,11 +310,13 @@ interface Entry {
   /** True when the socket was opened while cross-turn reuse was on, so it uses the wider windows. */
   crossTurn: boolean;
 }
+interface Waiter { key: string; resolve: (session: CodexWsSession | null) => void; timer: ReturnType<typeof setTimeout>; onAbort: () => void; signal?: AbortSignal }
 interface PoolOptions {
   now?: () => number;
   maxSessions?: number;
   idleMs?: number;
   maxAgeMs?: number;
+  waitMs?: number;
   crossTurnIdleMs?: number;
   crossTurnMaxAgeMs?: number;
 }
@@ -310,6 +324,7 @@ interface PoolOptions {
 /** Bounded retained sockets only. Busy/capacity misses keep the existing one-shot path. */
 export class CodexWsPool {
   private readonly entries = new Map<string, Entry>();
+  private readonly waiters: Waiter[] = [];
   private timer?: ReturnType<typeof setTimeout>;
   private detachShutdown?: () => void;
   private readonly hookKey = `codex-upstream-ws-pool-${++poolSequence}`;
@@ -317,6 +332,7 @@ export class CodexWsPool {
   private readonly maxSessions: number;
   private readonly idleMs: number;
   private readonly maxAgeMs: number;
+  private readonly waitMs: number;
   private readonly crossTurnIdleMs: number;
   private readonly crossTurnMaxAgeMs: number;
   constructor(options: PoolOptions = {}) {
@@ -324,6 +340,7 @@ export class CodexWsPool {
     this.maxSessions = options.maxSessions ?? CODEX_WS_POOL_MAX_SESSIONS;
     this.idleMs = options.idleMs ?? CODEX_WS_POOL_IDLE_MS;
     this.maxAgeMs = options.maxAgeMs ?? CODEX_WS_POOL_MAX_AGE_MS;
+    this.waitMs = options.waitMs ?? CODEX_WS_POOL_WAIT_MS;
     this.crossTurnIdleMs = options.crossTurnIdleMs ?? CODEX_WS_CROSS_TURN_IDLE_MS;
     this.crossTurnMaxAgeMs = options.crossTurnMaxAgeMs ?? CODEX_WS_CROSS_TURN_MAX_AGE_MS;
   }
@@ -340,18 +357,59 @@ export class CodexWsPool {
   }
 
   acquire(identity: CodexWsReuseIdentity, url: string, headers: Record<string, string>, proxy?: string): CodexWsSession | null {
-    this.sweep();
-    for (const entry of this.entries.values()) {
-      if (entry.identity.scope !== identity.scope || entry.identity.key === identity.key) continue;
-      entry.retired = true;
-      if (!entry.session.busy) this.remove(entry);
+    return this.claim(identity, url, headers, proxy).session;
+  }
+
+  /**
+   * Before any frame is sent, wait for the matching busy socket instead of dialing a throwaway.
+   * The queue is FIFO and at most two deep. An abort or the deadline returns null.
+   */
+  acquireWaiting(
+    identity: CodexWsReuseIdentity,
+    url: string,
+    headers: Record<string, string>,
+    proxy: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<CodexWsSession | null> {
+    const claimed = this.claim(identity, url, headers, proxy);
+    if (claimed.session || !claimed.busy) return Promise.resolve(claimed.session);
+    if (signal?.aborted) return Promise.resolve(null);
+    if (this.waiters.filter(waiter => waiter.key === identity.key).length >= CODEX_WS_POOL_WAIT_DEPTH) {
+      return Promise.resolve(null);
     }
+    return new Promise(resolve => {
+      const waiter: Waiter = {
+        key: identity.key,
+        resolve,
+        signal,
+        timer: setTimeout(() => this.finishWaiter(waiter, null), this.waitMs),
+        onAbort: () => this.finishWaiter(waiter, null),
+      };
+      waiter.timer.unref?.();
+      signal?.addEventListener("abort", waiter.onAbort, { once: true });
+      this.waiters.push(waiter);
+    });
+  }
+
+  private claim(
+    identity: CodexWsReuseIdentity,
+    url: string,
+    headers: Record<string, string>,
+    proxy?: string,
+  ): { session: CodexWsSession | null; busy: boolean } {
+    this.sweep();
+    this.retireSiblings(identity);
     const existing = this.entries.get(identity.key);
     if (existing) {
-      if (existing.retired || existing.session.busy) {
+      if (existing.retired) {
         noteIdentityDebug({ event: "pool-acquire", hit: false, scope: identity.scope.slice(0, 8),
-          reason: existing.retired ? "retired" : "busy", size: this.entries.size });
-        return null;
+          reason: "retired", size: this.entries.size });
+        return { session: null, busy: false };
+      }
+      if (existing.session.busy) {
+        noteIdentityDebug({ event: "pool-acquire", hit: false, scope: identity.scope.slice(0, 8),
+          reason: "busy", size: this.entries.size });
+        return { session: null, busy: true };
       }
       // Handing a socket to a later turn is the experiment: label it on the session so every
       // settle that follows can be attributed, and give the exchange a bounded window to hear
@@ -367,18 +425,24 @@ export class CodexWsPool {
         noteIdentityDebug({ event: "pool-acquire", hit: true, scope: identity.scope.slice(0, 8),
           sameTurn: existing.identity.turn === identity.turn, exchanges: existing.session.reused });
         this.arm();
-        return existing.session;
+        return { session: existing.session, busy: false };
       }
       noteIdentityDebug({ event: "pool-acquire", hit: false, scope: identity.scope.slice(0, 8),
         reason: "reserve-failed", size: this.entries.size });
       this.remove(existing);
+    } else if (codexWsReuseAcrossTurnsEnabled() && this.scopeCount(identity.scope) >= CODEX_WS_POOL_SCOPE_LIMIT) {
+      const oldest = [...this.entries.values()]
+        .filter(entry => entry.identity.scope === identity.scope && !entry.session.busy)
+        .sort((left, right) => left.idleAt - right.idleAt)[0];
+      if (!oldest) return { session: null, busy: false };
+      this.remove(oldest);
     } else {
       noteIdentityDebug({ event: "pool-acquire", hit: false, scope: identity.scope.slice(0, 8),
         reason: "no-entry", size: this.entries.size });
     }
     if (this.entries.size >= this.maxSessions) {
       const oldest = [...this.entries.values()].filter(entry => !entry.session.busy).sort((a, b) => a.idleAt - b.idleAt)[0];
-      if (!oldest) return null;
+      if (!oldest) return { session: null, busy: false };
       this.remove(oldest);
     }
     const createdAt = this.now();
@@ -391,13 +455,45 @@ export class CodexWsPool {
     session.reserve();
     this.entries.set(identity.key, entry);
     this.detachShutdown ??= registerOptionalShutdownHook(this.hookKey, () => this.dispose());
-    return session;
+    return { session, busy: false };
+  }
+
+  private retireSiblings(identity: CodexWsReuseIdentity): void {
+    const reuseAcrossTurns = codexWsReuseAcrossTurnsEnabled();
+    for (const entry of this.entries.values()) {
+      if (entry.identity.scope !== identity.scope || entry.identity.key === identity.key) continue;
+      const routeChanged = entry.identity.routeTag !== identity.routeTag;
+      if (reuseAcrossTurns && !routeChanged) continue;
+      entry.retired = true;
+      if (!entry.session.busy) this.remove(entry);
+    }
+  }
+
+  private scopeCount(scope: string): number {
+    let count = 0;
+    for (const entry of this.entries.values()) if (entry.identity.scope === scope && !entry.retired) count += 1;
+    return count;
+  }
+
+  private finishWaiter(waiter: Waiter, session: CodexWsSession | null): void {
+    const index = this.waiters.indexOf(waiter);
+    if (index < 0) return;
+    this.waiters.splice(index, 1);
+    clearTimeout(waiter.timer);
+    waiter.signal?.removeEventListener("abort", waiter.onAbort);
+    waiter.resolve(session);
   }
 
   private changed(entry: Entry): void {
     if (this.entries.get(entry.identity.key) !== entry) return;
     if (entry.session.closed) this.entries.delete(entry.identity.key);
     else if (!entry.session.busy) {
+      const waiter = this.waiters.find(candidate => candidate.key === entry.identity.key);
+      if (waiter && !entry.retired && entry.session.reserve()) {
+        this.finishWaiter(waiter, entry.session);
+        this.arm();
+        return;
+      }
       entry.idleAt = this.now();
       if (entry.retired || entry.idleAt - entry.createdAt >= this.windows(entry).maxAgeMs) this.remove(entry);
     }
@@ -445,6 +541,7 @@ export class CodexWsPool {
     this.detachShutdown = undefined;
     const entries = [...this.entries.values()];
     this.entries.clear();
+    for (const waiter of [...this.waiters]) this.finishWaiter(waiter, null);
     for (const entry of entries) entry.session.dispose(new DOMException("codex websocket pool shutdown", "AbortError"));
   }
 

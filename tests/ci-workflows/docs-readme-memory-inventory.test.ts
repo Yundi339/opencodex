@@ -68,7 +68,6 @@ const PAGES = [
     observed: /(\d+) observed buffers/,
     stateStores: /(\d+) state-store registrations/,
     totalSentence: "process-retained state",
-  },] as const;
 
 /**
  * The number one page states for one claim.
@@ -119,3 +118,4 @@ describe("documented memory inventory counts match the registered rosters", () =
     });
   }
 });
+  },] as const;

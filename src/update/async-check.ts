@@ -52,7 +52,7 @@ export async function latestVersionAsync(
   installer: Installer,
   deps: AsyncLookupDeps = defaultDeps,
 ): Promise<string | null> {
-  if (installer === "source" || installer === "mise") return null;
+  if (installer === "source" || installer === "standalone" || installer === "mise") return null;
   if (!process.env.OCX_UPDATE_SPEC?.trim()) {
     // Same source as the synchronous lookup (fork-release.mjs), only awaited instead of blocked
     // on: the background check must not hold a turn open, and a failed lookup stays silent.
@@ -100,6 +100,7 @@ export async function latestVersionAsync(
       });
     });
   }
+
   let owner: PnpmGlobalOwner | null | undefined;
   try { owner = installer === "pnpm" ? await deps.ownerFn() : undefined; }
   catch { return null; }

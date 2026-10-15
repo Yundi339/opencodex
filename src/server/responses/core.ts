@@ -28,9 +28,6 @@ import { deliverAdapterResponse } from "./adapter-delivery";
 import { releaseUpstreamHostAdmission } from "../../codex/upstream-host-health";
 import { releaseCodexAuthContextProbeLease } from "../../codex/auth-context";
 import { runWithCompactionRecovery } from "./compaction-recovery";
-
-/** Public Responses entry and compatibility exports. Implementations live with their owners. */
-
 /**
  * Route one `/v1/responses` request through the adapter pipeline: recovery loop, passthrough
  * wire, image/web-search bridges, and the terminal-guard continuation.
@@ -51,7 +48,7 @@ export async function handleResponses(
   abortSignal.addEventListener("abort", cancel, { once: true });
   try {
     const response = await runWithCompactionRecovery(req, config, logCtx, {
-      ...options,
+      ...options, abortSignal,
       openAiSidecarAuth: options.openAiSidecarAuth === undefined
         ? captureExplicitOpenAiCallerAuth(req.headers, config) : options.openAiSidecarAuth,
       nativeCallerAuth: options.nativeCallerAuth === undefined
@@ -68,11 +65,14 @@ export async function handleResponses(
     }, handleResponsesInner);
     const finalResponse = ownsBudget
       ? finalizeOwnedTranslatorBudget(response, translatorBudget, {
-        provider: logCtx.provider,
-        model: logCtx.model,
-        comboId: logCtx.comboId,
-        direction: "response",
-        transport: "http",
+        turnStateWhere: {
+          provider: logCtx.provider,
+          model: logCtx.model,
+          comboId: logCtx.comboId,
+          direction: "response",
+          transport: "http",
+        },
+        signal: abortSignal,
       })
       : response;
     if (!accountLoad.lease) { release(); return finalResponse; }
@@ -81,9 +81,10 @@ export async function handleResponses(
     release();
     if (ownsBudget) translatorBudget.dispose();
     throw error;
+  } finally {
+    if (!options.comboInitialSend?.producerOwned) options.comboInitialSend?.permit.release();
   }
 }
-
 export async function handleComboResponses(
   req: Request,
   rawBody: unknown,
@@ -102,7 +103,6 @@ export async function handleComboResponses(
     requestDispatchers,
   );
 }
-
 /** Compose request phases while retaining the original admission-finally ownership. */
 async function handleResponsesInner(
   req: Request,
@@ -115,6 +115,7 @@ async function handleResponsesInner(
     pendingHostAdmissionLease: null,
     authCtx: { kind: "main", accountId: null },
   };
+  let releasePendingSend = () => {};
   try {
     const requestState = await prepareResponsesRequest(requestContext, admissionState, requestDispatchers);
     if (requestState instanceof Response) return requestState;
@@ -132,7 +133,7 @@ async function handleResponsesInner(
     const sendBudgetState = createResponsesSendBudget(requestContext);
     if (sendBudgetState instanceof Response) return sendBudgetState;
     if ("passthrough" in transportState.adapter && transportState.adapter.passthrough && !sidecarState.routedCompaction) {
-      return await executePassthroughResponse(
+      const passthroughResult = await executePassthroughResponse(
         requestContext,
         admissionState,
         requestState,
@@ -141,6 +142,9 @@ async function handleResponsesInner(
         responseEffects,
         sendBudgetState,
       );
+      if (passthroughResult instanceof Response) return passthroughResult;
+      const unclaimedHop = sendBudgetState.pendingHopPermit;
+      releasePendingSend = () => { if (sendBudgetState.pendingHopPermit === unclaimedHop) { unclaimedHop?.release(); sendBudgetState.pendingHopPermit = undefined; } };
     }
     const sidecarPlans = await executeResponsesSidecars(
       requestContext,
@@ -190,15 +194,14 @@ async function handleResponsesInner(
       continuationState,
     );
   } finally {
+    releasePendingSend();
     if (admissionState.pendingHostAdmissionLease) {
       releaseUpstreamHostAdmission(admissionState.pendingHostAdmissionLease);
       releaseCodexAuthContextProbeLease(admissionState.authCtx);
     }
   }
 }
-
 const requestDispatchers: ResponsesDispatchers = { handleResponses, handleComboResponses };
-
 export { adapterNeedsForcedContinuation } from "./core-replay";
 export {
   sidecarOutcomeRecorder, codexLogAccountId, usesCodexForwardPoolAuth, preAuthUpstreamHostCircuitKey,

@@ -1,4 +1,6 @@
 import type { TranslatorBudget } from "../../lib/translator-budget";
+import { finalizeTranslatorBudgetResponse } from "../../lib/translator-budget";
+import { isNonReplayableResponse, markResponseNonReplayable } from "../../lib/upstream-retry";
 import {
   createTurnStateSniffer,
   observeTurnStateResponseHeaders,
@@ -40,23 +42,32 @@ export const UPSTREAM_JSON_BODY_READ_OPTIONS = {
  * Owned here rather than in the shared marker carry so that this module and the carry do not
  * import each other; every wrapper in this file restates it alongside the rest.
  */
-export function finalizeOwnedTranslatorBudget(response: Response, budget: TranslatorBudget, turnStateWhere?: TurnStateWhere): Response {
+export function finalizeOwnedTranslatorBudget(
+  response: Response,
+  budget: TranslatorBudget,
+  options: { turnStateWhere?: TurnStateWhere; signal?: AbortSignal } = {},
+): Response {
   if (!response.body) {
     budget.dispose();
     return response;
   }
   const reader = response.body.getReader();
-  const turnStateSniffer = turnStateWhere ? createTurnStateSniffer(turnStateWhere) : undefined;
-  if (turnStateWhere) {
-    observeTurnStateUpstreamStatus(response.status, turnStateWhere);
-    observeTurnStateResponseHeaders(response.headers, turnStateWhere);
+  const turnStateSniffer = options.turnStateWhere ? createTurnStateSniffer(options.turnStateWhere) : undefined;
+  if (options.turnStateWhere) {
+    observeTurnStateUpstreamStatus(response.status, options.turnStateWhere);
+    observeTurnStateResponseHeaders(response.headers, options.turnStateWhere);
   }
   let finalized = false;
   const finalize = () => {
     if (finalized) return;
     finalized = true;
+    options.signal?.removeEventListener("abort", finalize);
     budget.dispose();
   };
+  // 2.86 reliability rule: an abort releases accounting even when no consumer ever
+  // pulls or cancels this body.
+  if (options.signal?.aborted) finalize();
+  else options.signal?.addEventListener("abort", finalize, { once: true });
   const body = new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {

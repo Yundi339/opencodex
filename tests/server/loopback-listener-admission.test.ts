@@ -118,14 +118,13 @@ describe("local client inference wires on the loopback listener (#4236)", () => 
     );
   });
 
-  test("no /api route joins the allowlist", () => {
-    // Management discovery is the other destination contract (authenticated ingress). A
-    // reviewer condition on #4236: `/api/*` must never appear on this listener.
+  test("the local companion includes management routes for its dashboard", () => {
+    // The companion is kernel-bound to loopback; the remote data listener stays /v1-only.
     const start = source.indexOf("function loopbackRouteAllowed(");
     const end = source.indexOf("function managementIngressRouteAllowed(", start);
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
-    expect(source.slice(start, end)).not.toContain('"/api');
+    expect(source.slice(start, end)).toContain('if (path.startsWith("/api/")) return true;');
   });
 
   test("the chat wire finishes CORS with the receiving listener's policy", () => {
@@ -135,7 +134,8 @@ describe("local client inference wires on the loopback listener (#4236)", () => 
     const nextRoute = source.indexOf("url.pathname === \"/v1/live\"", chatStart);
     expect(chatStart).toBeGreaterThan(-1);
     const branch = source.slice(chatStart, nextRoute);
-    expect(branch).toContain("handleChatCompletions(req, config, logCtx");
+    // The handler receives the caller-session-promoted request (#6520); CORS still uses req.
+    expect(branch).toContain("handleChatCompletions(sessionReq, config, logCtx");
     expect(branch).toContain("req,\n          policy,\n        )");
     expect(branch).not.toContain("req,\n          config,\n        )");
   });

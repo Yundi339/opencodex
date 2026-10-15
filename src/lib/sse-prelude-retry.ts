@@ -20,6 +20,8 @@
 const DEFAULT_HOLD_MS = 25_000;
 
 export interface SsePreludeDeclineRetryOptions {
+  /** Release the send reporter when this asynchronous stream finishes or is cancelled. */
+  onSettled?: () => void;
   /** Waits before each resend, indexed by rung; its length is the resend budget. */
   delaysMs: readonly number[];
   /** Perform one more physical send. Null when the caller has no rung left to spend. */
@@ -245,6 +247,8 @@ export function withSsePreludeDeclineRetry(
   const holdMs = options.holdMs ?? DEFAULT_HOLD_MS;
   let reader = response.body.getReader();
   let flushTimer: ReturnType<typeof setTimeout> | undefined;
+  let settled = false;
+  const settle = () => { if (!settled) { settled = true; options.onSettled?.(); } };
   const body = new ReadableStream<Uint8Array>({
     async start(controller) {
       let buffer = new Uint8Array(0);
@@ -271,6 +275,7 @@ export function withSsePreludeDeclineRetry(
         clearStall();
         clearTimeout(flushTimer); flushTimer = undefined;
         try { controller.close(); } catch { /* already closed */ }
+        settle();
       };
       /**
        * Swap in the next physical attempt. False when no stream could be obtained, in which case the
@@ -436,9 +441,10 @@ export function withSsePreludeDeclineRetry(
         if (!released && held.length > 0) flushHeld();
         clearStall();
         try { controller.error(error); } catch { /* already closed */ }
+        settle();
       }
     },
-    cancel() { clearTimeout(flushTimer); void reader.cancel(); },
+    cancel() { clearTimeout(flushTimer); void reader.cancel(); settle(); },
   });
   // The spliced body is still the same response: restate the identity markers the layers above
   // key on (a rebuilt Response carries none of them, and this wrapper sees every canonical
