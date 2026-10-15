@@ -25,7 +25,6 @@ import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { forkInstallSpec } from "./fork-release.mjs";
 
 /**
  * Dependency lookup confined to the candidate's OWN tree. This is the npm contract and it
@@ -397,18 +396,6 @@ export function transactionalNpmUpdate({
 }) {
   const rename = deps.rename ?? renameSync;
   const scopeDir = dirname(packageDir);
-  // This fork is published as a packed tarball attached to its own GitHub releases, never to a
-  // registry: @bitkyc08/opencodex@<version> has never existed on npm (ETARGET, after the proxy was
-  // already stopped), and if that name ever did resolve it would install the official upstream
-  // build over this fork. The spec comes from the fork source module, and an unresolved target
-  // fails closed before a staging directory is created.
-  const resolvedVersion = typeof targetVersion === "string" ? targetVersion.trim() : "";
-  const spec = resolvedVersion && !/^(latest|preview)$/.test(resolvedVersion)
-    ? forkInstallSpec(resolvedVersion, resolvedVersion.startsWith("v") ? resolvedVersion : "v" + resolvedVersion)
-    : null;
-  if (!spec) {
-    return { ok: false, phase: "stage", error: "no concrete version resolved from the fork release source; refusing to stage from the npm registry" };
-  }
   // Leftovers from earlier attempts are only reported; fresh unique stages step around them. This never fails.
   try { sweepUpdateLeftovers({ packageDir, pkgName, log, deps }); } catch { /* report-only */ }
   let stageRoot;
@@ -440,6 +427,7 @@ export function transactionalNpmUpdate({
       log("Left this update's staging directory in place (could not remove it: " + removal.code + "); later updates will not remove it either — delete it by hand once no OpenCodex process is running from it: " + basename(stageRoot));
     }
   };
+  const spec = pkgName + "@" + (targetVersion || tag);
   log("Staging " + spec + " into " + basename(stageRoot) + " next to the package");
   // npm 12 blocks lifecycle scripts by default. Bun's postinstall copies the selected
   // @oven/bun-* executable into bun/bin, so a successful npm exit without this narrow

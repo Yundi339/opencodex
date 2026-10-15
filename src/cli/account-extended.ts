@@ -1,5 +1,6 @@
+import { isAnthropicOAuthInstance } from "../providers/anthropic-instance";
 import { loadConfig } from "../config";
-import { cmdAnthropicAccountThreshold } from "./account-anthropic-threshold";
+import { anthropicProviderIdentityError, cmdAnthropicAccountThreshold } from "./account-anthropic-threshold";
 import { isReservedCodexAccountWord, reportCodexAccountTargetError, resolveCodexAccountTarget } from "./account-target";
 import { hasPassiveAccountQuota } from "../providers/quota";
 import { closeSync, openSync, readSync, readFileSync, statSync } from "node:fs";
@@ -41,7 +42,7 @@ const AUTO_NOTE = "auto (no pin — lowest-usage account is selected per request
 const EXTENDED_USAGE = `Usage:
   ocx account refresh <provider> [--json]
   ocx account auto-switch <provider> <on|off|status|threshold <0-100>> [--json]
-  ocx account auto-switch anthropic <on|off|status|inherit|threshold <0-100>> --account <id> [--json]
+  ocx account auto-switch <anthropic|anthropic2> <on|off|status|inherit|threshold <0-100>> --account <id> [--json]
   ocx account alias <provider> <id|alias|main> <display-name|-> [--json]
   ocx account priority <provider> <id|alias|main> [<-100..100|first|earlier|normal|later|last|reset>] [--json]
   ocx account pause <provider> <id|alias|main> [--json]
@@ -49,7 +50,7 @@ const EXTENDED_USAGE = `Usage:
   ocx account pause-exhausted <provider> [--json]
   ocx account strategy <provider> [<quota|round-robin|fill-first|least-loaded|reset-first>] [--json]
   ocx account sticky <provider> [<1-100>] [--json]
-  ocx account routes anthropic [--file <json-file>|--clear] [--json]
+  ocx account routes <anthropic|anthropic2> [--file <json-file>|--clear] [--json]
   ocx account remove <provider> <id|alias|main> --yes [--json]
   ocx account clear-cooldown <provider> <id|alias|main> [--json]
   ocx account add-key <provider> [--label <label>] [--json]
@@ -276,12 +277,6 @@ function quotaParts(quota: ProviderQuotaDto): string[] {
   const parts: string[] = [];
   const add = (label: string, percent: number | undefined, resetAt?: number) => {
     if (percent === undefined) return;
-    // Availability / model rows are a dot matrix, not a budget: printing "… 78% resets <date>"
-    // after them reads as a quota window and drags a percentage onto something that is a state.
-    if (/^(?:官方|渠道|模型)/.test(label)) {
-      parts.push(label);
-      return;
-    }
     parts.push(`${label} ${percent}%`);
     const reset = resetIso(resetAt);
     if (reset) parts.push(`resets ${reset}`);
@@ -294,13 +289,7 @@ function quotaParts(quota: ProviderQuotaDto): string[] {
 }
 
 export function providerQuotaLine(name: string, report: ProviderQuotaReportDto): string {
-  // The label carries what the windows cannot: which site/account the row describes, that site's
-  // own availability verdict, and the channel's cost multiplier.
-  const hold = report.capacityHold;
-  const parked = hold
-    ? `parked(capacity #${hold.escalations}) until ${new Date(hold.until).toISOString()}`
-    : undefined;
-  return [name, report.label, ...quotaParts(report.quota), parked].filter(Boolean).join(" ");
+  return [name, ...quotaParts(report.quota)].join(" ");
 }
 
 export async function readStdinLine(deps: AccountDeps): Promise<string> {
@@ -372,8 +361,8 @@ export async function cmdAutoSwitch(args: string[], deps: AccountDeps): Promise<
   const classified = configAndType(deps, name);
   // Anthropic keeps its threshold on its own pool contract; generic OAuth providers (#695)
   // and the Codex pool are accepted here.
-  if (!("error" in classified) && classified.type === "oauth" && name === "anthropic") return cmdAnthropicAccountThreshold(args, action, wantsJson, deps);
-  if ("error" in classified || classified.type === "api-key" || name === "anthropic") {
+  if (!("error" in classified) && classified.type === "oauth" && isAnthropicOAuthInstance(name)) return cmdAnthropicAccountThreshold(args, action, wantsJson, deps, name);
+  if ("error" in classified || classified.type === "api-key" || isAnthropicOAuthInstance(name)) {
     return usage("Error: auto-switch only applies to the openai Codex account pool or a generic OAuth provider pool");
   }
   const genericPool = classified.type === "oauth";
@@ -650,7 +639,7 @@ export async function cmdClearCooldown(args: string[], deps: AccountDeps): Promi
   if (!name || !requestedId || args.length) return usage();
   const classified = configAndType(deps, name);
   if ("error" in classified) return usage(`Error: ${classified.error}`);
-  if (classified.type !== "codex" && !(classified.type === "oauth" && name === "anthropic")) {
+  if (classified.type !== "codex" && !(classified.type === "oauth" && isAnthropicOAuthInstance(name))) {
     return usage(`Error: ${name} has no operator-clearable account cooldown`);
   }
   const baseUrl = await resolveBaseUrl(deps);
@@ -1120,7 +1109,8 @@ export async function cmdRoutes(args: string[], deps: AccountDeps): Promise<numb
   const wantsJson = flag(args, "--json");
   const file = flagValue(args, "--file");
   const clear = flag(args, "--clear");
-  if (args.shift() !== "anthropic" || args.length || (file.found && (!file.value || clear))) return usage();
+  const provider = args.shift();
+  if (!isAnthropicOAuthInstance(provider) || args.length || (file.found && (!file.value || clear))) return usage();
   const baseUrl = await resolveBaseUrl(deps);
   if (!baseUrl) return proxyUnreachable();
   let routes: unknown;
@@ -1135,10 +1125,12 @@ export async function cmdRoutes(args: string[], deps: AccountDeps): Promise<numb
   }
   const writing = file.found || clear;
   const response = await apiJson(deps, baseUrl, writing ? "PUT" : "GET",
-    writing ? "/api/pool/settings" : "/api/pool/settings?provider=anthropic",
-    writing ? { provider: "anthropic", routes: clear ? null : routes } : undefined);
+    writing ? "/api/pool/settings" : `/api/pool/settings?provider=${provider}`,
+    writing ? { provider, routes: clear ? null : routes } : undefined);
   if (response.status === 0) return proxyUnreachable(response.transportError);
   if (response.status !== 200) return apiError(response.json, "failed to manage Anthropic routes", response.status);
+  const identityError = anthropicProviderIdentityError(response.json, provider, "Anthropic routes");
+  if (identityError !== undefined) return identityError;
   if (wantsJson) console.log(JSON.stringify(response.json, null, 2));
   else console.log(JSON.stringify(response.json.routes ?? [], null, 2));
   return 0;

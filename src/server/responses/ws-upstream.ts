@@ -15,6 +15,7 @@ import type { NativeResponseControl } from "./native-response-control";
 // returned event frames as an SSE byte stream, so every downstream consumer
 // (passthrough relay, adapter parsers, usage sniffing) is unchanged.
 
+import { codexWsReuseAcrossTurnsEnabled } from "../../config/codex-ws-reuse-setting";
 import { compareBunVersions } from "../../lib/bun-stream-caps";
 import { resolveProxyRoute, socks5ProxyFromEnv } from "../../lib/proxy-env";
 import type { CodexWsQuotaObserver } from "./codex-ws-metadata";
@@ -22,14 +23,12 @@ import { CODEX_RESPONSES_HTTP_URL, CODEX_RESPONSES_WS_URL, CODEX_WS_FRAME_HEADER
 import { codexWsExchange } from "./codex-ws-exchange";
 import { CodexWsSession } from "./codex-ws-session";
 import { codexWsPool, codexWsReuseIdentity } from "./codex-ws-pool";
-import { codexWsLaneDisabled } from "./codex-ws-lane";
-import { codexWsCreateFrameExceedsLimit } from "./codex-ws-wire";
+import { codexWsCreateFrameExceedsLimit, type CodexWsPreOutputRefusalHold } from "./codex-ws-wire";
 import { isLoopbackUrl, rewriteWebSocketDial } from "../../plugins/upstream-hooks";
-import { conversationKeyFromHeaders, threadTransportDemotedToHttp } from "../ws-thread-transport";
-import { normalizeLogConversationId } from "../request-log-conversation";
+import { outboundCredentials } from "../../lib/outbound-credential-registry";
 export { CODEX_WS_LIVENESS_PING_INTERVAL_MS, CODEX_WS_RESPONSE_PRELUDE_TIMEOUT_MS, MAX_CODEX_WS_FRAME_BYTES, MAX_CODEX_WS_QUEUE_BYTES,
   MAX_CODEX_WS_CREATE_FRAME_BYTES, CODEX_WS_CREATE_FRAME_LIMIT_BYTES, codexWsCreateFrameExceedsLimit,
-  isCodexWsQuotaObservedResponse, isCodexWsUpstreamResponse } from "./codex-ws-wire";
+  isCodexWsQuotaObservedResponse, isCodexWsUpstreamResponse, isCodexWsPreludeProjection } from "./codex-ws-wire";
 export const MIN_BOUNDED_CODEX_WS_BUN_VERSION = "1.4.0";
 
 /**
@@ -102,8 +101,10 @@ export function planCodexWsDial(
   // and is authoritative; a pooled socket's upgrade copy is intentionally ignored. A rewriter
   // therefore cannot change them here, and the upgrade keeps the values the frame carries.
   const dialHeaders = { ...rewritten.headers };
+  const reuseAcrossTurns = codexWsReuseAcrossTurnsEnabled();
   for (const name of CODEX_WS_FRAME_HEADERS) {
-    if (Object.hasOwn(headers, name)) dialHeaders[name] = headers[name]!;
+    if (reuseAcrossTurns) delete dialHeaders[name];
+    else if (Object.hasOwn(headers, name)) dialHeaders[name] = headers[name]!;
     else delete dialHeaders[name];
   }
   const dial = { ...rewritten, headers: dialHeaders };
@@ -135,10 +136,6 @@ export function shouldUseCodexWsUpstream(
   // api.openai.com lane still requires the operator opt-in.
   if (url !== CODEX_RESPONSES_HTTP_URL
     && !(upstreamWebsocketConfigured && url === OPENAI_API_RESPONSES_URL)) return false;
-  // The lane-level breaker: the origin is closing every dial without answering, so stop spending a
-  // capacity ladder (5+12+25+45s) per turn on it and ride HTTP until the hold expires. See
-  // ./codex-ws-lane.ts for the measured shape this reacts to.
-  if (url === CODEX_RESPONSES_HTTP_URL && codexWsLaneDisabled()) return false;
   if ((init?.method ?? "GET").toUpperCase() !== "POST") return false;
   const body = init?.body;
   if (typeof body !== "string") return false;
@@ -148,43 +145,15 @@ export function shouldUseCodexWsUpstream(
   // substring matching) also keeps whitespace-formatted bodies routable.
   try {
     const parsed = JSON.parse(body) as unknown;
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)
-      || (parsed as Record<string, unknown>).stream !== true) return false;
-    // Per-thread demotion: a conversation the WS lane keeps shedding rides HTTP instead, while
-    // every other conversation keeps the faster lane. See ../ws-thread-transport.ts.
-    const candidates = codexWsThreadKeys(parsed as Record<string, unknown>, init);
-    return !candidates.some(key => threadTransportDemotedToHttp(key));
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      && (parsed as Record<string, unknown>).stream === true;
   } catch {
     return false;
   }
 }
 
-/**
- * Every identity this request could be known by in the transport ledger.
- *
- * The ledger records verdicts under the proxy's own conversation id, which is derived (and hashed)
- * from the caller's headers; the Codex client also names the thread in `client_metadata.thread_id`.
- * Checking both spellings keeps the demotion attached to the conversation even when the two differ.
- */
-function codexWsThreadKeys(
-  parsed: Record<string, unknown>,
-  init: RequestInit | undefined,
-): string[] {
-  const keys: string[] = [];
-  const fromHeaders = conversationKeyFromHeaders(init?.headers);
-  if (fromHeaders) keys.push(fromHeaders);
-  const metadata = parsed.client_metadata;
-  if (metadata && typeof metadata === "object" && !Array.isArray(metadata)) {
-    const thread = (metadata as Record<string, unknown>).thread_id;
-    if (typeof thread === "string" && thread.trim().length > 0) {
-      const normalized = normalizeLogConversationId(thread);
-      if (normalized && !keys.includes(normalized)) keys.push(normalized);
-    }
-  }
-  return keys;
-}
-
-export function codexWsUpstreamFetch(
+/** Select the bounded WS lane or HTTP fallback, forwarding receipts at physical dispatch. */
+export async function codexWsUpstreamFetch(
   url: string,
   init: RequestInit,
   sseFallback: typeof globalThis.fetch,
@@ -193,6 +162,9 @@ export function codexWsUpstreamFetch(
   beforeDispatch?: (headers: Headers) => void,
   nativeControl?: NativeResponseControl,
   beforeContinuation?: () => Promise<void>,
+  onPhysicalDispatch?: () => void,
+  /** Opt-in pre-output refusal hold (#6969); see codexWsExchange. */
+  preOutputRefusalHold?: CodexWsPreOutputRefusalHold,
 ): Promise<Response> {
   const prepared = prepareCodexWsRequest(url, init);
   if (!prepared) return sseFallback(url, prepareCodexHttpInit(url, init));
@@ -252,9 +224,21 @@ export function codexWsUpstreamFetch(
     // reused for a different destination or with stale plugin headers.
     const dial = planCodexWsDial(wsUrl, headers, proxy);
     if (!dial) return sseFallback(url, init);
+    // The final dial headers, after plugin rewrites, are what the WebSocket upstream receives; the
+    // per-turn headers planning drops from the upgrade still reach it inside the frame metadata.
+    outboundCredentials().remember(headers);
+    outboundCredentials().remember(dial.headers);
     const identity = control ? null : codexWsReuseIdentity(url, dial.headers, frameText, dial.proxy, dial.url);
-    session = (identity ? codexWsPool.acquire(identity, dial.url, dial.headers, dial.proxy) : null)
-      ?? new CodexWsSession(dial.url, dial.headers, false, undefined, dial.proxy);
+    const reuseAcrossTurns = identity !== null && codexWsReuseAcrossTurnsEnabled();
+    const pooled = identity
+      ? reuseAcrossTurns
+        ? await codexWsPool.acquireWaiting(identity, dial.url, dial.headers, dial.proxy, signal)
+        : codexWsPool.acquire(identity, dial.url, dial.headers, dial.proxy)
+      : null;
+    if (reuseAcrossTurns && signal?.aborted) {
+      return Promise.reject(signal.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+    }
+    session = pooled ?? new CodexWsSession(dial.url, dial.headers, false, undefined, dial.proxy);
     if (!session.busy && !session.reserve()) {
       session.dispose();
       return sseFallback(url, init);
@@ -265,7 +249,8 @@ export function codexWsUpstreamFetch(
   return codexWsExchange({
     session, url, init, prepared, sseFallback, onQuota, beforeDispatch,
     nativeControl: control,
-    beforeContinuation,
+    beforeContinuation, onPhysicalDispatch,
+    preOutputRefusalHold,
     bunVersion: typeof runtime === "string" ? runtime : runtime.version,
   });
 }

@@ -1,20 +1,12 @@
 import type { OcxComboTarget, OcxConfig } from "../types";
-import { getCachedProviderRoutingQuota, panelProviderDegraded, panelProviderHopeless } from "../providers/quota-routing-cache";
-import { providerQualityHeld } from "../providers/quality-holds";
+import { getCachedProviderRoutingQuota } from "../providers/quota-routing-cache";
 import type { ProviderQuota, ProviderQuotaWindow } from "../providers/quota-types";
 import { sleepWithAbort } from "../lib/upstream-retry";
 import {
   coolComboTarget,
   earliestComboCooldown,
-  isComboTargetBreakerOpen,
   isComboTargetInCooldown,
   snapshotComboQuotaCooldowns as snapshotTargetQuotaCooldowns,
-  comboBreakerPolicy,
-  comboTargetDeferred,
-  isProviderCapacityHeld,
-  providerHoldKind,
-  noteProviderSuccess,
-  noteComboTargetSuccess,
   type ComboFailureCooldownScope,
 } from "./failover";
 import { quotaResetRemainingMs } from "./reset-window";
@@ -31,8 +23,6 @@ export interface ComboPick {
   targetIndex: number;
   attempted: string[];
   writerGeneration: number;
-  /** Tier this pick came from: 0 healthy, 1 demoted, 2 held (the least-bad fallback). */
-  rank?: number;
 }
 
 interface SelectionState {
@@ -71,33 +61,11 @@ export class NoAvailableComboTargetsError extends Error {
   }
 }
 
-/**
- * The facts that make a target structurally unroutable: the provider is configured and enabled.
- * Everything the operator can recover from (quota, cooling, park, site verdict) is a preference,
- * not a structural fact — see `pickComboTarget`.
- */
-function targetProviderIsRoutable(config: OcxConfig, target: OcxComboTarget): boolean {
+function targetProviderIsUsable(config: OcxConfig, target: OcxComboTarget, now: number): boolean {
   if (!Object.hasOwn(config.providers, target.provider)) return false;
   const provider = config.providers[target.provider];
-  return Boolean(provider) && provider.disabled !== true;
-}
-
-/**
- * Panel/probe quota evidence says this provider has nothing left in the current window.
- *
- * A "skip", not a wall: the row steps aside while an alternative exists and is still tried once
- * when it is the only thing left, because a panel snapshot goes stale and a manual reset lands
- * between two exports. The window is matched per model, so a per-model custom window only hides
- * the rows that speak that model.
- */
-function targetProviderQuotaExhausted(config: OcxConfig, target: OcxComboTarget, now: number): boolean {
-  const provider = config.providers[target.provider];
-  if (!provider) return false;
-  return cachedProviderQuotaIsExhausted(getCachedProviderRoutingQuota(target.provider, provider, now), now, target.model);
-}
-
-function targetProviderIsUsable(config: OcxConfig, target: OcxComboTarget, now: number): boolean {
-  return targetProviderIsRoutable(config, target) && !targetProviderQuotaExhausted(config, target, now);
+  if (!provider || provider.disabled === true) return false;
+  return !cachedProviderQuotaIsExhausted(getCachedProviderRoutingQuota(target.provider, provider, now), now, target.model);
 }
 
 /** Capture usable providers' quota cooldowns; request eligibility is deferred to exhaustion. */
@@ -280,17 +248,6 @@ export function pickComboTarget(
     now?: number;
     /** Inspect a round-robin choice without mutating its sticky/weight state. */
     preview?: boolean;
-    /**
-     * Sticky choices, most recent first: targets this session lane already used, so the picker can
-     * keep the conversation on a provider whose prompt cache it primed.
-     */
-    prefer?: Pick<OcxComboTarget, "provider" | "model"> | Array<Pick<OcxComboTarget, "provider" | "model">>;
-    /**
-     * Last-resort pass: let a capacity-parked official row compete as a DEMOTED row instead of
-     * being unreachable. Only the combo ladder sets this, and only after its ordinary pass found
-     * nothing -- a parked account is still left alone while any other channel can serve.
-     */
-    allowCapacityParked?: boolean;
   } = {},
 ): ComboPick | null {
   const writerGeneration = captureConfigGeneration();
@@ -298,44 +255,11 @@ export function pickComboTarget(
   if (!combo) throw new UnknownComboError(comboId);
   const excluded = new Set(options.exclude ?? []);
   const now = options.now ?? Date.now();
-  /** Facts, not judgements: the provider is configured, the caller accepts it, it is not spent. */
-  const routable = (target: NormalizedComboTarget): boolean =>
-    targetProviderIsRoutable(config, target)
+  const eligible = (target: NormalizedComboTarget): boolean =>
+    targetProviderIsUsable(config, target, now)
+    && !isComboTargetInCooldown(comboId, target, now)
     && !excluded.has(targetKey(target))
     && (options.eligible?.(target) ?? true);
-  /**
-   * Three tiers, price order inside each. Only a TRIPPED breaker and the official OpenAI
-   * capacity ladder take a row out of reach, and even those stay reachable as the least-bad
-   * choice -- an operator asking for the next price step must never be answered "no targets"
-   * while a configured channel exists. Everything else here is a demotion:
-   *   0 healthy, 1 demoted (one-off cooldown, relay failure hold, site verdict, quota window,
-   *   recently stuck), 2 held (tripped breaker, official capacity hold).
-   */
-  const rankOf = (target: NormalizedComboTarget): number => {
-    if (!routable(target)) return -1;
-    const hold = providerHoldKind(target.provider, now);
-    // The official-OpenAI capacity lock is the operator's "leave this account alone" verdict:
-    // it is a hard exclusion, never a last-resort step. Surfacing its rate-limit/overload error as
-    // the ladder's final answer is what made a fully parked ladder look like a 429 storm, and
-    // walking a risk-controlled account to save one failed turn is the trade the ladder refuses.
-    if (hold === "capacity") return options.allowCapacityParked === true ? 1 : -1;
-    if (isComboTargetBreakerOpen(comboId, target, now)) return 2;
-    const demoted = hold === "failures"
-      || isComboTargetInCooldown(comboId, target, now)
-      // A quality hold is the one rank input that saw the CONTENT: a probe with a verified
-      // answer judged this provider's answers wrong (measured 2026-09-25: official gpt-6 answered
-      // 29 where the minimum is provably 21, five fresh sessions in a row). It demotes rather
-      // than excludes -- while any honest row exists this one steps aside, and a lane with
-      // nothing else left is still allowed to answer rather than to fail.
-      || providerQualityHeld(target.provider, now)
-      || panelProviderHopeless(target.provider, now)
-      || panelProviderDegraded(target.provider, now)
-      || comboTargetDeferred(comboId, target, now)
-      || targetProviderQuotaExhausted(config, target, now);
-    return demoted ? 1 : 0;
-  };
-  /** Same name the strategy branches below have always used: everything that may be picked. */
-  const eligible = (target: NormalizedComboTarget): boolean => rankOf(target) >= 0;
 
   let targetIndex = -1;
   if (combo.strategy === "round-robin") {
@@ -400,28 +324,7 @@ export function pickComboTarget(
   } else if (combo.strategy === "reset-window") {
     targetIndex = resetWindowIndex(config, combo.targets, eligible, now);
   } else {
-    // The configured price order decides; only the SITE's own "hopeless" verdict removes a step
-    // (ocxquota --export marks channels below the availability floor as exhausted).
-    //
-    // Demoting a merely-unhealthy provider was tried and reverted: it promoted the native
-    // ChatGPT row ahead of the ladder, and a native 5xx is non-replayable (the relay may already
-    // be generating that turn), so the combo stopped there instead of failing over. Order belongs
-    // to the operator; unavailability is handled by exclusion windows and the per-attempt
-    // first-byte timeout.
-    // Price order, except that a target which was STUCK recently drops behind the others for a
-    // while: paying the same first-byte timeout on it first, every turn, is what makes a ladder
-    // feel frozen even when it would eventually progress.
-    let bestIndex = -1;
-    let bestRank = Number.POSITIVE_INFINITY;
-    for (let index = 0; index < combo.targets.length; index++) {
-      const target = combo.targets[index]!;
-      const rank = rankOf(target);
-      if (rank < 0 || rank >= bestRank) continue;
-      bestIndex = index;
-      bestRank = rank;
-      if (rank === 0) break;
-    }
-    targetIndex = bestIndex;
+    targetIndex = combo.targets.findIndex(eligible);
   }
 
   if (targetIndex < 0) return null;
@@ -432,7 +335,6 @@ export function pickComboTarget(
     targetIndex,
     attempted: [...excluded, targetKey(target)],
     writerGeneration,
-    rank: rankOf(target),
   };
 }
 
@@ -444,10 +346,6 @@ export function noteComboSuccess(
 ): void {
   const key = targetKey(target);
   if (!mayCommitComboState(comboId, key, writerGeneration)) return;
-  // The breaker closes on successes for every strategy, including the plain failover ladder that
-  // the code below returns early from.
-  noteComboTargetSuccess(comboId, target, comboBreakerPolicy(combo));
-  noteProviderSuccess(target.provider);
   if (combo.strategy === "least-used") {
     let state = selectionState.get(comboId);
     if (!state) {
@@ -478,22 +376,6 @@ export function noteComboFailure(
     delete state.activeKey;
     state.successes = 0;
   }
-}
-
-/**
- * Whether a provider's failures may escalate onto the hour-scale capacity ladder.
- *
- * Only the OFFICIAL OpenAI forward row qualifies: its capacity / overload verdicts are OpenAI's
- * own risk control and last for hours. A relay's verdict is transient, so a relay keeps plain
- * failover + breaker (the shared 15-minute failure hold) and recovers on its own.
- *
- * Shared with the half-open probe path in the responses handler so a failed probe can never walk
- * a relay up that ladder.
- */
-export function providerUsesCapacityLadder(config: OcxConfig, provider: string): boolean {
-  const row = Object.hasOwn(config.providers, provider) ? config.providers[provider] : undefined;
-  return (row?.authMode ?? "key") === "forward"
-    || String(row?.baseUrl ?? "").includes("chatgpt.com");
 }
 
 export function advanceComboAfterFailure(
@@ -535,15 +417,9 @@ export function advanceComboAfterFailure(
     const cooldownTargets = options.cooldownScope === "provider" && combo
       ? combo.targets.filter(target => target.provider === pick.target.provider)
       : [pick.target];
-    // Only the OFFICIAL OpenAI row escalates into the hour-scale hold ladder: its capacity /
-    // overload verdicts are OpenAI's own risk control and last for hours. A relay's capacity
-    // verdict is transient, so it keeps plain failover + breaker and recovers on its own.
-    const officialOpenAi = providerUsesCapacityLadder(config, pick.target.provider);
     for (const target of cooldownTargets) {
       const recorded = coolComboTarget(pick.comboId, target, {
         ...options,
-        breaker: comboBreakerPolicy(combo),
-        capacityHoldLadder: officialOpenAi && target.provider === pick.target.provider,
         cooldownMs: options.cooldownMs ?? combo?.cooldownMs,
         writerGeneration: pick.writerGeneration,
       });
@@ -576,10 +452,6 @@ export async function pickComboTargetWithWait(
     abortSignal?: AbortSignal;
     now?: number;
     sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
-    /** Sticky choice forwarded to the picker (see pickComboTarget). */
-    prefer?: Pick<OcxComboTarget, "provider" | "model"> | Array<Pick<OcxComboTarget, "provider" | "model">>;
-    /** Last-resort pass forwarded to the picker (see pickComboTarget). */
-    allowCapacityParked?: boolean;
   },
 ): Promise<ComboPick | null> {
   const now = options.now ?? Date.now();
@@ -590,7 +462,7 @@ export async function pickComboTargetWithWait(
     && (customEligible?.(target) ?? true);
   const eligible = (target: NormalizedComboTarget): boolean => eligibleAt(target, now);
   // Milliseconds already slept inside this call. `waitForCooldownMs` is documented as a cap
-  // per *selection attempt*, so a deferral wait and the ordinary wait below must share it --
+  // per *selection attempt*, so a deferral wait and the ordinary wait below must share it —
   // otherwise a 3s deferral followed by a 9s ordinary wait spends 12s against a 10s budget.
   let spentWaitMs = 0;
 
@@ -599,7 +471,7 @@ export async function pickComboTargetWithWait(
   // waits rather than dispatching a target the operator marked emergency-only.
   //
   // It only ever defers. Every exit below falls through to the unchanged
-  // selection, which still sees the last-resort target -- a policy that could
+  // selection, which still sees the last-resort target — a policy that could
   // withhold it when no normal target is reachable would turn a fallback into
   // an outage, which is worse than the premature routing it prevents.
   const policyCombo = getCombo(config, comboId);
@@ -655,16 +527,12 @@ export async function pickComboTargetWithWait(
   const clock = now + spentWaitMs;
   const remainingWaitMs = options.waitForCooldownMs - spentWaitMs;
 
-  // The picker already tiers cooling rows behind healthy ones, so this only decides whether
-  // WAITING buys a healthy slot. A demoted pick is a usable answer, never a reason to stall.
   const pick = pickComboTarget(config, comboId, {
     exclude: excluded,
+    eligible: target => eligibleAt(target, clock),
     now: clock,
-    eligible: customEligible,
-    prefer: options.prefer,
-    allowCapacityParked: options.allowCapacityParked,
   });
-  if (!pick || pick.rank === 0 || remainingWaitMs <= 0 || options.abortSignal?.aborted) return pick;
+  if (pick || remainingWaitMs <= 0 || options.abortSignal?.aborted) return pick;
   const combo = getCombo(config, comboId);
   if (!combo) throw new UnknownComboError(comboId);
   const waitingTargets = combo.targets.filter(target =>
@@ -674,9 +542,9 @@ export async function pickComboTargetWithWait(
     && (customEligible?.(target) ?? true),
   );
   const earliest = earliestComboCooldown(comboId, waitingTargets, clock);
-  if (earliest === undefined) return pick;
+  if (earliest === undefined) return null;
   const delay = earliest.expiry - clock;
-  if (delay > remainingWaitMs) return pick;
+  if (delay > remainingWaitMs) return null;
   // The expiry computation above is the single source of truth for the wait budget.
   // Its target preserves configured order for ties.
   const target = earliest.target;
@@ -695,9 +563,7 @@ export async function pickComboTargetWithWait(
   return pickComboTarget(config, comboId, {
     exclude: excluded,
     now: clock + delay,
-    eligible: customEligible,
-    prefer: options.prefer,
-    allowCapacityParked: options.allowCapacityParked,
+    eligible: targetCandidate => eligibleAt(targetCandidate, clock + delay),
   });
 }
 

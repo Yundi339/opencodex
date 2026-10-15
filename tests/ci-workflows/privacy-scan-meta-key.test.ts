@@ -28,7 +28,7 @@ describe("privacy scan: sponsorship contact address", () => {
 
   test("still fails everywhere else", () => {
     const line = `Email: ${sponsorContact}`;
-    for (const file of ["devlog/_plan/x/000.md", "src/example.ts", "docs-site/src/content/docs/index.mdx", "README.zh-CN.md"]) {
+    for (const file of ["readme/README.ko.md", "devlog/_plan/x/000.md", "src/example.ts", "docs-site/src/content/docs/index.mdx"]) {
       expect(scanText(file, line).some(f => f.kind === "email")).toBe(true);
     }
   });

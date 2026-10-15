@@ -1,5 +1,7 @@
+import { canInferVendorContext, vendorContextInference } from "./vendor-context";
 import { effectiveProviderAlias, effectiveProviderAliasDecision } from "../../providers/default-aliases";
 import { initialModelSelectionPending } from "../../providers/initial-model-selection";
+import { supportsConfiguredUltraFast } from "./configured-tiers";
 import { execFileSync } from "node:child_process";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
@@ -35,7 +37,7 @@ import { modelInList } from "../../types";
 import { CODEX_REASONING_LEVELS, codexEffortRank, configuredReasoningEfforts, modelRecordValue, sanitizeCodexReasoningEfforts } from "../../reasoning-effort";
 import { isModelVisionSidecarConsumer } from "../../vision/eligibility";
 import { getModelMetadata, getModelMetadataCaseInsensitive, listModelMetadata, resolveMetadataProvider, type ModelMetadata } from "../../generated/model-metadata";
-import { enrichProviderFromRegistry, shouldCaseFoldMetadataModelId } from "../../providers/derive";
+import { azureVendorModelMetadata, enrichProviderFromRegistry, shouldCaseFoldMetadataModelId } from "../../providers/derive";
 import {
   captureFastPolicyAuthority,
   fastPolicyForModel,
@@ -217,9 +219,11 @@ export function routedMaxOutputTokens(
   model: CatalogModel,
   metadataId = model.id,
   metadataModelIdCaseFold?: boolean,
+  metadataConfigDir?: string,
 ): number | undefined {
   const discovered = positiveSafeInteger(model.maxOutputTokens);
-  const generated = generatedMaxOutputTokens(providerName, model.id, metadataId, metadataModelIdCaseFold);
+  const generated = positiveSafeInteger(azureVendorModelMetadata(provider.baseUrl, metadataId, metadataConfigDir)?.maxTokens)
+    ?? generatedMaxOutputTokens(providerName, model.id, metadataId, metadataModelIdCaseFold);
   const configured = positiveSafeInteger(
     modelRecordValue(provider.modelMaxOutputTokens, model.id),
   );
@@ -248,6 +252,7 @@ export function configuredReasoningSummarySupport(prov: OcxProviderConfig | unde
   return modelRecordValue(prov.modelReasoningSummaryDelivery, id) !== undefined ? true : undefined;
 }
 
+/** Reapply configured limits and captured wire capabilities without trusting stale discovery hints. */
 export function applyProviderConfigHints(
   name: string,
   prov: OcxProviderConfig,
@@ -255,6 +260,7 @@ export function applyProviderConfigHints(
   providerCap?: number,
   metadataModelIdCaseFold?: boolean,
   effectiveAlias?: string | null,
+  metadataConfigDir?: string,
 ): CatalogModel {
   const staticPolicy = resolveModelPolicy({
     providerName: name,
@@ -276,13 +282,14 @@ export function applyProviderConfigHints(
     : model.providerAlias;
   const configuredCap = staticPolicy.model.contextWindow ?? configuredContextWindow(prov, model.id);
   const configuredMaxInput = staticPolicy.model.maxInputTokens;
-  const maxOutputTokens = routedMaxOutputTokens(name, prov, model, model.id, metadataModelIdCaseFold);
+  const azureMetadata = azureVendorModelMetadata(prov.baseUrl, model.id, metadataConfigDir);
+  const maxOutputTokens = routedMaxOutputTokens(name, prov, model, model.id, metadataModelIdCaseFold, metadataConfigDir);
   const configuredAutoCompact = configuredAutoCompactTokenLimit(prov, model.id);
   // The resolver owns exact capability precedence and legacy exact/colon-family/case-fold fallback.
   // Removing an exact capability row therefore returns this projection to legacy-map inference.
-  let inputModalities = staticPolicy.model.inputModalities
-    ? [...staticPolicy.model.inputModalities]
-    : undefined;
+  const resolvedModalities = staticPolicy.model.inputModalities ?? model.inputModalities
+    ?? (azureMetadata?.input ? modelInputModalities({ id: model.id, input_modalities: azureMetadata.input }, undefined) : undefined);
+  let inputModalities = resolvedModalities ? [...resolvedModalities] : undefined;
   // The shared vision-sidecar consumer predicate keeps catalog advertisement and request-time
   // planning aligned. The catalog must still advertise image input — the Codex app
   // gates attachments client-side on input_modalities, and a text-only entry would block images
@@ -305,7 +312,12 @@ export function applyProviderConfigHints(
   // owns catalog publication, including an explicit provider-level false.
   const supportsServiceTier = serviceTierSupportFromPolicy(fastPolicy);
   const {
+    contextWindowInference: _staleContextInference,
+    contextWindow: _previousContextWindow,
+    contextCap: previousContextCap,
+    contextCapped: previousContextCapped,
     supportsServiceTier: _staleServiceTier,
+    supportsUltraFastTier: _staleUltraFastTier,
     fastTierDescription: _staleFastTierDescription,
     providerAlias: _staleProviderAlias,
     suppressSyntheticMax: _staleSuppressSyntheticMax,
@@ -313,15 +325,23 @@ export function applyProviderConfigHints(
   } = model;
   // 已发现窗口只允许被配置值压低；缺窗口时，已开的 Context cap 就是实际窗口。
   const discoveredWindow = githubCopilotCatalogContextWindow(name, prov, model.id,
-    typeof model.contextWindow === "number" && model.contextWindow > 0 ? model.contextWindow : undefined);
+    !model.contextWindowInference && typeof model.contextWindow === "number" && model.contextWindow > 0 ? model.contextWindow : undefined);
   const projectedLimits = clampObservedModelLimits(staticPolicy.model, {
     ...(discoveredWindow !== undefined ? { contextWindow: discoveredWindow } : {}),
     ...(typeof model.maxInputTokens === "number" && model.maxInputTokens > 0 ? { maxInputTokens: model.maxInputTokens } : {}),
   });
+  const azureWindow = positiveSafeInteger(azureMetadata?.contextWindow);
+  const inferredWindow = projectedLimits.contextWindow === undefined && azureWindow === undefined && canInferVendorContext(name, prov)
+    ? vendorContextInference(model.id) : undefined;
   const hintedWindow = projectedLimits.contextWindow
+    ?? azureWindow
+    ?? inferredWindow?.contextWindow
     ?? (providerCap !== undefined ? resolveUnknownRoutedContextWindow(providerCap) : undefined);
   const hinted = {
     ...modelWithoutServiceTier,
+    ...(!model.contextWindowInference && previousContextCap !== undefined
+      ? { contextCap: previousContextCap, contextCapped: previousContextCapped } : {}),
+    ...(inferredWindow ? { contextWindowInference: inferredWindow } : {}),
     ...(displayName !== undefined ? { displayName } : {}),
     ...(providerAlias !== undefined ? { providerAlias } : {}),
     ...(hintedWindow !== undefined ? { contextWindow: hintedWindow } : {}),
@@ -338,6 +358,7 @@ export function applyProviderConfigHints(
     ...(typeof supportsReasoningSummaries === "boolean" ? { supportsReasoningSummaries } : {}),
     ...(typeof supportsVerbosity === "boolean" ? { supportsVerbosity } : {}),
     ...(typeof supportsServiceTier === "boolean" ? { supportsServiceTier } : {}),
+    supportsUltraFastTier: supportsConfiguredUltraFast(fastPolicy),
     ...(supportsServiceTier === true && fastPolicy.fastTierDescription !== undefined
       ? { fastTierDescription: fastPolicy.fastTierDescription }
       : {}),
@@ -383,8 +404,9 @@ export function catalogHintsFromProviderConfig(
   contextCap?: number,
   metadataModelIdCaseFold?: boolean,
   effectiveAlias?: string | null,
+  metadataConfigDir?: string,
 ): Partial<CatalogModel> {
-  const hinted = applyProviderConfigHints(name, prov, { id, provider: name }, contextCap, metadataModelIdCaseFold, effectiveAlias);
+  const hinted = applyProviderConfigHints(name, prov, { id, provider: name }, contextCap, metadataModelIdCaseFold, effectiveAlias, metadataConfigDir);
   const { provider: _provider, id: _id, ...hints } = hinted;
   return hints;
 }
@@ -396,8 +418,9 @@ export function applyConfigHintsToCachedModels(
   contextCap?: number,
   metadataModelIdCaseFold?: boolean,
   effectiveAlias?: string | null,
+  metadataConfigDir?: string,
 ): CatalogModel[] {
-  return models.map(model => applyProviderConfigHints(name, prov, model, contextCap, metadataModelIdCaseFold, effectiveAlias));
+  return models.map(model => applyProviderConfigHints(name, prov, model, contextCap, metadataModelIdCaseFold, effectiveAlias, metadataConfigDir));
 }
 
 /** Catalog slugs whose configured model must not gain a missing synthetic max rung. */
@@ -424,7 +447,9 @@ export function suppressedSyntheticMaxCatalogSlugs(
   }
   return slugs;
 }
-export const QUIET_AUTHORITATIVE_CATALOG_PROVIDERS = new Set(["kimi", "xai"]);
+// google-antigravity: the static lineup is an entitlement superset (Claude 5.5 and Gemini 4 Argon
+// are per-account), so a live roster that omits some of it is the expected case, not drift.
+export const QUIET_AUTHORITATIVE_CATALOG_PROVIDERS = new Set(["kimi", "xai", "google-antigravity"]);
 
 export const CALLABLE_CONFIGURED_COMPATIBILITY_MODELS: Readonly<Record<string, ReadonlySet<string>>> = {
   // CodeBuddy's vendor defaults are real callable selectors — both the bundled manifests
@@ -492,21 +517,6 @@ const MODEL_DISCOVERY_METADATA_CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u202
 
 export function positiveSafeInteger(...values: unknown[]): number | undefined {
   return values.find(value => typeof value === "number" && Number.isSafeInteger(value) && value > 0) as number | undefined;
-}
-
-/**
- * Largest selectable tier in a provider's top-level context_windows array.
- *
- * xAI's Build gateway publishes the tier list ([256000, 500000]) next to a single
- * context_window that carries only the DEFAULT tier. The array is the capability, so its
- * maximum is the honest window; a missing or malformed array yields undefined and leaves
- * every other provider's resolution untouched.
- */
-export function contextWindowTierMax(value: unknown): number | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const tiers = value.filter((entry): entry is number =>
-    typeof entry === "number" && Number.isSafeInteger(entry) && entry > 0);
-  return tiers.length > 0 ? Math.max(...tiers) : undefined;
 }
 
 function normalizedMetadataString(raw: string, maxLength: number): string | undefined {
@@ -709,16 +719,6 @@ export function catalogHintsFromModelsApiItem(providerName: string, item: Provid
       // real values. Appended after the recognized fields for the same reason as the
       // llama.cpp entries above: no provider that already resolves changes behavior.
       capabilityRecord?.context_length,
-      // xAI's Build gateway (cli-chat-proxy.grok.com) reports BOTH a single
-      // top-level context_window -- the DEFAULT tier, 256k for grok-4.7 -- and a
-      // context_windows array listing the selectable tiers ([256000, 500000]).
-      // The array is the capability; the single value is only the default. Reading
-      // just the single value published 256k for a model xAI documents as a 500k
-      // window (docs.x.ai release notes), and the config-only-lowers clamp then made
-      // an operator-configured 500k unreachable entirely (measured 2026-10-14/15).
-      // Prefer the array's maximum; absent array keeps every other provider's
-      // current resolution unchanged.
-      contextWindowTierMax(item.context_windows),
       // OpenGateway publishes a top-level context_window. Keep this last so catalogs
       // already resolving through any recognized field retain their existing window.
       item.context_window,

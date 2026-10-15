@@ -1,6 +1,6 @@
+import { effectiveAzureOutputBudget } from "../../adapters/azure";
+import { resolveWireProtocolOverride } from "../adapter-resolve";
 import type { CodexAccountModelRefusal } from "../../combos/failover";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import {
   isCodexReasoningEffort,
   isDeclaredReasoningEffort,
@@ -21,9 +21,7 @@ import type { OcxComboDefaultEffort, OcxConfig } from "../../types";
 import type { RequestLogContext } from "../request-log";
 import type { HandleResponsesOptions, ResponsesDispatchers, ConsumedComboFailure } from "./core-options";
 import type { TranslatorBudget } from "../../lib/translator-budget";
-import { getConfigDir } from "../../config/paths";
 import {
-  claimProviderProbe,
   getCombo,
   comboRequestHasImageInput,
   pickComboTarget,
@@ -34,11 +32,6 @@ import {
   isComboTargetInCooldown,
   snapshotComboQuotaCooldowns,
   noteComboSuccess,
-  noteProviderCapacityVerdict,
-  finishProviderProbe,
-  earliestComboCooldownExpiry,
-  comboTargetDeferred,
-  isProviderCapacityHeld,
   comboFailureDecision,
   advanceComboAfterFailure,
   comboFailureCooldownScope,
@@ -48,11 +41,7 @@ import {
   type ComboPick,
   type JevCandidate,
   type JevDecision,
-  comboCooldownRetryAfterSeconds,
 } from "../../combos";
-import { cachedProviderQuotaIsExhausted } from "../../combos/resolve";
-import { getCachedProviderRoutingQuota, panelProviderHopeless } from "../../providers/quota-routing-cache";
-import { sleepWithAbort } from "../../lib/upstream-retry";
 import { formatErrorResponse } from "../../bridge";
 import { SEND_BUDGET_EXHAUSTED_CODE } from "../../lib/errors";
 import {
@@ -65,11 +54,10 @@ import { routeConcreteModel, comboRouteDecisionTrace } from "../../router";
 import { memoryModelRouteReason } from "./memory-models";
 import { poolAccountProviderLabel } from "../../providers/label";
 import { getAccountSet } from "../../oauth/store";
+import { configuredAnthropicInstance } from "../../providers/anthropic-instance";
 import {
+  anthropicRoutingFor,
   formatAnthropicProviderForLog,
-  getAnthropicAccountHealthSnapshot,
-  getAnthropicPoolRetryAfterSeconds,
-  getEligibleAnthropicAccounts,
 } from "../../oauth/anthropic-routing";
 import { codexAccountLogLabel } from "../../codex/account-label";
 import { codexQuotaScopeForModel, getCodexQuotaHealthSnapshot } from "../../codex/routing";
@@ -94,6 +82,7 @@ import {
   buildComboChildHeaders,
   createChildPassthroughCallbackGate,
   consumeComboFailure,
+  isLateAttributionRefusal,
 } from "./core-combo-failure";
 import {
   linkRequestSessionLane,
@@ -104,7 +93,7 @@ import {
 import type { CodexAuthContext } from "../../codex/auth-context";
 import type { ResponsesTerminalStatus } from "../../bridge";
 import { beginRequestAttempt, sealRequestAttemptIdentity, finishRequestAttempt } from "../request-log";
-import { forgetComboForLane, rememberComboForLane } from "./combo-session-recall";
+import { rememberComboForLane } from "./combo-session-recall";
 import { runTurnAdapterSseResponses } from "./core-lifetime";
 import { normalizePersistedJevDecision } from "../../usage/jev-stats";
 import {
@@ -114,128 +103,13 @@ import {
   markEagerRelaySseResponse,
 } from "../relay";
 import { preflightComboStreamResponse } from "./combo-stream-preflight";
-import { streamingContextOverflowResponse, jsonContextOverflowResponse } from "./context-overflow";
+import { streamingContextOverflowResponse, jsonContextOverflowResponse, lateAttributionLimitResponse } from "./context-overflow";
 import { mandatoryResponsesReasoningReplayUnavailable } from "./core-replay";
-import { isReplayRefusalCode, settleOperatorReplacement } from "../../lib/upstream-retry";
+import { settleOperatorReplacement } from "../../lib/upstream-retry";
 import { createComboProtocolLanes, dispatchNativeComboChild } from "./core-combo-native";
 import { createJevModelInvoker } from "./jev-model-invoke";
 import { comboRequestedEffortLabel } from "./combo-requested-effort";
 import { clientWireOf } from "../inference/client-wire";
-import {
-  COMBO_DEGENERATE_CODE,
-  guardComboDegenerateOutput,
-  markComboTargetDegenerate,
-  noteComboToolRoundTrip,
-} from "./combo-degenerate-output";
-
-/** Channel-shaped failure statuses: the row could not serve, but the request itself was fine. */
-const COMBO_CHANNEL_FAILURE_STATUSES = new Set([0, 401, 402, 403, 404, 408, 409, 410, 425, 429]);
-
-/**
- * One honest line about why the whole ladder ran out, or undefined when the TURN was the problem.
- *
- * The ladder used to hand the client the LAST attempt's error, usually a dead cheap relay's 403 or
- * 429, while the official row's first-byte timeout sat unmentioned one line above it. Codex answers
- * a 429 by retrying until it reports its own "exceeded retry limit", so the operator learns nothing.
- * This summary is produced only when EVERY attempt failed for a channel-shaped reason; a
- * request-shaped failure (400/413/422, context overflow) still surfaces untouched, because that one
- * describes the turn rather than the fleet.
- */
-function summarizeLadderExhaustion(
-  attempts: readonly { provider: string; status: number }[],
-): string | undefined {
-  if (attempts.length === 0) return undefined;
-  // A credential or entitlement verdict is the operator's to fix, and it is the one thing the
-  // envelope must not hide: a ladder whose every attempt came back 401/403 answers with its own
-  // status and body so the surface (and the person reading it) sees the auth failure, not a
-  // retryable "combo unavailable".
-  if (attempts.every(attempt => attempt.status === 401 || attempt.status === 403)) return undefined;
-  for (const attempt of attempts) {
-    if (attempt.status >= 500) continue;
-    if (COMBO_CHANNEL_FAILURE_STATUSES.has(attempt.status)) continue;
-    return undefined;
-  }
-  const grouped = new Map<string, number>();
-  for (const attempt of attempts) {
-    const key = `${attempt.provider} ${attempt.status === 0 ? "no-response" : attempt.status}`;
-    grouped.set(key, (grouped.get(key) ?? 0) + 1);
-  }
-  const parts = [...grouped.entries()]
-    .sort((left, right) => right[1] - left[1])
-    .slice(0, 4)
-    .map(([key, count]) => (count > 1 ? `${key} x${count}` : key));
-  return `${attempts.length} attempt(s): ${parts.join(", ")}`;
-}
-
-/** How long one combo target may wait for its first upstream byte. */
-const COMBO_ATTEMPT_FIRST_BYTE_TIMEOUT_MS = 90_000;
-/** Wall-clock budget for the whole ordered combo ladder. */
-const COMBO_LADDER_TOTAL_BUDGET_MS = 75_000;
-/** Do not start a new target when the remaining ladder slice is too small to be useful. */
-const COMBO_MIN_ATTEMPT_MS = 15_000;
-/** Same-site limiter verdicts in one ladder pass before sibling rows are skipped. */
-const COMBO_SITE_LIMIT_HITS = 3;
-const COMBO_LIMITED_PASS_WAIT_MAX_MS = 10_000;
-/** A later retry pass is deliberately disabled; the client can retry against a fresh ladder. */
-const COMBO_LIMITED_RETRY_PASSES = 0;
-/**
- * How many rows a ladder may walk past a replay refusal in one request. A refusal means "this
- * send died ambiguously", which is true of the row that answered it and silent about every other
- * row, so walking on is the honest reading. It is bounded because each hop is a real send: a
- * relay that resets every time must not cost sixteen sends per turn.
- */
-const COMBO_REFUSAL_HOPS = 2;
-const COMBO_LIMITED_RETRY_DEADLINE_MS = 45_000;
-
-/**
- * Probe a parked provider after its hold expires. The request uses the real local proxy path so
- * a recovered provider is re-admitted without making the next user turn pay for discovery.
- */
-function probeProviderInBackground(provider: string, model: string, apiKey: string | undefined): void {
-  let port = 0;
-  try {
-    const record = JSON.parse(readFileSync(join(getConfigDir(), "runtime-port.json"), "utf8")) as { port?: unknown };
-    if (typeof record.port === "number" && Number.isFinite(record.port)) port = record.port;
-  } catch { /* the probe is best effort */ }
-  if (!port || !apiKey) {
-    finishProviderProbe(provider, false);
-    return;
-  }
-  const body = JSON.stringify({
-    model: `${provider}/${model}`,
-    input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
-    max_output_tokens: 16,
-    stream: true,
-    store: false,
-  });
-  void fetch(`http://127.0.0.1:${String(port)}/v1/responses`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    body,
-    signal: AbortSignal.timeout(30_000),
-  }).then(async response => {
-    const ok = response.ok;
-    try { await response.body?.cancel(); } catch { /* best effort */ }
-    console.warn(`[combo] half-open probe ${provider}: HTTP ${response.status} -> ${ok ? "re-admitted" : "staying parked"}`);
-    finishProviderProbe(provider, ok);
-  }).catch(() => {
-    console.warn(`[combo] half-open probe ${provider}: request failed -> staying parked`);
-    finishProviderProbe(provider, false);
-  });
-}
-
-function comboFirstByteTimeoutResponse(provider: string, timeoutMs: number): Response {
-  return new Response(
-    JSON.stringify({
-      error: {
-        message: `Combo target "${provider}" produced no first byte within ${timeoutMs}ms`,
-        type: "upstream_timeout",
-        code: "upstream_timeout",
-      },
-    }),
-    { status: 504, headers: { "Content-Type": "application/json" } },
-  );
-}
 
 /**
  * Sends one combo target may run on its own before the ladder moves on. A target is a whole
@@ -246,10 +120,11 @@ export const COMBO_TARGET_BASE_SENDS = CODEX_TEXT_GUARDED_BUDGET_POLICY.baseSend
 
 function cooledPoolAccountLabel(config: OcxConfig, providerName: string, modelId: string, label: string | undefined): string | undefined {
   if (!label) return undefined;
-  if (providerName === "anthropic") {
-    const matches = getAccountSet("anthropic")?.accounts.filter(account =>
-      formatAnthropicProviderForLog("anthropic", account.id) === label) ?? [];
-    return matches.length === 1 && getAnthropicAccountHealthSnapshot(matches[0]!.id) ? label : undefined;
+  const instance = configuredAnthropicInstance(config, providerName);
+  if (instance && config.providers[providerName]?.authMode === "oauth") {
+    const matches = getAccountSet(instance)?.accounts.filter(account =>
+      formatAnthropicProviderForLog(instance, account.id) === label) ?? [];
+    return matches.length === 1 && anthropicRoutingFor(instance).getAnthropicAccountHealthSnapshot(matches[0]!.id) ? label : undefined;
   }
   const provider = config.providers[providerName];
   if (!provider || !isCanonicalOpenAiForwardProvider(provider)) return undefined;
@@ -280,12 +155,13 @@ export function isAnthropicPoolLocalRefusal(
   failedAccount: string | undefined,
   now = Date.now(),
 ): boolean {
-  return providerName === "anthropic"
+  const instance = configuredAnthropicInstance(config, providerName);
+  return instance !== undefined
     && config.providers[providerName]?.authMode === "oauth"
     && status === 429
     && failedAccount === undefined
-    && getEligibleAnthropicAccounts(now).length === 0
-    && getAnthropicPoolRetryAfterSeconds(now) !== null;
+    && anthropicRoutingFor(instance).getEligibleAnthropicAccounts(now).length === 0
+    && anthropicRoutingFor(instance).getAnthropicPoolRetryAfterSeconds(now) !== null;
 }
 
 /**
@@ -466,16 +342,6 @@ export async function executeComboResponses(
     comboId,
     targets: combo.targets,
   });
-  // Probe parked providers from the request path, once per hold expiry. A probe is deliberately
-  // fire-and-forget: it must never hold the user's ladder open or expose its response body.
-  const probeModels = new Map<string, string>();
-  for (const target of combo.targets) {
-    if (!probeModels.has(target.provider)) probeModels.set(target.provider, target.model);
-  }
-  const probeKey = config.apiKeys?.[0]?.key;
-  for (const [provider, model] of probeModels) {
-    if (claimProviderProbe(provider)) probeProviderInBackground(provider, model, probeKey);
-  }
   // The ladder's own scope, derived from what this combo DECLARES. It shares the request-wide
   // counter with the holder that arrived on options -- a combo child already inherited that
   // counter, but nothing read it as a limit across targets -- while its transition and
@@ -529,19 +395,6 @@ export async function executeComboResponses(
       : undefined,
     recoveredPlaintext: false,
   };
-  // A repeated identical tool call/result across turns is a no-progress channel failure. Record
-  // it before selecting the next target so the demotion affects this request immediately.
-  const comboDegenerateLane = sessionLaneIdFromRequest(req.headers);
-  const roundTripLoop = noteComboToolRoundTrip(comboDegenerateLane, body);
-  if (roundTripLoop) {
-    markComboTargetDegenerate(
-      roundTripLoop.comboId,
-      combo,
-      roundTripLoop.target,
-      `no-progress tool loop: ${roundTripLoop.signature} x${roundTripLoop.repeats} with identical results`,
-    );
-    forgetComboForLane(comboDegenerateLane, roundTripLoop.comboId);
-  }
   const reasoningReplayConversationId = reasoningReplayConversationIdFromResponsesRequest({
     clientThreadId: inboundClientThreadId,
     threadIdHeader: req.headers.get("thread-id"),
@@ -665,50 +518,6 @@ export async function executeComboResponses(
     return true;
   };
   const initialNow = Date.now();
-  const comboStartedAt = Date.now();
-  const comboProviderSiteKey = (baseUrl: string | undefined): string | undefined => {
-    if (typeof baseUrl !== "string" || baseUrl.trim() === "") return undefined;
-    try {
-      return new URL(baseUrl).host.toLowerCase();
-    } catch {
-      return baseUrl.trim().toLowerCase();
-    }
-  };
-  const siteRungCounts = new Map<string, number>();
-  const limitingSiteHits = new Map<string, number>();
-  const hotSites = new Set<string>();
-  const quotaHoldSites = new Set<string>();
-  let lastLimiterShape = false;
-  let limitedRetryPasses = 0;
-  let refusalHops = 0;
-  const siteKeyOf = (providerName: string): string =>
-    comboProviderSiteKey(config.providers[providerName]?.baseUrl) ?? providerName;
-  const passEligible = (target: (typeof combo.targets)[number]): boolean =>
-    targetEligible(target)
-    && !hotSites.has(siteKeyOf(target.provider))
-    && !quotaHoldSites.has(siteKeyOf(target.provider));
-  const describeComboGates = (attempted: ReadonlySet<string>): string => {
-    const now = Date.now();
-    return combo.targets.map(target => {
-      const reasons: string[] = [];
-      const provider = config.providers[target.provider];
-      if (!provider) reasons.push("unconfigured");
-      else if (provider.disabled === true) reasons.push("disabled");
-      else if (cachedProviderQuotaIsExhausted(
-        getCachedProviderRoutingQuota(target.provider, provider, now), now,
-      )) reasons.push("quota-exhausted");
-      if (attempted.has(targetKey(target))) reasons.push("attempted");
-      if (isComboTargetInCooldown(comboId, target, now)) reasons.push("cooldown");
-      if (isProviderCapacityHeld(target.provider, now)) reasons.push("provider-parked");
-      if (panelProviderHopeless(target.provider, now)) reasons.push("panel-hopeless");
-      if (comboTargetDeferred(comboId, target, now)) reasons.push("stuck-deferred");
-      if (hotSites.has(siteKeyOf(target.provider))) reasons.push("site-rate-limited");
-      if (quotaHoldSites.has(siteKeyOf(target.provider))) reasons.push("site-quota-exhausted");
-      if (!payloadEligible(target)) reasons.push("payload-ineligible");
-      if (!reasoningReplayEligible(target)) reasons.push("replay-incompatible");
-      return `${target.provider}${reasons.length > 0 ? `[${reasons.join("+")}]` : "[open]"}`;
-    }).join(" ");
-  };
   const pickWithWait = (pickOptions: {
     exclude?: Iterable<string>;
     eligible?: (target: NonNullable<typeof combo>["targets"][number]) => boolean;
@@ -718,35 +527,6 @@ export async function executeComboResponses(
     waitForCooldownMs: combo.waitForCooldownMs,
     abortSignal: options.abortSignal,
   });
-  const retryLadderAfterLimiterBackoff = async (): Promise<Awaited<ReturnType<typeof pickWithWait>> | undefined> => {
-    if (!lastLimiterShape || limitedRetryPasses >= COMBO_LIMITED_RETRY_PASSES) return undefined;
-    if (options.abortSignal?.aborted) return undefined;
-    if (Date.now() - comboStartedAt > COMBO_LIMITED_RETRY_DEADLINE_MS) return undefined;
-    const budgetLeftMs = (combo.ladderBudgetMs ?? COMBO_LADDER_TOTAL_BUDGET_MS)
-      - (Date.now() - comboStartedAt);
-    if (budgetLeftMs <= COMBO_MIN_ATTEMPT_MS) return undefined;
-    const now = Date.now();
-    const earliest = earliestComboCooldownExpiry(comboId, combo.targets, now);
-    const delayMs = Math.min(
-      earliest === undefined ? COMBO_MIN_ATTEMPT_MS : Math.max(earliest - now, 250),
-      COMBO_LIMITED_PASS_WAIT_MAX_MS,
-      Math.max(budgetLeftMs - COMBO_MIN_ATTEMPT_MS, 250),
-    );
-    console.warn(
-      `[combo] ${comboId}: every target answered rate-limit/5xx; pausing ${delayMs}ms before retry pass ${limitedRetryPasses + 1}/${COMBO_LIMITED_RETRY_PASSES}`,
-    );
-    try {
-      await sleepWithAbort(delayMs, options.abortSignal);
-    } catch {
-      return undefined;
-    }
-    if (options.abortSignal?.aborted) return undefined;
-    limitedRetryPasses += 1;
-    limitingSiteHits.clear();
-    hotSites.clear();
-    siteRungCounts.clear();
-    return await pickWithWait({ eligible: passEligible, now: Date.now() });
-  };
   let pick = await pickWithWait({
     eligible: targetEligible,
     now: initialNow,
@@ -934,42 +714,57 @@ export async function executeComboResponses(
         retryAfter: String(Math.max(1, Math.ceil(remainingQuotaCooldownMs / 1000))),
       }) : lastFailure;
   };
-  let lastAttempted = new Set<string>();
-  let ladderStopReason: "budget" | "no-eligible-target" | undefined;
+  // The caller's output ceiling, captured once so a floor applied to one target never
+  // leaks into the next. An established parent estimate wins; otherwise (combo dispatch
+  // precedes request preparation) the caller's own positive cap is reserved.
+  const callerBudget = isPlainObject(body) ? body.max_output_tokens : undefined;
+  const callerOutputCeilingTokens = logCtx.spendOutputCeilingTokens
+    ?? (typeof callerBudget === "number" && Number.isFinite(callerBudget) && callerBudget > 0
+      ? Math.trunc(callerBudget) : undefined);
   while (pick) {
     if (options.abortSignal?.aborted) return clientCancelledResponse();
-    const ladderBudgetMs = combo.ladderBudgetMs ?? COMBO_LADDER_TOTAL_BUDGET_MS;
-    if ((logCtx.attempts?.length ?? 0) > 0
-      && ladderBudgetMs - (Date.now() - comboStartedAt) <= COMBO_MIN_ATTEMPT_MS) {
-      ladderStopReason = "budget";
-      break;
-    }
-    const selectedTarget = pick.target;
     const firstComboTarget = comboTargetsDispatched === 0;
-    // The first target seeds the ledger's target identity and charges nothing; every later one
-    // is a real transition, refused once the declared hops, the alternate-target ledger or the
-    // request total are spent. `countedExternally` is required: the child charges its own
-    // physical sends, and charging here as well would halve the cap without saying so.
+    const targetRoute = routeConcreteModel(config, `${pick.target.provider}/${pick.target.model}`);
+    // The inherited spend tracker observes this parent log, before the child has its own label.
+    logCtx.spendPoolId = targetRoute.providerName;
+    // Combo prepays before its child normalizes the route; the parent tracker must
+    // already see this target's effective cap rather than a previous target's cap.
+    const spendProvider = resolveWireProtocolOverride(targetRoute.providerName, targetRoute.modelId,
+      targetRoute.provider, options.inboundWire ?? "responses", targetRoute.staticPolicy);
+    const outputBudget = effectiveAzureOutputBudget(spendProvider, callerBudget);
+    if (outputBudget !== callerBudget && typeof outputBudget === "number" && outputBudget > 0) {
+      logCtx.spendOutputCeilingTokens = Math.trunc(outputBudget);
+    } else if (callerOutputCeilingTokens === undefined) {
+      delete logCtx.spendOutputCeilingTokens;
+    } else {
+      logCtx.spendOutputCeilingTokens = callerOutputCeilingTokens;
+    }
+    // Derive the target's allowance before booking its initial send; the booking occupies it.
+    const targetSendBudget = comboSendScope
+      ? comboTargetSendBudget(comboSendScope, combo.targets.length - 1 - comboTargetsDispatched)
+      : options.sendBudget;
+    // Every target prepays one send. Only its child may consume that booking; later targets
+    // remain bounded by the shared total, transition ledger and per-target holdback.
+    // `countedExternally` is required: the child charges its own physical sends against this
+    // booking through the exact permit, and charging here as well would halve the cap.
     const hopDecision = comboSendScope?.reserveDispatch({
       sendClass: firstComboTarget ? "initial" : "combo-failover",
       targetKey: `${pick.target.provider}/${pick.target.model}`,
       countedExternally: true,
     });
-    if (hopDecision && hopDecision.allowed) hopDecision.permit.use();
-    else if (hopDecision && firstComboTarget) {
+    if (hopDecision && !hopDecision.allowed && firstComboTarget) {
       // A refused initial reservation authorizes no child send and has no upstream failure to return.
       return formatErrorResponse(429, SEND_BUDGET_EXHAUSTED_CODE, "request send budget exhausted before combo dispatch");
     }
-    else if (hopDecision) {
+    else if (hopDecision && !hopDecision.allowed) {
       // Out of budget is not this target's failure. The established exhaustion contract is to
       // return the last real upstream answer with its status, headers and any quota body
       // intact rather than to mint a synthetic error, and a later target only exists because
       // an earlier one already recorded one.
       return exhaustedFailure();
     }
-    const targetSendBudget = comboSendScope
-      ? comboTargetSendBudget(comboSendScope, combo.targets.length - 1 - comboTargetsDispatched)
-      : options.sendBudget;
+    const initialSend = hopDecision?.allowed ? { permit: hopDecision.permit, producerOwned: false } : undefined;
+    try {
     comboTargetsDispatched += 1;
     const childLog: RequestLogContext = {
       model: pick.target.model,
@@ -977,7 +772,6 @@ export async function executeComboResponses(
       ...(logCtx.conversationId ? { conversationId: logCtx.conversationId } : {}),
       ...(logCtx.surface ? { surface: logCtx.surface } : {}),
     };
-    const targetRoute = routeConcreteModel(config, `${pick.target.provider}/${pick.target.model}`);
     const targetReasoningEfforts = supportedLadderFor({
       provider: targetRoute.provider,
       modelId: targetRoute.modelId,
@@ -994,7 +788,7 @@ export async function executeComboResponses(
       initialJevDecision ? initialJevDecision.effort : comboDefaultEffort(config, comboId),
       initialJevDecision?.effort === null ? [] : targetReasoningEfforts,
       combo.reasoningEffortMode,
-      initialJevDecision !== undefined && initialJevDecision.effort !== null ? "force" : combo.defaultEffortMode,
+      initialJevDecision ? (initialJevDecision.effort === null ? "fallback" : "force") : combo.defaultEffortMode,
     );
     if (initialJevDecision) {
       delete childBody.service_tier;
@@ -1075,61 +869,10 @@ export async function executeComboResponses(
         if (childLog.terminalIncompleteReason !== undefined) logCtx.terminalIncompleteReason = childLog.terminalIncompleteReason;
         if (childLog.terminalErrorCode !== undefined) logCtx.terminalErrorCode = childLog.terminalErrorCode;
         if (childLog.upstreamError !== undefined) logCtx.upstreamError = childLog.upstreamError;
-        const terminalProvider = Object.hasOwn(config.providers, selectedTarget.provider)
-          ? config.providers[selectedTarget.provider]
-          : undefined;
-        const terminalOverloaded = (childLog.terminalHttpStatus ?? 0) >= 500
-          || /overload|capacity/i.test(childLog.upstreamError ?? "");
-        if (terminalProvider && isCanonicalOpenAiForwardProvider(terminalProvider) && terminalOverloaded) {
-          const hold = noteProviderCapacityVerdict(
-            selectedTarget.provider,
-            (childLog.upstreamError || "official provider overloaded").slice(0, 120),
-            Date.now(),
-          );
-          if (hold) {
-            console.warn(
-              `[combo] ${comboId}: ${selectedTarget.provider} parked ${Math.round((hold.until - Date.now()) / 60000)}min (capacity rung #${hold.escalations}, committed forward stream)`,
-            );
-          }
-        }
         options.onNativePassthroughTerminal?.(status);
       },
     });
     let response: Response;
-    // The timeout owns only this child. The parent signal remains the cancellation authority for
-    // the whole ladder, so a silent target can be abandoned without freezing later targets.
-    const attemptAbort = new AbortController();
-    const forwardParentAbort = (): void => attemptAbort.abort(options.abortSignal?.reason);
-    if (options.abortSignal) {
-      if (options.abortSignal.aborted) forwardParentAbort();
-      else options.abortSignal.addEventListener("abort", forwardParentAbort, { once: true });
-    }
-    const ladderRemainingMs = Math.max(COMBO_MIN_ATTEMPT_MS, ladderBudgetMs - (Date.now() - comboStartedAt));
-    const siteKey = comboProviderSiteKey(config.providers[selectedTarget.provider]?.baseUrl)
-      ?? selectedTarget.provider;
-    const siteRungsTried = siteRungCounts.get(siteKey) ?? 0;
-    siteRungCounts.set(siteKey, siteRungsTried + 1);
-    const siteDecayMs = siteRungsTried === 0
-      ? Number.POSITIVE_INFINITY
-      : siteRungsTried === 1
-        ? Math.max(COMBO_MIN_ATTEMPT_MS, 25_000)
-        : siteRungsTried <= 3
-          ? Math.max(COMBO_MIN_ATTEMPT_MS, 12_000)
-          : Math.max(COMBO_MIN_ATTEMPT_MS, 8_000);
-    const firstByteDeadlineMs = Math.min(
-      selectedTarget.firstByteTimeoutMs ?? combo.firstByteTimeoutMs ?? COMBO_ATTEMPT_FIRST_BYTE_TIMEOUT_MS,
-      ladderRemainingMs,
-      siteDecayMs,
-    );
-    let firstByteTimer: ReturnType<typeof setTimeout> | undefined;
-    const firstByteDeadline = new Promise<"deadline">(resolve => {
-      firstByteTimer = setTimeout(() => {
-        attemptAbort.abort(new Error(
-          `combo target ${selectedTarget.provider} produced no first byte within ${firstByteDeadlineMs}ms`,
-        ));
-        resolve("deadline");
-      }, firstByteDeadlineMs);
-    });
     try {
       const currentTargetProvider = pick.target.provider;
       const remainingTargets = combo.strategy === "jev"
@@ -1141,10 +884,11 @@ export async function executeComboResponses(
           && targetEligible(target)
           && !isComboTargetInCooldown(comboId, target),
         );
-      const nativeChild = protocolLanes?.nativeChild(pick.target, targetRoute, targetSendBudget);
-      const attemptOutcome = (nativeChild ? dispatchNativeComboChild({
+      const nativeChild = protocolLanes?.nativeChild(pick.target, targetRoute, targetSendBudget, initialJevDecision);
+      response = nativeChild ? await dispatchNativeComboChild({
         source: options.protocolSource!,
         plan: nativeChild,
+        comboDispatchPermit: hopDecision?.allowed ? hopDecision.permit : undefined,
         logCtx,
         childLog,
         attempt,
@@ -1162,15 +906,16 @@ export async function executeComboResponses(
           onCancel: callbackGate.onCancel,
           onResponseComplete: callbackGate.onResponseComplete,
         },
-      }) : requestDispatchers.handleResponses(childRequest, config, childLog, {
+      }) : await requestDispatchers.handleResponses(childRequest, config, childLog, {
         ...options,
         // A bridge child is a concrete route; the native source belongs to this loop only.
         ...(options.protocolSource ? { protocolSource: undefined } : {}),
         // After the spread: the child must run on THIS target's ladder, not on the holder the
         // parent arrived with.
-        abortSignal: attemptAbort.signal,
         sendBudget: targetSendBudget,
         comboAttempt: true,
+        comboInitialSend: initialSend,
+        comboDispatchPermit: hopDecision?.allowed ? hopDecision.permit : undefined,
         comboReplaySnapshot,
         deferCodexResetDerivedCooldown,
         // Attempt-relative TTFT is recorded HERE (not via childLog.firstOutputMs — a later
@@ -1188,25 +933,9 @@ export async function executeComboResponses(
         onNativePassthroughTerminal: callbackGate.onTerminal,
         onNativePassthroughCancel: callbackGate.onCancel,
         onResponseComplete: callbackGate.onResponseComplete,
-      })).then(
-        value => ({ kind: "response" as const, value }),
-        (error: unknown) => ({ kind: "error" as const, error }),
-      );
-      const settled = await Promise.race([attemptOutcome, firstByteDeadline]);
-      if (settled === "deadline") {
-        callbackGate.discard();
-        response = comboFirstByteTimeoutResponse(selectedTarget.provider, firstByteDeadlineMs);
-        consumedChildFailure = {
-          response,
-          classificationText: `combo attempt first-byte timeout after ${firstByteDeadlineMs}ms`,
-        };
-      } else if (settled.kind === "error") {
-        throw settled.error;
-      } else {
-        response = settled.value;
-        // Native Chat rebuilds its own body and does not apply the initial JEV effort.
-        restoreOriginalRequestedEffort(childLog, nativeChild ? undefined : initialJevDecision?.effort);
-      }
+      });
+      // Both lanes applied the initial choice before provider pins/caps; retain those transitions.
+      restoreOriginalRequestedEffort(childLog, initialJevDecision?.effort);
     } catch (error) {
       callbackGate.discard();
       if (options.abortSignal?.aborted) {
@@ -1215,9 +944,6 @@ export async function executeComboResponses(
       }
       finishRequestAttempt(attempt, 502, Date.now() - started, childLog.usage);
       throw error;
-    } finally {
-      if (firstByteTimer !== undefined) clearTimeout(firstByteTimer);
-      options.abortSignal?.removeEventListener("abort", forwardParentAbort);
     }
 
     if (options.abortSignal?.aborted) {
@@ -1228,28 +954,12 @@ export async function executeComboResponses(
 
     // A native Chat child reports a pre-stream failure by status before any byte, so its body
     // is never peeked; a non-OK one takes the ordinary failure path below.
-    if (response.ok
-      && (options.comboAttempt
-        || isNativePassthroughSseResponse(response)
-        || !runTurnAdapterSseResponses.has(response))
-      && clientWireOf(response) !== "chat") {
+    if (response.ok && !runTurnAdapterSseResponses.has(response) && clientWireOf(response) !== "chat") {
       const nativePassthrough = isNativePassthroughSseResponse(response);
       const eagerRelay = isEagerRelaySseResponse(response);
       let preflight;
-      let zeroOutputTimedOut = false;
-      const comboFailureFrame = (payload: unknown): boolean => {
-        if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
-        const type = (payload as { type?: unknown }).type;
-        return type === "error" || type === "response.failed" || type === "response.incomplete";
-      };
       try {
-        preflight = await preflightComboStreamResponse(response, childLog, comboFailureFrame, {
-          zeroOutputDeadlineAt: started + firstByteDeadlineMs,
-          onZeroOutputDeadline: () => {
-            zeroOutputTimedOut = true;
-            return comboFirstByteTimeoutResponse(selectedTarget.provider, firstByteDeadlineMs);
-          },
-        });
+        preflight = await preflightComboStreamResponse(response, childLog);
       } catch (error) {
         callbackGate.discard();
         if (options.abortSignal?.aborted) {
@@ -1263,12 +973,6 @@ export async function executeComboResponses(
         callbackGate.discard();
         terminalRecorder?.("failed", preflight.response.status);
         response = preflight.response;
-        if (zeroOutputTimedOut) {
-          consumedChildFailure = {
-            response,
-            classificationText: `combo attempt first-byte timeout: no output within ${firstByteDeadlineMs}ms`,
-          };
-        }
         preflightModelRefusal = preflight.codexModelRefusal;
       } else {
         response = preflight.response;
@@ -1300,22 +1004,7 @@ export async function executeComboResponses(
       options.onCodexAuthContextResolved?.(resolvedAuth);
       options.setTerminalOutcomeRecorder?.(terminalRecorder);
       callbackGate.commit();
-      const guardedResponse = guardComboDegenerateOutput(response, {
-        comboId,
-        combo,
-        target: completedTarget,
-        lane: comboDegenerateLane,
-        onVerdict: detail => {
-          logCtx.errorCode = COMBO_DEGENERATE_CODE;
-          logCtx.terminalHttpStatus = 502;
-          logCtx.upstreamError = `degenerate output: ${detail}`;
-          callbackGate.onTerminal("failed");
-          terminalRecorder?.("failed", 502);
-        },
-      });
-      if (isNativePassthroughSseResponse(response)) markNativePassthroughSseResponse(guardedResponse);
-      if (isEagerRelaySseResponse(response)) markEagerRelaySseResponse(guardedResponse);
-      return guardedResponse;
+      return response;
     }
 
     callbackGate.discard();
@@ -1340,6 +1029,10 @@ export async function executeComboResponses(
       retainCancelledAttempt();
       return clientCancelledResponse();
     }
+    // A member's local late-attribution refusal reaches the client only as the literal constant
+    // envelope: swap the response, keep every classification input, and skip the overflow rewrite.
+    const lateAttributionRefusal = isLateAttributionRefusal(failure);
+    if (lateAttributionRefusal) failure = { ...failure, response: lateAttributionLimitResponse() };
     sealRequestAttemptIdentity(
       attempt,
       childLog.provider,
@@ -1372,79 +1065,15 @@ export async function executeComboResponses(
     }
     // A non-replayable failure (the answer to a spent ambiguous-reset replacement) may follow a
     // send that already ran the turn, so no later target may receive it, whatever its status says.
-    const wsStage = attempt.codexWsStage;
-    const acceptedThenSilent = wsStage?.sent === true && (wsStage.relayedEvents ?? 0) === 0;
-    const forwardProvider = Object.hasOwn(config.providers, pick.target.provider)
-      ? config.providers[pick.target.provider]
-      : undefined;
-    const officialForward = !!forwardProvider && isCanonicalOpenAiForwardProvider(forwardProvider);
-    const silentOfficialFailure = officialForward && acceptedThenSilent && failure.response.status >= 500;
-    if (silentOfficialFailure) forgetComboForLane(sessionLaneIdFromRequest(req.headers), comboId);
-    // A replay refusal is a verdict on ONE row's send -- "this exchange died ambiguously and may
-    // already have run" -- not on the fleet. Stopping the ladder on it is what handed the client a
-    // bare 429: Codex answers 429 by NOT resending and reporting "exceeded retry limit, last
-    // status: 429 Too Many Requests", so one relay reset ended a turn whose later rows were all
-    // still available. The ladder keeps walking instead, bounded per request so a genuinely stuck
-    // turn cannot lap the target list.
-    // Only the proxy's own replay refusal earns a hop: it is a verdict on ONE row's send, and the
-    // rows behind it never saw the turn. Every other non-replayable failure is a row that may
-    // already have produced output, where a second send would bill and answer the turn twice.
-    const replayRefusal = failure.nonReplayable
-      && isReplayRefusalCode(failure.upstreamCode);
-    if (replayRefusal) refusalHops += 1;
-    const baseDecision = failure.nonReplayable
-      ? (replayRefusal && refusalHops <= COMBO_REFUSAL_HOPS ? "hop" : "stop")
+    const failureDecision = failure.nonReplayable || spentReplacement
+      ? "stop"
       : comboFailureDecision(failure.response.status, failure.classificationText, {
         code: failure.upstreamCode,
         codexModelRefusal: failure.codexModelRefusal,
       });
-    if (failure.nonReplayable && baseDecision === "hop") {
-      console.warn(
-        `[combo] ${comboId}: ${targetKey(pick.target)} refused a replay after an ambiguous reset; continuing the ladder (${refusalHops}/${COMBO_REFUSAL_HOPS})`,
-      );
-    }
-    // An ambiguous send whose one replacement is already spent may have run the turn, so no later
-    // target may receive it, whatever the status says. Otherwise the ladder keeps walking: a
-    // silent official forward failure is absorbed as a hop rather than handed to the client.
-    const failureDecision = spentReplacement
-      ? "stop"
-      : !failure.nonReplayable && silentOfficialFailure && baseDecision === "stop"
-        ? "hop"
-        : baseDecision;
-    const failureMessage = acceptedThenSilent && failure.response.status >= 500
-      ? `capacity: forward target closed before its first event (${failure.classificationText || "no detail"})`
-      : failure.classificationText;
-    lastLimiterShape = failure.response.status === 408 || failure.response.status === 425
-      || failure.response.status === 429 || failure.response.status >= 500
-      || /capacity|overloaded/i.test(failureMessage);
-    const failedSite = siteKeyOf(pick.target.provider);
-    const providerLevelVerdict =
-      (/usage_limit|insufficient_quota|insufficient_balance|套餐|weekly limit|weekly usage limit|subscription[_ ]?not[_ ]?found|no active subscription|subscription (?:is )?(?:missing|expired|inactive|unpaid)/i.test(failureMessage)
-        && !/rate.?limit/i.test(failureMessage))
-      || /upstream (?:access forbidden|authentication failed)|contact administrator/i.test(failureMessage);
-    if (providerLevelVerdict) {
-      if (!quotaHoldSites.has(failedSite)) {
-        quotaHoldSites.add(failedSite);
-        console.warn(
-          `[combo] ${comboId}: ${failedSite} reports a provider-level verdict (${failureMessage.slice(0, 80)}); skipping its remaining rows`,
-        );
-      }
-    }
-    if (lastLimiterShape) {
-      const hits = (limitingSiteHits.get(failedSite) ?? 0) + 1;
-      limitingSiteHits.set(failedSite, hits);
-      if (hits >= COMBO_SITE_LIMIT_HITS && !hotSites.has(failedSite)) {
-        hotSites.add(failedSite);
-        console.warn(
-          `[combo] ${comboId}: ${failedSite} answered ${hits} limiter verdicts in this pass; skipping its remaining rows until the retry pass`,
-        );
-      }
-    } else {
-      limitingSiteHits.delete(failedSite);
-    }
     const wantsStream = (rawBody as { stream?: unknown } | null)?.stream === true;
     // Local byte admission has its own diagnostic; do not relabel it as an upstream refusal.
-    const classifyOverflow = failure.response.status === 413
+    const classifyOverflow = failure.response.status === 413 && !lateAttributionRefusal
       && (wantsStream || (failure.upstreamCode !== "outbound_body_too_large"
         && failure.upstreamCode !== "translation_buffer_limit"));
     lastFailureClassifiesOverflow = classifyOverflow;
@@ -1510,17 +1139,16 @@ export async function executeComboResponses(
     const poolLocalRefusal = isAnthropicPoolLocalRefusal(
       config, pick.target.provider, failure.response.status, failedAccount, failureNow,
     );
-    lastAttempted = new Set(attemptedTargets);
     const nextPick = advanceComboAfterFailure(config, pick, {
       retryAfter: poolLocalRefusal ? undefined : failure.retryAfter,
       resetAt: failure.resetAt,
       cooldownMs: combo.cooldownMs,
       now: failureNow,
       cooldownScope: failureCooldownScope,
-      eligible: passEligible,
+      eligible: targetEligible,
       status: failure.response.status,
       code: failure.upstreamCode,
-      message: failureMessage,
+      message: failure.classificationText,
       failedAccount,
       onCooldownRecorded: target => {
         failedTargetCooldownRecorded ||= targetKey(target) === failedTargetKey;
@@ -1535,7 +1163,7 @@ export async function executeComboResponses(
     // difference is deliberate and is the whole point of the single-target retry.
     const retryAfterCooldown = () =>
       pickWithWait({
-        eligible: passEligible,
+        eligible: targetEligible,
         now: failureNow,
       });
     if (nextPick) {
@@ -1543,7 +1171,7 @@ export async function executeComboResponses(
     } else {
       pick = await pickWithWait({
         exclude: pick.attempted,
-        eligible: passEligible,
+        eligible: targetEligible,
         now: failureNow,
       });
       // A single-target combo with waitForCooldownMs has no alternate target to fail over to,
@@ -1585,45 +1213,11 @@ export async function executeComboResponses(
       }
       // Waiting or recovery may have observed cancellation after the check above.
       if (options.abortSignal?.aborted) return clientCancelledResponse();
-      // Hot-site marks are a pass-local ordering hint, not a permanent ban. If the healthy tail
-      // is empty, give the held-back rows one final chance before stopping the ladder.
-      if (hotSites.size > 0) {
-        const hotRetryPick = await pickWithWait({
-          exclude: attemptedTargets,
-          eligible: targetEligible,
-          now: Date.now(),
-        });
-        if (hotRetryPick) {
-          pick = hotRetryPick;
-          continue;
-        }
-      }
-      // A parked official row is normally skipped, but one last attempt is preferable to a
-      // synthetic unavailable response when every other channel is gone.
-      const parkedLastResort = pickComboTarget(config, comboId, {
-        exclude: attemptedTargets,
-        now: Date.now(),
-        // `passEligible`, not the plain target eligibility: the last resort exists to reach a
-        // capacity-PARKED row (official), never to resurrect rows this pass already skipped for a
-        // provider-level verdict -- a relay with no subscription answers the same 403 every time,
-        // and walking all sixteen of them as "last resorts" is what made the ladder crawl.
-        eligible: passEligible,
-        allowCapacityParked: true,
-      });
-      if (parkedLastResort) {
-        console.warn(
-          `[combo] ${comboId}: nothing else is eligible; trying the capacity-parked ${targetKey(parkedLastResort.target)} as a last resort`,
-        );
-        pick = parkedLastResort;
-        continue;
-      }
-      const retryPick = await retryLadderAfterLimiterBackoff();
-      if (retryPick) {
-        pick = retryPick;
-        continue;
-      }
-      ladderStopReason = "no-eligible-target";
-      adoptFailedChildLog(childLog);
+    }
+    } finally {
+      // External receipts make release a no-op after real work. runTurn owns its asynchronous
+      // producer; core transfers cleanup there before returning a streaming response.
+      if (!initialSend?.producerOwned) initialSend?.permit.release();
     }
   }
   const failure = exhaustedFailure();
@@ -1634,37 +1228,6 @@ export async function executeComboResponses(
     return (rawBody as { stream?: unknown } | null)?.stream === true
       ? streamingContextOverflowResponse(requestedModel, options.translatorBudget)
       : jsonContextOverflowResponse();
-  }
-  if (lastFailure) {
-    console.warn(
-      `[combo] ${comboId}: ladder stopped (${ladderStopReason ?? "exhausted"}) after ${logCtx.attempts?.length ?? 0} attempt(s), returning ${lastFailure.status}; gates: ${describeComboGates(lastAttempted)}`,
-    );
-    // A whole-fleet failure deserves one honest sentence instead of "last status: 429": the summary
-    // names every channel that refused, and the 429-shaped ones stop driving the client's retry loop.
-    const exhaustion = summarizeLadderExhaustion(logCtx.attempts ?? []);
-    if (exhaustion) {
-      console.warn(
-        `[combo] ${comboId}: every channel failed for a channel-shaped reason (${exhaustion}); returning combo_unavailable`,
-      );
-      return comboUnavailableResponse(
-        `No combo target could serve this turn - every channel failed (${exhaustion}).`,
-        { retryAfter: comboCooldownRetryAfterSeconds(comboId) },
-      );
-    }
-  }
-  // Nothing above summarized this stop, and the answer still carries 429 -- the one status the
-  // Codex client does not retry, so it reports "exceeded retry limit, last status: 429 Too Many
-  // Requests" and the turn is lost even though the ladder had targets left. The ladder owns the
-  // client contract, so it answers with its own 503: Codex resends, the refused row is cooling by
-  // then, and the next row gets the turn.
-  if (lastFailure && lastFailure.status === 429) {
-    console.warn(
-      `[combo] ${comboId}: ladder stopped (${ladderStopReason ?? "exhausted"}) on a 429 - answering combo_unavailable instead of a raw rate-limit`,
-    );
-    return comboUnavailableResponse(
-      "No combo target could serve this turn - every remaining channel answered rate-limit or refused the send.",
-      { retryAfter: comboCooldownRetryAfterSeconds(comboId) },
-    );
   }
   return failure;
 }

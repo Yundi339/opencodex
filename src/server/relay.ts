@@ -6,13 +6,14 @@ import {
   isCyberPolicyCode,
   isCyberPolicyMessage,
   isTerminalRefusalCode,
+  recognizedUpstreamError,
   safetyRefusalCodeFromMessage,
   terminalRefusalFallbackMessage,
   upstreamErrorMessageFromPayload,
 } from "../lib/errors";
 import { redactSecretString } from "../lib/redact";
 import { isTranslatorBudgetExceededError } from "../lib/translator-budget";
-import { carryReplayRefusal } from "../lib/upstream-retry";
+import { carryReplayRefusal, isReplayRefusalResponse } from "../lib/upstream-retry";
 import { isUsageDebugEnabled } from "../usage/debug";
 import {
   addRequestLog,
@@ -38,8 +39,10 @@ import { clientWireLogOf } from "./inference/client-wire";
 import { recordClientWireRequestLog } from "./inference/client-wire-log";
 import { nativeResponseFingerprint } from "./responses/native-response-json";
 import { nativeResponseOutput } from "./responses/native-response-output";
-import { isNativePassthroughSseResponse, isPreinspectedJsonResponse } from "./sse-response-markers";
 
+const nativePassthroughSseResponses = new WeakSet<Response>();
+const eagerRelaySseResponses = new WeakSet<Response>();
+const preinspectedJsonResponses = new WeakSet<Response>();
 
 export const MAX_INSPECTION_SSE_FRAME_BYTES = MAX_CLIENT_SSE_FRAME_BYTES;
 export const MAX_COMPLETED_OUTPUT_ITEMS = 256;
@@ -166,25 +169,28 @@ export function failedTailFrame(encoder: TextEncoder, err: unknown, maskCredenti
  * classifies this terminal by `error.code` alone and retries everything outside
  * its fatal set (codex-rs/codex-api/src/sse/responses.rs:423-450), so stamping
  * `upstream_server_error` on a refusal delivered it as a retryable disconnect
- * and drove the reconnect loop in #5176. Without a refusal code the terminal is
- * unchanged: a genuine transport failure stays retryable, which is what it is.
+ * and drove the reconnect loop in #5176. Without a refusal code the terminal
+ * carries only recognized rate-limit/overload classes; unknown codes stay generic.
  */
 export function upstreamErrorTailFrame(
   encoder: TextEncoder,
   message: string,
   refusalCode?: string,
   maskCredential?: (text: string) => string,
+  errorType?: string,
+  errorCode?: string,
 ): Uint8Array {
   return encoder.encode(
-    `event: response.failed\ndata: ${upstreamErrorFailedPayload(message, refusalCode, maskCredential)}\n\n`,
+    `event: response.failed\ndata: ${upstreamErrorFailedPayload(message, refusalCode, maskCredential, errorType, errorCode)}\n\n`,
   );
 }
 
-function upstreamErrorFailedPayload(message: string, refusalCode?: string, maskCredential?: (text: string) => string): string {
+function upstreamErrorFailedPayload(message: string, refusalCode?: string, maskCredential?: (text: string) => string, errorType?: string, errorCode?: string): string {
   const diagnostic = redactSecretString(message);
+  const recognized = recognizedUpstreamError({ type: errorType, code: errorCode });
   const error = {
-    type: refusalCode === undefined ? "upstream_error" : "invalid_request_error",
-    code: refusalCode === undefined ? "upstream_server_error" : (maskCredential?.(refusalCode) ?? refusalCode),
+    type: refusalCode === undefined ? (recognized?.type ?? "upstream_error") : "invalid_request_error",
+    code: refusalCode === undefined ? (recognized?.code ?? "upstream_server_error") : (maskCredential?.(refusalCode) ?? refusalCode),
     message: (maskCredential?.(diagnostic) ?? diagnostic).slice(0, MAX_TAIL_ERROR_MESSAGE_CHARS),
   };
   return JSON.stringify({
@@ -547,6 +553,8 @@ export function relaySseWithFailedTail(
                   upstreamError,
                   terminalBoundary.upstreamRefusalCode(),
                   opts?.maskCredential,
+                  terminalBoundary.upstreamErrorType(),
+                  terminalBoundary.upstreamErrorCode(),
                 ));
               controller.enqueue(doneFrame(encoder));
             }
@@ -896,6 +904,11 @@ export function responseWithDeferredRequestLog(
   logCtx: RequestLogContext,
   addLog: (entry: RequestLogEntry) => void = addRequestLog,
 ): Response {
+  // A synthetic 429 is a transport verdict, not evidence that the provider declined the turn.
+  if (isReplayRefusalResponse(response)) {
+    logCtx.causeHint = "transport-ambiguous";
+    logCtx.terminalSource = "synthetic";
+  }
   const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
   if (isUsageDebugEnabled() && !logCtx.usageDebugContentType && contentType) {
     logCtx.usageDebugContentType = contentType;
@@ -916,7 +929,7 @@ export function responseWithDeferredRequestLog(
       // Retain EOF/cancel logging there, but do not materialize and parse the same near-limit
       // response a second time merely for metadata the first pass already published.
       const preinspectedJson = contentType.includes("application/json")
-        && isPreinspectedJsonResponse(response);
+        && preinspectedJsonResponses.has(response);
       const body = createBoundedResponseLogBody(response.body, {
         json: contentType.includes("application/json"),
         ...(preinspectedJson ? { maxInspectionBytes: 0 } : {}),
@@ -975,17 +988,34 @@ export function responseWithDeferredRequestLog(
   });
 }
 
-// The markers themselves live in sse-response-markers.ts: they are read and restated by layers
-// that must not pull the relay (and its request-log import) into their own import cycle. The JSON
-// preinspection marker rides along, because the same rebuilt-Response carry has to restate it.
-export {
-  markNativePassthroughSseResponse,
-  isNativePassthroughSseResponse,
-  markEagerRelaySseResponse,
-  isEagerRelaySseResponse,
-  markPreinspectedJsonResponse,
-  isPreinspectedJsonResponse,
-} from "./sse-response-markers";
+export function markNativePassthroughSseResponse(response: Response): Response {
+  nativePassthroughSseResponses.add(response);
+  return response;
+}
+
+/** Mark bounded JSON whose request-log metadata was already derived from its source events. */
+export function markPreinspectedJsonResponse(response: Response): Response {
+  preinspectedJsonResponses.add(response);
+  return response;
+}
+
+export function isPreinspectedJsonResponse(response: Response): boolean {
+  return preinspectedJsonResponses.has(response);
+}
+
+export function isNativePassthroughSseResponse(response: Response): boolean {
+  return nativePassthroughSseResponses.has(response);
+}
+
+export function markEagerRelaySseResponse(response: Response): Response {
+  eagerRelaySseResponses.add(response);
+  return response;
+}
+
+/** Test-only path identity seam; runtime behavior must not branch on this marker. */
+export function isEagerRelaySseResponse(response: Response): boolean {
+  return eagerRelaySseResponses.has(response);
+}
 
 export function relaySseWithHeartbeat(
   body: ReadableStream<Uint8Array> | null,

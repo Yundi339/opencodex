@@ -18,6 +18,21 @@ import { readAntigravityWireSnapshot, writeAntigravityWireSnapshot, type Antigra
 const GEMINI_FLASH_CURRENT = "gemini-3.8-flash";
 
 /**
+ * Gemini 4 Argon. Like 3.8 it publishes one wire id per tier (`-low/-medium/-high`) and no
+ * `-tiered` row, verified 2026-10-14 against live CCA. CCA serves these ids only to the CLI
+ * User-Agent (see antigravityUserAgentForWireModel), and only to AI Ultra / Enterprise accounts.
+ */
+const GEMINI_ARGON = "gemini-4-argon";
+
+/**
+ * Claude 5.5 on Antigravity: one wire id per tier (`-low/-medium/-high`), each 1,000,000 tokens
+ * with image input, observed in live CCA discovery on 2026-10-03
+ * (devlog/_fin/261003_release_lane_c). They ride the IDE User-Agent like every non-Argon model.
+ */
+const CLAUDE_OPUS_55 = "claude-opus-5-5";
+const CLAUDE_SONNET_55 = "claude-sonnet-5-5";
+
+/**
  * Previous Flash generation — still served, still picker-visible.
  *
  * 3.6 vanished from CCA the moment 3.7 shipped, which is why RETIRED_FLASH_TIERS exists. 3.8
@@ -28,15 +43,14 @@ const GEMINI_FLASH_CURRENT = "gemini-3.8-flash";
 const GEMINI_FLASH_PREVIOUS = "gemini-3.7-flash";
 
 /**
- * Wire ID that CCA accepts for the RETIRED-tier redirect target (currently 3.8).
+ * Wire ID that CCA accepts for the RETIRED-tier redirect target (currently 3.7).
  *
- * Moved from `gemini-3.7-flash-tiered` on 2026-10-15: a live :fetchAvailableModels call that
- * day returned 3.8 (tieredModelIds.flash) and NO 3.7 wire ids at all -- Google retired 3.7 the
- * same way it retired 3.6 before it, so a redirect target named for 3.7 had become a dead end
- * for every saved 3.5/3.6 selection. 3.8 now carries the `-tiered` suffix, making the role
- * (redirect target) and the current generation coincide again.
+ * Google renamed 3.7 to carry a `-tiered` suffix; the picker-visible ID stays
+ * `gemini-3.7-flash` (stripped by `pickerModelIdForDiscoveredWireId`). This constant is named
+ * for its ROLE, not for the current generation: 3.8 is current and has no `-tiered` id, so a
+ * name like GEMINI_FLASH_WIRE_ID would now point readers at the wrong model.
  */
-const GEMINI_RETIRED_FLASH_TARGET_WIRE_ID = "gemini-3.8-flash-tiered";
+const GEMINI_RETIRED_FLASH_TARGET_WIRE_ID = "gemini-3.7-flash-tiered";
 
 /**
  * Retired Flash ids → the reasoning tier they used to encode.
@@ -67,9 +81,6 @@ const RETIRED_FLASH_TIERS: Record<string, string> = {
 
 const ANTIGRAVITY_WIRE_MODELS = [
   "gemini-3.7-flash-tiered",
-  "gemini-3-flash",
-  "gemini-3.5-flash-lite",
-  "gemini-3.1-flash-lite",
   "gemini-3.1-pro-low",
   "gemini-pro-agent",
   "gemini-3.1-flash-image",
@@ -79,6 +90,15 @@ const ANTIGRAVITY_WIRE_MODELS = [
 ];
 
 const ANTIGRAVITY_PICKER_MODEL_BY_WIRE_ID: Record<string, string> = {
+  "claude-opus-5-5-low": CLAUDE_OPUS_55,
+  "claude-opus-5-5-medium": CLAUDE_OPUS_55,
+  "claude-opus-5-5-high": CLAUDE_OPUS_55,
+  "claude-sonnet-5-5-low": CLAUDE_SONNET_55,
+  "claude-sonnet-5-5-medium": CLAUDE_SONNET_55,
+  "claude-sonnet-5-5-high": CLAUDE_SONNET_55,
+  "gemini-4-argon-low": GEMINI_ARGON,
+  "gemini-4-argon-medium": GEMINI_ARGON,
+  "gemini-4-argon-high": GEMINI_ARGON,
   "gemini-3.8-flash-low": "gemini-3.8-flash",
   "gemini-3.8-flash-medium": "gemini-3.8-flash",
   "gemini-3.8-flash-high": "gemini-3.8-flash",
@@ -168,8 +188,11 @@ function collapsesIntoKnownPickerModel(candidateId: string): boolean {
 // Claude Opus: effort → thinkingConfig.thinkingLevel (CLIProxyAPI proven pattern).
 export const ANTIGRAVITY_MODEL_EFFORTS: Record<string, string[]> = {
   // No `minimal`: Google documents it as an error for this generation, and CCA exposes only
-  // the three tiers.
+  // the three tiers. Argon documents the same ladder (`minimal` is an HTTP 400).
+  [GEMINI_ARGON]: ["low", "medium", "high"],
   "gemini-3.8-flash": ["low", "medium", "high"],
+  [CLAUDE_OPUS_55]: ["low", "medium", "high"],
+  [CLAUDE_SONNET_55]: ["low", "medium", "high"],
   "gemini-3.7-flash": ["low", "medium", "high"],
   "gemini-3.1-pro": ["low", "high"],
   "claude-sonnet-4-6": ["low", "medium", "high", "max"],
@@ -179,7 +202,23 @@ export const ANTIGRAVITY_MODEL_EFFORTS: Record<string, string[]> = {
 // ── Effort → wire model map for Gemini base models ──
 const ANTIGRAVITY_EFFORT_WIRE_MAP: Record<string, Record<string, string>> = {
   // 3.8 publishes one wire id per tier and no `-tiered` row, so its efforts ride the suffix.
-  // This is the 3.6 shape, not the 3.7 one.
+  // This is the 3.6 shape, not the 3.7 one. Argon has the same shape.
+  [GEMINI_ARGON]: {
+    low: "gemini-4-argon-low",
+    medium: "gemini-4-argon-medium",
+    high: "gemini-4-argon-high",
+  },
+  // Claude 5.5 publishes the same per-tier suffix family.
+  [CLAUDE_OPUS_55]: {
+    low: "claude-opus-5-5-low",
+    medium: "claude-opus-5-5-medium",
+    high: "claude-opus-5-5-high",
+  },
+  [CLAUDE_SONNET_55]: {
+    low: "claude-sonnet-5-5-low",
+    medium: "claude-sonnet-5-5-medium",
+    high: "claude-sonnet-5-5-high",
+  },
   "gemini-3.8-flash": {
     low: "gemini-3.8-flash-low",
     medium: "gemini-3.8-flash-medium",
@@ -202,7 +241,7 @@ const ANTIGRAVITY_EFFORT_WIRE_MAP: Record<string, Record<string, string>> = {
  * `gemini-3.1-pro` is deliberately absent: its `high` rung is `gemini-pro-agent`, which carries
  * no tier suffix, so there the level is the only thing naming the effort.
  */
-const ANTIGRAVITY_SUFFIX_TIER_MODELS = new Set(["gemini-3.8-flash"]);
+const ANTIGRAVITY_SUFFIX_TIER_MODELS = new Set([GEMINI_ARGON, "gemini-3.8-flash", CLAUDE_OPUS_55, CLAUDE_SONNET_55]);
 
 function completeDiscoveredEffortWireModelIds(
   pickerId: string,
@@ -227,7 +266,11 @@ function completeDiscoveredEffortWireModelIds(
 // ── Default effort per Gemini base model ──
 const ANTIGRAVITY_DEFAULT_EFFORT: Record<string, string> = {
   // Google's documented thinking_level default, and the tier CCA marks `recommended`.
+  [GEMINI_ARGON]: "medium",
   "gemini-3.8-flash": "medium",
+  // Matches the discovered-family default (medium), so static and live resolution agree.
+  [CLAUDE_OPUS_55]: "medium",
+  [CLAUDE_SONNET_55]: "medium",
   "gemini-3.1-pro": "high",
 };
 
@@ -289,13 +332,26 @@ export const ANTIGRAVITY_MODEL_ALIASES: Record<string, string> = {
   ...ANTIGRAVITY_COMPATIBILITY_MODEL_ALIASES,
 };
 
-// Picker-visible: collapsed base models only.
+// Static picker lineup: collapsed base models only, exactly "3.8 / 4 / 5.5 / 5.5" (2026-10-14).
+// Anything else reaches the picker only when live discovery returns it.
 export const ANTIGRAVITY_MODELS = [
   GEMINI_FLASH_CURRENT,
+  GEMINI_ARGON,
+  CLAUDE_OPUS_55,
+  CLAUDE_SONNET_55,
+];
+
+/**
+ * Every base id the routing and discovery rules recognise: the static lineup plus models that
+ * left it. Removing a model from the picker must not change how a saved selection routes or how
+ * a discovered row collapses, so these legacy bases stay known here. Live discovery on
+ * 2026-10-14 no longer returns gemini-3.7-flash(-tiered) or the gemini-3.1-pro wire ids (both
+ * 404), but still returns the Claude 4.6 rows and gpt-oss-120b-medium, which therefore keep
+ * appearing through discovery.
+ */
+export const ANTIGRAVITY_KNOWN_PICKER_MODELS: readonly string[] = [
+  ...ANTIGRAVITY_MODELS,
   GEMINI_FLASH_PREVIOUS,
-  "gemini-3-flash",
-  "gemini-3.5-flash-lite",
-  "gemini-3.1-flash-lite",
   "gemini-3.1-pro",
   "gemini-3.1-flash-image",
   "claude-sonnet-4-6",
@@ -304,17 +360,23 @@ export const ANTIGRAVITY_MODELS = [
 ];
 
 function isKnownAntigravityPickerModelId(value: string): boolean {
-  return isValidModelDiscoveryModelId(value) && ANTIGRAVITY_MODELS.includes(value);
+  return isValidModelDiscoveryModelId(value) && ANTIGRAVITY_KNOWN_PICKER_MODELS.includes(value);
 }
 
 // Context windows from the upstream `:fetchAvailableModels` maxTokens per model.
 const ANTIGRAVITY_WIRE_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
+  "claude-opus-5-5-low": 1_000_000,
+  "claude-opus-5-5-medium": 1_000_000,
+  "claude-opus-5-5-high": 1_000_000,
+  "claude-sonnet-5-5-low": 1_000_000,
+  "claude-sonnet-5-5-medium": 1_000_000,
+  "claude-sonnet-5-5-high": 1_000_000,
+  "gemini-4-argon-low": 1_048_576,
+  "gemini-4-argon-medium": 1_048_576,
+  "gemini-4-argon-high": 1_048_576,
   "gemini-3.8-flash-low": 1_048_576,
   "gemini-3.8-flash-medium": 1_048_576,
   "gemini-3.8-flash-high": 1_048_576,
-  "gemini-3-flash": 1_048_576,
-  "gemini-3.5-flash-lite": 1_048_576,
-  "gemini-3.1-flash-lite": 1_048_576,
   "gemini-3.7-flash-tiered": 1_048_576,
   "gemini-3.1-pro-low": 1_048_576,
   "gemini-pro-agent": 1_048_576,
@@ -326,11 +388,11 @@ const ANTIGRAVITY_WIRE_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
 
 export const ANTIGRAVITY_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   // Collapsed base IDs — explicit entries for the picker.
+  [GEMINI_ARGON]: 1_048_576,
   "gemini-3.8-flash": 1_048_576,
+  [CLAUDE_OPUS_55]: 1_000_000,
+  [CLAUDE_SONNET_55]: 1_000_000,
   "gemini-3.7-flash": 1_048_576,
-  "gemini-3-flash": 1_048_576,
-  "gemini-3.5-flash-lite": 1_048_576,
-  "gemini-3.1-flash-lite": 1_048_576,
   "gemini-3.1-pro": 1_048_576,
   // Wire IDs and aliases via derivation.
   ...ANTIGRAVITY_WIRE_MODEL_CONTEXT_WINDOWS,
@@ -343,15 +405,15 @@ export const ANTIGRAVITY_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
 };
 
 export const ANTIGRAVITY_MODEL_INPUT_MODALITIES: Record<string, string[]> = {
+  [GEMINI_ARGON]: ["text", "image"],
+  [CLAUDE_OPUS_55]: ["text", "image"],
+  [CLAUDE_SONNET_55]: ["text", "image"],
   // Google documents 3.7 Flash as also accepting video, audio and PDF, but this proxy
   // carries only text and image parts (`OcxImageContent`, src/types.ts) and the Codex
   // catalog normalizes `input_modalities` against a closed enum. Advertising a modality
   // the wire cannot carry would be a promise we break at request time.
   "gemini-3.8-flash": ["text", "image"],
   "gemini-3.7-flash": ["text", "image"],
-  "gemini-3-flash": ["text", "image"],
-  "gemini-3.5-flash-lite": ["text", "image"],
-  "gemini-3.1-flash-lite": ["text", "image"],
   "gemini-3.1-pro": ["text", "image"],
   "gemini-3.1-flash-image": ["text", "image"],
   "claude-sonnet-4-6": ["text", "image"],
@@ -657,7 +719,7 @@ export function resolveAntigravityWireModelId(modelId: string, baseUrl?: string)
  * IS the effort, and sending both creates a contradictory request.
  */
 export function isAntigravitySuffixModelId(modelId: string): boolean {
-  return !(ANTIGRAVITY_MODELS as string[]).includes(modelId);
+  return !ANTIGRAVITY_KNOWN_PICKER_MODELS.includes(modelId);
 }
 
 /** The reasoning tier a retired Flash id used to encode, if it is one. */
@@ -705,9 +767,9 @@ export function resolveAntigravityEffortWireModel(
     };
   }
 
-  // Rule 0: retired Flash id — Google has taken the wire id offline, so route to the current
-  // redirect target (3.8-tiered since 2026-10-15; 3.7 itself was retired that week) and carry
-  // the tier the retired id encoded.
+  // Rule 0: retired Flash id — Google has taken the wire id offline, so route to the 3.7
+  // redirect target and carry the tier the retired id encoded. (3.7, not "the current
+  // generation": 3.8 is current but these ids were retired onto 3.7, which is still served.)
   // This runs BEFORE the suffix check because those ids are aliases, and rule 1 would drop
   // the tier.
   const retiredTier = retiredAntigravityFlashTier(modelId);
@@ -769,7 +831,7 @@ export function resolveAntigravityEffortWireModel(
 // summary aggregation consults this reverse map so one call model = one usage row.
 const ANTIGRAVITY_USAGE_BASE_BY_ID: Record<string, string> = (() => {
   const rev: Record<string, string> = {};
-  for (const base of ANTIGRAVITY_MODELS) rev[base] = base;
+  for (const base of ANTIGRAVITY_KNOWN_PICKER_MODELS) rev[base] = base;
   for (const [base, effortMap] of Object.entries(ANTIGRAVITY_EFFORT_WIRE_MAP)) {
     rev[base] = base;
     for (const wire of Object.values(effortMap)) rev[wire] = base;

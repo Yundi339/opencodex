@@ -24,7 +24,6 @@ import { repairLegacyDottedToolCallNames } from "../../responses/legacy-dotted-t
 import { preparePlaintextV2AgentMessages } from "../../responses/plaintext-v2-agent-messages";
 import { isMetaAiResponsesDestination, rewriteMuseToolNamesForUpstream } from "../../responses/muse-tool-name-alias";
 import { openaiResponsesUrl } from "../openai-responses-url";
-import { conversationKeyFromHeaders, threadAffinityResetActive } from "../../server/ws-thread-transport";
 import { normalizeResponsesCodeMode } from "../responses-code-mode";
 import { injectXaiResponsesXSearch, normalizeXaiResponsesWebSearch } from "../xai-web-search";
 import {
@@ -38,6 +37,7 @@ import {
 } from "../../providers/fastwire";
 import { dropResponsesReasoningInputItems, mapRoutedResponsesReasoningEffort, normalizeConfiguredReasoningSummaryDelivery, sanitizeReasoningInputContent, stripDisabledReasoningSummaries, stripDisabledVerbosity, stripNoneReasoningSummary, stripUnsupportedReasoningSummaryDelivery } from "./reasoning";
 import { scrubOcxCompactionItems, stripCanonicalOnlyToolFields, stripCanonicalOnlyTopLevelFields, stripInternalChatMessageMetadataPassthrough, stripInvalidItemIds, stripItemIdsWhenUnstored, stripRejectedSamplingParams } from "./request-strips";
+import { notePlaintextReasoningDropped } from "./plaintext-reasoning-notice";
 import { stripCanonicalForwardPromptCacheOptions, stripDeprecatedPromptCacheRetention } from "./prompt-cache";
 import { isPlainObject } from "./internal";
 import { normalizeToolSchemas, promoteClientLoadedTools, stripUnsupportedHostedTools } from "./tool-schema";
@@ -49,6 +49,8 @@ import { stripMuseSparkUnsupportedWebSearchFields, stripOpenAiOnlyWebSearchField
 import { observeOutbound } from "../../usage/cache-diagnostic";
 import { normalizeForwardedClientHeaderName } from "../../lib/provider-client-headers";
 import { normalizeMuseToolChoice } from "./muse-tool-choice";
+import { renderCompactionSearchHistoryItems } from "./compaction-search-history";
+import { stripKimiEmptyAssistantMessages } from "./empty-assistant";
 
 /**
  * Identifies DeepSeek's strict Responses replay contract: tool-bearing continuations need
@@ -134,17 +136,21 @@ function stripInputImagesDeep(value: unknown): unknown {
  * be applied here. Images go too: a summary needs no pixels, and a text-only
  * gateway would reject them.
  */
-function buildRoutedCompactionBody(body: unknown): unknown {
+function buildRoutedCompactionBody(body: unknown, responsesLite: boolean): unknown {
   if (!isPlainObject(body)) return body;
   // `text` goes with the tool fields: the summary must be prose, not schema-constrained JSON.
   const { tools: _tools, tool_choice: _toolChoice, parallel_tool_calls: _parallel, text: _text, ...rest } = body;
   const input = Array.isArray(body.input) ? body.input : [];
-  const kept = input.filter(item => !isPlainObject(item)
+  // Bridge restoration has already recovered any available real call/result pairs. Remaining
+  // hosted cells require tools, so they become bounded assistant reference notes.
+  const kept = renderCompactionSearchHistoryItems(input.filter(item => !isPlainObject(item)
     // `additional_tools` is how Codex Desktop's responses-lite shape carries tools;
     // leaving it in would break the no-tools invariant even with `tools` removed.
-    || (item.type !== "compaction_trigger" && item.type !== "additional_tools"));
+    || (item.type !== "compaction_trigger" && item.type !== "additional_tools")));
   return {
     ...rest,
+    // Lite validates this flag even when the summarizer has no callable tools.
+    ...(responsesLite ? { parallel_tool_calls: false } : {}),
     input: [
       ...(stripInputImagesDeep(kept) as unknown[]),
       { type: "message", role: "user", content: [{ type: "input_text", text: COMPACT_PROMPT }] },
@@ -251,19 +257,6 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
                 }
               }
               headers[h] = v; // …so genuine forwarded fields win.
-            }
-          }
-          // A conversation the backend keeps serving slowly and shedding gets its routing identity
-          // re-rolled. Both per-conversation hints go: the client's window id AND the server-issued
-          // turn state (a token the backend handed back for this conversation, which the next
-          // request normally echoes). Dropping only the window id moved that conversation from
-          // 14-22s to 8.1-8.3s for about ten minutes and then it drifted back, so the second hint
-          // is dropped as well. Content, model, credential and cache prefix are untouched.
-          const affinityKey = conversationKeyFromHeaders(incoming?.headers);
-          if (affinityKey && threadAffinityResetActive(affinityKey)) {
-            for (const name of Object.keys(headers)) {
-              const lower = name.toLowerCase();
-              if (lower === "x-codex-window-id" || lower === "x-codex-turn-state") delete headers[name];
             }
           }
         }
@@ -480,11 +473,12 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
       // sanitizers below can still run after it.
       outBody = normalizeResponsesCodeMode(outBody, parsed, provider);
       if (parsed._compactionRequest === true && (!isCanonicalOpenAiForwardProvider(provider) || parsed._portableCompaction === true)) {
-        outBody = buildRoutedCompactionBody(outBody);
+        outBody = buildRoutedCompactionBody(outBody, new Headers(headers).get(CODEX_RESPONSES_LITE_HEADER) === "true");
       }
       // Run after routed compaction so nested input_image parts are replaced before a malformed
       // tool output is flattened to text and can no longer be inspected structurally.
       outBody = repairUnidentifiedToolOutputItems(outBody);
+      outBody = stripKimiEmptyAssistantMessages(outBody, url);
       if (parsed._plaintextV2AgentMessages === true && isCanonicalOpenAiForwardProvider(provider)) {
         const prepared = preparePlaintextV2AgentMessages(outBody);
         outBody = prepared.body;
@@ -507,6 +501,7 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
                   outBody,
                   destinationDecodesNativeCompactionBlob(provider),
                   threadServingIdentityChanged,
+                  parsed._compactionRequest !== true,
                 ),
                 {
                   preserveRawReasoningContent: provider.preserveResponsesReasoningContent === true,
@@ -514,6 +509,7 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
                   stripEncryptedContent: threadServingIdentityChanged || requiresPlaintextReasoningReplay(provider),
                   dropForeignItemId: parsed._dropForeignReasoningItemIds === true,
                   requirePlaintextReasoning: requiresPlaintextReasoningReplay(provider),
+                  onPlaintextReasoningBlanked: () => notePlaintextReasoningDropped(provider),
                 },
               ),
               provider,
