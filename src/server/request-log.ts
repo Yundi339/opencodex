@@ -7,6 +7,15 @@ export { sealRequestAttemptIdentity };
 import { captureUpstreamTerminalDiagnostics, upstreamDiagnosticLogFields, type UpstreamErrorDiagnostics, type UpstreamErrorPayload } from "./request-log-terminal-status";
 export { noteUpstreamRequestId } from "./request-log-terminal-status";
 import { readBoundedResponseBody } from "../lib/bounded-body";
+import {
+  isOverloadVerdictText,
+  noteThreadOverloadVerdict,
+  noteThreadRestrictionVerdict,
+  noteThreadTurnDuration,
+  noteThreadUpstreamCut,
+  shouldArmUpstreamCut,
+} from "./ws-thread-transport";
+import { noteProviderCapacityShed } from "../providers/capacity-window";
 import type { ResponsesTerminalStatus } from "../bridge";
 import {
   classifyError,
@@ -1133,6 +1142,8 @@ function captureUpstreamErrorParsed(
     const message = upstreamErrorMessageFromPayload(parsed);
     if (typeof message === "string" && message.trim()) {
       logCtx.upstreamError = redactSecretString(message).slice(0, 500);
+      noteThreadOverloadVerdict(logCtx.conversationId, logCtx.upstreamError);
+      noteThreadRestrictionVerdict(logCtx.conversationId, logCtx.upstreamError);
       return;
     }
     // No human-readable error message: fall back to the structured incomplete reason emitted by
@@ -1148,6 +1159,8 @@ function captureUpstreamErrorParsed(
   const trimmed = text.trim();
   if (trimmed) {
     logCtx.upstreamError = redactSecretString(trimmed).slice(0, 500);
+    noteThreadOverloadVerdict(logCtx.conversationId, logCtx.upstreamError);
+    noteThreadRestrictionVerdict(logCtx.conversationId, logCtx.upstreamError);
   }
 }
 
@@ -1383,6 +1396,28 @@ export function addFinalRequestLog(
   const closeReason = effectiveStatus === 499
     ? "client_cancel"
     : meta?.closeReason;
+  // A turn the origin cut AFTER output had started: the user watched the answer and then the
+  // stream died ("stream disconnected before completion"). Nothing may be replayed at that point,
+  // so the useful response is to stop routing this conversation the same way -- the same re-roll an
+  // overload verdict arms, on the same ledger. effectiveStatus already folded a client cancel into
+  // 499, which is not a verdict about the route, so the guard excludes it by construction.
+  if (shouldArmUpstreamCut(effectiveStatus, logCtx.transportPhase, logCtx.firstOutputMs)) {
+    noteThreadUpstreamCut(logCtx.conversationId, { status: effectiveStatus, midStream: true });
+  }
+  // Provider-scoped memory of a shed window. This request exhausted its capacity ladder --
+  // evidence that the PROVIDER is shedding right now -- and the next request should not pay
+  // for the same five refusals (2026-10-12: eight conversations burned 100-409s each inside
+  // one hour against the same open window). Counting only the terminal failure is what keeps
+  // the judgement honest: an absorbed shed that ended in 200 never reaches this seam.
+  if (effectiveStatus >= 500 && isOverloadVerdictText(logCtx.upstreamError)) {
+    noteProviderCapacityShed(logCtx.provider);
+  }
+  // Same seam, the other shape: this conversation is much slower than its OWN recent normal. Only
+  // successful turns feed both the baseline and the verdict -- a cancelled turn is the user
+  // leaving, and it would drag the yardstick down until every turn looked slow.
+  if (effectiveStatus < 400) {
+    noteThreadTurnDuration(logCtx.conversationId, Date.now() - start, logCtx.firstOutputMs);
+  }
   if (logCtx.activeAttempt) {
     finishRequestAttempt(
       logCtx.activeAttempt,
