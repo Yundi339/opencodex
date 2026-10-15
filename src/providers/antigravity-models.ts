@@ -28,14 +28,15 @@ const GEMINI_FLASH_CURRENT = "gemini-3.8-flash";
 const GEMINI_FLASH_PREVIOUS = "gemini-3.7-flash";
 
 /**
- * Wire ID that CCA accepts for the RETIRED-tier redirect target (currently 3.7).
+ * Wire ID that CCA accepts for the RETIRED-tier redirect target (currently 3.8).
  *
- * Google renamed 3.7 to carry a `-tiered` suffix; the picker-visible ID stays
- * `gemini-3.7-flash` (stripped by `pickerModelIdForDiscoveredWireId`). This constant is named
- * for its ROLE, not for the current generation: 3.8 is current and has no `-tiered` id, so a
- * name like GEMINI_FLASH_WIRE_ID would now point readers at the wrong model.
+ * Moved from `gemini-3.7-flash-tiered` on 2026-10-15: a live :fetchAvailableModels call that
+ * day returned 3.8 (tieredModelIds.flash) and NO 3.7 wire ids at all -- Google retired 3.7 the
+ * same way it retired 3.6 before it, so a redirect target named for 3.7 had become a dead end
+ * for every saved 3.5/3.6 selection. 3.8 now carries the `-tiered` suffix, making the role
+ * (redirect target) and the current generation coincide again.
  */
-const GEMINI_RETIRED_FLASH_TARGET_WIRE_ID = "gemini-3.7-flash-tiered";
+const GEMINI_RETIRED_FLASH_TARGET_WIRE_ID = "gemini-3.8-flash-tiered";
 
 /**
  * Retired Flash ids → the reasoning tier they used to encode.
@@ -704,9 +705,9 @@ export function resolveAntigravityEffortWireModel(
     };
   }
 
-  // Rule 0: retired Flash id — Google has taken the wire id offline, so route to the 3.7
-  // redirect target and carry the tier the retired id encoded. (3.7, not "the current
-  // generation": 3.8 is current but these ids were retired onto 3.7, which is still served.)
+  // Rule 0: retired Flash id — Google has taken the wire id offline, so route to the current
+  // redirect target (3.8-tiered since 2026-10-15; 3.7 itself was retired that week) and carry
+  // the tier the retired id encoded.
   // This runs BEFORE the suffix check because those ids are aliases, and rule 1 would drop
   // the tier.
   const retiredTier = retiredAntigravityFlashTier(modelId);

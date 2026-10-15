@@ -177,13 +177,23 @@ export function isOverloadVerdictText(message: string | undefined): boolean {
  *
  * Deliberately narrow: these are verdicts about the CLIENT, and misreading a load message as a
  * restriction would re-roll a healthy conversation's routing identity for nothing. The canonical
- * text is the backend's own ("This account only allows Codex official clients"); the rest covers
- * the shapes relays use for policy and abuse blocks.
+ * text is the backend's own ("This account only allows Codex official clients").
+ *
+ * CONTENT-review verdicts were removed from this matcher on 2026-10-15. The cyber classifier's
+ * "This content was flagged for possible cybersecurity risk..." contains the word "cyber", and
+ * the old regex (cyber|policy_violation|content policy violation|flagged for review) matched it,
+ * so every content rejection re-rolled the conversation's routing identity. That action cannot
+ * help: the origin refused the REQUEST'S CONTENT, and dropping the window-id/turn-state changes
+ * routing, not content. Measured that week: a session whose adversarial-review task was
+ * content-flagged four times sat in the affinity-armed ledger for the whole afternoon, its
+ * identity re-rolled for nothing, while the immediate-replay loop kept resending the same
+ * contents. Content verdicts are still recorded (usage errorCode cyber_policy / policy codes);
+ * they just no longer arm anything.
  */
 export function isRestrictionVerdictText(message: string | undefined): boolean {
   const text = (message ?? "").toLowerCase();
   if (text.length === 0) return false;
-  return /only allows codex official clients|official clients only|cyber|policy_violation|content policy violation|abuse|unusual activity|flagged for review/.test(text);
+  return /only allows codex official clients|official clients only|abuse|unusual activity/.test(text);
 }
 
 function trim(threadId: string | undefined): string | undefined {
