@@ -27,6 +27,7 @@ const encoder = new TextEncoder();
 const frame = (payload: unknown) => "event: " + (payload as { type?: string }).type + "\ndata: " + JSON.stringify(payload) + "\n\n";
 const created = (model: string) => frame({ type: "response.created", response: { id: "r1", model, status: "in_progress", output: [] } });
 const delta = (text: string) => frame({ type: "response.output_text.delta", item_id: "m1", output_index: 0, content_index: 0, delta: text });
+const rdelta = (text: string) => frame({ type: "response.reasoning_summary_text.delta", item_id: "r1", output_index: 0, summary_index: 0, delta: text });
 const completed = (model: string, tier?: string) => frame({ type: "response.completed", response: { id: "r1", model, status: "completed", ...(tier ? { service_tier: tier } : {}), output: [] } });
 
 function streamResponse(frames: string[], headers: Record<string, string> = {}) {
@@ -77,6 +78,27 @@ await readAll(guardNativeDegenerateOutput(
   { lane: "lane-zlib", onVerdict: detail => zlibVerdicts.push(detail) },
 ));
 check("degenerate: a separator-free run is still caught", zlibVerdicts.length === 1, JSON.stringify(zlibVerdicts));
+
+// 1c. Reasoning that restates a plan is NOT a cut: the visible rules are far too eager for a
+// window the client never sees, and cutting there truncates a turn that was still answering.
+const reasoningVerdicts: string[] = [];
+const planLine = "I should look at the settings pane before editing the layout";
+const reasoningRestated = await readAll(guardNativeDegenerateOutput(
+  streamResponse([created("gpt-6-sol"), ...Array.from({ length: 3 }, () => rdelta(planLine + "\n\n")),
+    delta("Setting up the pane now.")]),
+  { lane: "lane-reasoning-plan", onVerdict: detail => reasoningVerdicts.push(detail) },
+));
+check("degenerate: restated reasoning is not cut", reasoningVerdicts.length === 0, JSON.stringify(reasoningVerdicts));
+check("degenerate: restated reasoning still reaches the client", reasoningRestated.includes("Setting up the pane now."));
+
+// 1d. A reasoning window that is nothing but one repeated long unit is still a runaway.
+const reasoningLoopVerdicts: string[] = [];
+const loopLine = "the same long reasoning paragraph keeps coming back without ever reaching an answer";
+await readAll(guardNativeDegenerateOutput(
+  streamResponse([created("gpt-6-sol"), ...Array.from({ length: 7 }, () => rdelta(loopLine + "\n\n"))]),
+  { lane: "lane-reasoning-loop", onVerdict: detail => reasoningLoopVerdicts.push(detail) },
+));
+check("degenerate: a reasoning runaway is still cut", reasoningLoopVerdicts.length === 1, JSON.stringify(reasoningLoopVerdicts));
 
 // 2. A model mismatch is recorded once, and the bytes still reach the client untouched.
 const mismatchOut = await readAll(withResponseAttestation(

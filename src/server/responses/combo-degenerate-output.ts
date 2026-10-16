@@ -52,6 +52,20 @@ const SEGMENT_REPEAT_RATIO = 0.6;
 const SEGMENT_REPEAT_MIN_SEGMENTS = 6;
 const ZLIB_RATIO = 8;
 const ZLIB_MIN_BYTES = 1_536;
+/**
+ * The reasoning window is judged far more strictly than the visible one, because reasoning is not
+ * client-visible and restating a plan is normal there. Cutting a live stream on reasoning alone
+ * truncates a turn that was still going to answer: 75 of the 77 verdicts recorded on one host were
+ * reasoning-only, most of them `the same segment repeated 3 times`, i.e. a model repeating a
+ * short plan sentence inside its own thinking. Only a window that is essentially nothing but
+ * repeats reaches these tiers.
+ */
+const REASONING_LONG_SEGMENT_CHARS = 60;
+const REASONING_LONG_SEGMENT_REPEATS = 6;
+const REASONING_SEGMENT_REPEAT_RATIO = 0.9;
+const REASONING_SEGMENT_REPEAT_MIN_SEGMENTS = 20;
+const REASONING_ZLIB_RATIO = 15;
+const REASONING_ZLIB_MIN_BYTES = 3_072;
 /** Identical tool calls inside ONE response before it counts as a loop. */
 const CALL_SIGNATURE_REPEATS = 3;
 /** Identical call+result round trips across turns before the lane ledger trips. */
@@ -146,6 +160,48 @@ function repetitionVerdict(window: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Repetition reading of the reasoning window: runaway only.
+ *
+ * Reasoning repeats legitimately — a model restating its plan is thinking, not looping — so the
+ * tiers here only catch a window that is almost entirely one repeated long unit. A model that
+ * truly hangs in its thinking still trips this; a model that repeats a sentence three times while
+ * working keeps its stream.
+ */
+function reasoningRepetitionVerdict(window: string): string | undefined {
+  const segments = window.split(SEGMENT_SPLIT)
+    .map(normalizeSegment)
+    .filter(segment => segment.length >= SEGMENT_MIN_CHARS);
+  if (segments.length > 0) {
+    const counts = new Map<string, number>();
+    for (const segment of segments) counts.set(segment, (counts.get(segment) ?? 0) + 1);
+    let longestRepeat = 0;
+    for (const [segment, count] of counts) {
+      if (segment.length >= REASONING_LONG_SEGMENT_CHARS && count > longestRepeat) longestRepeat = count;
+    }
+    if (longestRepeat >= REASONING_LONG_SEGMENT_REPEATS) {
+      return `the same long segment repeated ${longestRepeat} times (reasoning)`;
+    }
+    if (segments.length >= REASONING_SEGMENT_REPEAT_MIN_SEGMENTS) {
+      const ratio = 1 - counts.size / segments.length;
+      if (ratio >= REASONING_SEGMENT_REPEAT_RATIO) {
+        return `repeat ratio ${(ratio * 100).toFixed(0)}% across ${segments.length} segments (reasoning)`;
+      }
+    }
+  }
+  const bytes = Buffer.byteLength(window, "utf8");
+  if (bytes >= REASONING_ZLIB_MIN_BYTES) {
+    const compressed = deflateSync(Buffer.from(window, "utf8"), { level: 6 }).byteLength;
+    if (compressed > 0) {
+      const ratio = bytes / compressed;
+      if (ratio >= REASONING_ZLIB_RATIO) {
+        return `compression ratio ${ratio.toFixed(1)}x over ${bytes}B (reasoning)`;
+      }
+    }
+  }
+  return undefined;
+}
+
 interface DegenerateStreamMonitor {
   feed(chunk: Uint8Array): void;
   /** True once a verdict has been reached and reported; further feeds are ignored. */
@@ -205,8 +261,13 @@ function createDegenerateStreamMonitor(onTrigger: (detail: string) => void): Deg
     bytes += deltaBytes;
     if (kind === "text") textBytes = bytes;
     else reasoningBytes = bytes;
-    const verdict = repetitionVerdict(parts.join(""));
-    if (verdict) fire(kind === "text" ? verdict : `${verdict} (reasoning)`);
+    // Reasoning is judged by its own, much stricter tiers: the visible-output rules exist to catch
+    // a channel the operator is watching repeat itself, and reasoning is neither visible nor a
+    // fair signal on its own. See reasoningRepetitionVerdict.
+    const verdict = kind === "text"
+      ? repetitionVerdict(parts.join(""))
+      : reasoningRepetitionVerdict(parts.join(""));
+    if (verdict) fire(verdict);
   };
 
   const noteCallSignature = (signature: string): void => {
