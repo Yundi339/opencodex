@@ -242,6 +242,37 @@ describe("compact handoff route admission namespacing", () => {
     // 5s budget is not enough on a contended host.
   }, 20000);
 
+  for (const hasLocalRollout of [false, true]) test(`persisted thread settings require local rollout evidence (${hasLocalRollout})`, () => {
+    const testDir = mkdtempSync(join(tmpdir(), "ocx-thread-model-evidence-"));
+    const previousCodexHome = process.env.CODEX_HOME;
+    const previousOpencodexHome = process.env.OPENCODEX_HOME;
+    const threadId = "01a00000-0000-4000-8000-000000000002";
+    try {
+      process.env.CODEX_HOME = testDir;
+      process.env.OPENCODEX_HOME = testDir;
+      writeFileSync(join(testDir, "thread-model-settings.json"), JSON.stringify({
+        version: 1,
+        settings: { [threadId]: { model: "fixture/old-model", lastSeenAt: Date.now() } },
+      }));
+      if (hasLocalRollout) {
+        const rolloutDir = join(testDir, "sessions");
+        mkdirSync(rolloutDir);
+        writeFileSync(join(rolloutDir, "rollout-fixture.jsonl"), JSON.stringify({
+          timestamp: "2026-10-01T10:00:00.000Z", type: "event_msg",
+          payload: { type: "thread_settings_applied", thread_settings: { thread_id: threadId, model: "fixture/current-model" } },
+        }) + "\n");
+      }
+      const setting = threadModelSettingForRequest(new Headers({ "thread-id": threadId }), { kind: "loopback", source: "loopback" });
+      expect(setting?.model).toBe(hasLocalRollout ? "fixture/current-model" : undefined);
+    } finally {
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previousOpencodexHome;
+      removeTreeWithRetry(testDir);
+    }
+  });
+
   test("loopback reads the latest Codex thread setting from rollout history", () => {
     const testDir = mkdtempSync(join(tmpdir(), "ocx-thread-model-settings-"));
     const previousCodexHome = process.env.CODEX_HOME;

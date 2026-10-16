@@ -22,6 +22,9 @@ interface PersistedState {
 }
 
 const settings = new Map<string, ThreadModelSetting>();
+// Persisted entries are hints only: a remote caller can reach the loopback admission
+// path without owning a rollout on this host. Only witnessed local events may override it.
+const settingSources = new Map<string, string>();
 const fileStamps = new Map<string, string>();
 let loaded = false;
 let lastRefreshAt = 0;
@@ -151,8 +154,9 @@ function readSettingsFromFile(path: string, fallbackTimestamp: number): boolean 
     if (!model || model.length > 512) continue;
     const seenAt = timestampOf(record.timestamp, fallbackTimestamp);
     const previous = settings.get(threadId);
-    if (!previous || seenAt >= previous.lastSeenAt) {
+    if (!settingSources.has(threadId) || !previous || seenAt >= previous.lastSeenAt) {
       settings.set(threadId, { model, lastSeenAt: seenAt });
+      settingSources.set(threadId, path);
       changed = true;
     }
   }
@@ -210,6 +214,7 @@ function refreshIndex(now: number, focusThreadIds: readonly string[] = []): void
     const oldest = [...settings.entries()].sort((a, b) => a[1].lastSeenAt - b[1].lastSeenAt)[0]?.[0];
     if (!oldest) break;
     settings.delete(oldest);
+    settingSources.delete(oldest);
     changed = true;
   }
   if (changed) persistState();
@@ -217,6 +222,7 @@ function refreshIndex(now: number, focusThreadIds: readonly string[] = []): void
 
 export function clearThreadModelSettingsForTests(): void {
   settings.clear();
+  settingSources.clear();
   fileStamps.clear();
   loaded = false;
   lastRefreshAt = 0;
@@ -238,7 +244,8 @@ export function threadModelSettingForRequest(
   refreshIndex(now, threadIds);
   for (const raw of threadIds) {
     const entry = settings.get(raw);
-    if (entry) return entry;
+    const source = settingSources.get(raw);
+    if (entry && source && existsSync(source)) return entry;
   }
   return undefined;
 }
