@@ -7,7 +7,7 @@ import { clearAccountQuota, updateAccountQuota } from "../../src/codex/auth-api"
 import { clearCodexUpstreamHealth } from "../../src/codex/routing";
 import { clearUpstreamHostHealth } from "../../src/codex/upstream-host-health";
 import { clearConversationSelectionsForTests, rememberConversationSelection } from "../../src/server/responses/conversation-selection";
-import { clearThreadModelSettingsForTests, threadModelSettingForRequest } from "../../src/server/responses/thread-model-settings";
+import { clearThreadModelSettingsForTests, threadModelOverrideForRequest, threadModelSettingForRequest } from "../../src/server/responses/thread-model-settings";
 import { handleResponsesCompact } from "../../src/server/responses";
 import type { OcxConfig } from "../../src/types";
 import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
@@ -296,6 +296,12 @@ describe("compact handoff route admission namespacing", () => {
         { kind: "loopback", source: "loopback" },
       );
       expect(setting?.model).toBe("gpt-5.6-sol");
+      const headers = new Headers({ "thread-id": threadId });
+      const admission = { kind: "loopback", source: "loopback" } as const;
+      expect(threadModelOverrideForRequest(headers, admission, false)).toBeUndefined();
+      expect(threadModelOverrideForRequest(headers, admission, true)).toBe("gpt-5.6-sol");
+      rememberConversationSelection(headers, admission, "fixture/new-selection");
+      expect(threadModelOverrideForRequest(headers, admission, true)).toBeUndefined();
     } finally {
       if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
       else process.env.CODEX_HOME = previousCodexHome;

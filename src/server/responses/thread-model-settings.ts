@@ -4,6 +4,7 @@ import { atomicWriteFile } from "../../config/atomic-write";
 import { getConfigDir } from "../../config/paths";
 import { resolveCodexHomeDir } from "../../codex/home";
 import type { DataPlaneAdmission } from "../auth-cors";
+import { peekConversationSelection } from "./conversation-selection";
 
 const STATE_FILE = "thread-model-settings.json";
 const STATE_VERSION = 1;
@@ -248,4 +249,19 @@ export function threadModelSettingForRequest(
     if (entry && source && existsSync(source)) return entry;
   }
   return undefined;
+}
+
+/** Bridge an old compact body only when a newer, verified selection event proves the change. */
+export function threadModelOverrideForRequest(
+  headers: Headers,
+  admission: DataPlaneAdmission | undefined,
+  isCompaction: boolean,
+  now = Date.now(),
+): string | undefined {
+  // Ordinary requests declare the selection themselves; cached settings never override them.
+  if (!isCompaction) return undefined;
+  const setting = threadModelSettingForRequest(headers, admission, now);
+  const ordinarySelection = peekConversationSelection(headers, admission, now);
+  if (!setting || (ordinarySelection && ordinarySelection.lastSeenAt >= setting.lastSeenAt)) return undefined;
+  return setting.model;
 }

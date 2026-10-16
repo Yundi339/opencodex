@@ -151,7 +151,7 @@ import {
 } from "./core-codex-account";
 import { acquireUpstreamHostAdmission } from "../../codex/upstream-host-health";
 import { applyCompactionRoutingOverride, compactionRoutingKeepsProviderIdentity } from "./compaction-routing";
-import { threadModelSettingForRequest } from "./thread-model-settings";
+import { threadModelOverrideForRequest } from "./thread-model-settings";
 import { codexAuthContextLogLabel } from "../../codex/account-label";
 import {
   conversationStateBindingFromAuth,
@@ -470,21 +470,18 @@ export async function prepareResponsesRequest(
         effort: effortRow.effort,
       };
     }
-    // The desktop can enqueue a turn while a model-change event is still being flushed. In that
-    // window the request body may carry the previous provider/model even though the thread has
-    // already switched. Local loopback threads have an authoritative settings event, so align
-    // both ordinary and automatic-compaction requests before route selection. Child/combo and
-    // explicit compaction overrides intentionally keep their own synthetic target.
+    // Ordinary requests carry the user's selection. Only automatic compaction may need a
+    // newer verified settings event to bridge a body queued before the model changed.
     if (inboundWire === "responses"
       && !options.comboAttempt
       && !options.compactionRoutingOverride
       && !threadSpawn
       && !memoryModelApplies) {
-      const threadSetting = threadModelSettingForRequest(req.headers, options.admission);
-      if (threadSetting && threadSetting.model !== parsed.modelId) {
-        parsed.modelId = threadSetting.model;
+      const selectedModel = threadModelOverrideForRequest(req.headers, options.admission, parsed._compactionRequest === true);
+      if (selectedModel && selectedModel !== parsed.modelId) {
+        parsed.modelId = selectedModel;
         const raw = parsed._rawBody as Record<string, unknown>;
-        raw.model = threadSetting.model;
+        raw.model = selectedModel;
       }
     }
     if (!options.comboAttempt) {
