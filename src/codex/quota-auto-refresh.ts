@@ -357,15 +357,27 @@ export async function runCodexQuotaAutoRefresh(
     };
     for (let index = 0; index < accountIds.length; index += CONCURRENCY) {
       await Promise.all(accountIds.slice(index, index + CONCURRENCY).map(async accountId => {
-        if (!eligible(accountId)) return;
+        // The hard lock withholds billable work from the main account, but it cannot withhold
+        // the quota read that decides whether the lock still applies. A reset performed
+        // elsewhere -- a reset credit spent in ChatGPT's own UI -- reaches this proxy only by
+        // being read back, and while the lock is on there is no other reader: requests are
+        // refused before they are sent, and the warmup below is gated on the same lock. Without
+        // this exception the lock holds until the natural window reset even though usage is 0%.
+        const lockBlockedMain = accountId === MAIN_CODEX_ACCOUNT_ID && isMainAccountHardLocked(config);
+        if (!eligible(accountId) && !lockBlockedMain) return;
         // Capture before WHAM can move an idle window's reset into the future.
         rememberWindows(config, accountId, quotaFor(accountId));
         const quota = quotaFor(accountId);
         // A known deadline remains actionable even when its usage snapshot is old.
         // Only discover missing windows; never poll merely to keep percentages fresh.
-        if (hasScheduledWindows(config, accountId)) {
+        const windowsKnown = hasScheduledWindows(config, accountId);
+        if (windowsKnown) {
           quotaRefreshAfterByAccount.delete(accountId);
-        } else if ((!quota || now - quota.updatedAt >= RETRY_MS)
+        }
+        // A locked main account is the one case that must re-read percentages on purpose: the
+        // lock is an assertion about usage, and a stale assertion locks out a reset account.
+        const stale = !quota || now - quota.updatedAt >= RETRY_MS;
+        if ((!windowsKnown || lockBlockedMain) && stale
           && (liveRetry(quotaRefreshAfterByAccount, accountId, credentialGeneration(accountId))?.after ?? 0) <= now) {
           deferRetry(quotaRefreshAfterByAccount, accountId, now, credentialGeneration(accountId));
           try { await refresh(config, accountId); } catch { /* Retry missing metadata with backoff. */ }

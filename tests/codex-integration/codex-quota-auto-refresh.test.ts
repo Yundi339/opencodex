@@ -23,6 +23,10 @@ import { startupHealthFixture } from "../helpers/startup-health";
 import { saveCodexAccountCredential } from "../../src/codex/account-store";
 import { clearAccountNeedsReauth, isAccountNeedsReauth } from "../../src/codex/account-runtime-state";
 import { drainAndRemoveFixtureRoots } from "../helpers/fixture-teardown";
+import { reconcileMainCodexAccountRuntimeState, resetMainCodexAccountIdentityTrackingForTests } from "../../src/codex/account-lifecycle";
+import { MAIN_CODEX_ACCOUNT_ID, setMainAccountPlan } from "../../src/codex/main-account";
+import { captureMainQuotaWriter } from "../../src/codex/main-account-cache";
+import { isMainAccountHardLocked } from "../../src/codex/main-account-hard-lock";
 
 const NOW = 1_800_000_000_000;
 const RESET_SECONDS = NOW / 1000;
@@ -44,6 +48,15 @@ function completedWithQuota(resetAt: number) {
     "x-codex-primary-window-minutes": "300",
     "x-codex-primary-reset-at": String(resetAt),
   } });
+}
+
+/** A structurally valid main-account bearer; the identity comes from its chatgpt_account_id. */
+function mainBearer(accountId: string): string {
+  const payload = Buffer.from(JSON.stringify({
+    exp: Math.floor(Date.now() / 1000) + 86_400,
+    "https://api.openai.com/auth": { chatgpt_account_id: accountId },
+  })).toString("base64url");
+  return `header.${payload}.signature`;
 }
 
 function config(): OcxConfig {
@@ -120,6 +133,7 @@ afterEach(async () => {
   clearAccountNeedsReauth("pool-a");
   clearAccountQuota();
   resetCodexQuotaAutoRefreshForTests();
+  resetMainCodexAccountIdentityTrackingForTests();
   // Windows may still hold credential-hardening handles after a quota assertion. Drain their
   // owners before removal; synchronous EBUSY retries alone cannot deliver an async child reap.
   await drainAndRemoveFixtureRoots({
@@ -132,6 +146,40 @@ afterEach(async () => {
 });
 
 describe("Codex quota window auto refresh", () => {
+  test("a hard-locked main account still re-reads its quota so an external reset can lift the lock", async () => {
+    // The incident: usage was reset in ChatGPT's own UI, but the lock kept refusing because the
+    // only readers of the quota were the requests it was refusing and a warmup it also gated.
+    const accountId = "auto-refresh-hard-lock-fixture";
+    const cfg = config();
+    cfg.codexAccounts = [];
+    cfg.codexQuotaAutoRefresh = undefined;
+    const previousCodexHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = testHome;
+    writeFileSync(join(testHome, "auth.json"), JSON.stringify({
+      tokens: { access_token: mainBearer(accountId), refresh_token: "fixture-refresh", account_id: accountId },
+    }));
+    resetMainCodexAccountIdentityTrackingForTests();
+    setMainAccountPlan(null);
+    reconcileMainCodexAccountRuntimeState();
+    setAccountQuotaFromParsed(MAIN_CODEX_ACCOUNT_ID, { shortPercent: 99 }, undefined,
+      captureMainQuotaWriter(accountId));
+    if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousCodexHome;
+    expect(isMainAccountHardLocked(cfg)).toBe(true);
+
+    let refreshes = 0;
+    let warmups = 0;
+    await runCodexQuotaAutoRefresh(cfg, NOW, {
+      getQuota: accountIdArg => accountIdArg === MAIN_CODEX_ACCOUNT_ID ? getAccountQuota(MAIN_CODEX_ACCOUNT_ID) : null,
+      refreshQuota: async () => { refreshes += 1; },
+      warmAccount: async () => { warmups += 1; },
+      persistCompleted: () => true,
+    });
+    expect(refreshes).toBe(1);
+    // Billable work stays behind the lock: only the quota read is allowed through.
+    expect(warmups).toBe(0);
+  });
+
   test("pending validation suppresses scheduled inference and completion markers", async () => {
     const cfg = config();
     saveCodexAccountCredential("pool-a", {
