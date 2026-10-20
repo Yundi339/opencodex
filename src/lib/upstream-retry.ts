@@ -864,7 +864,7 @@ export async function fetchWithTransientRetry(
       resend: async () => {
         // One more physical send, counted exactly like every send this helper owns.
         opts.onSendsConsumed?.(1);
-        return await fetchWithResetRetry(countedFetch, innerResetOptions(1), "transient-5xx");
+        return await fetchWithResetRetry(rungFetch, innerResetOptions(1), "transient-5xx");
       },
     });
   };
@@ -872,6 +872,24 @@ export async function fetchWithTransientRetry(
     // Incremented BEFORE the await so a rejected send still consumes budget; counting only
     // successes would let a reset storm loop without bound.
     if (opts.onSendsConsumed?.beforeSend && !opts.onSendsConsumed.beforeSend()) throw new SendBudgetExhaustedError(opts.label);
+    sent += 1;
+    const run = () => doFetch(recovery);
+    return opts.onSendsConsumed?.execute ? opts.onSendsConsumed.execute(run) : run();
+  };
+  /**
+   * One physical send the caller has already authorized as an extra rung.
+   *
+   * Capacity and rate-limit rungs are documented as ADDITIONAL to the transient budget: the
+   * provider declined before running the turn, and the whole point of the rung is that the turn
+   * keeps going. Dispatching them through {@link countedFetch} asked the shared gate anyway, so a
+   * request whose base allowance was already spent refused the very send the ladder had just
+   * decided to make. Measured 2026-10-20: ChatGPT answered `server_is_overloaded` inside a 200
+   * prelude, the rung logged `resending in 4000ms (1/1)`, and then failed with
+   * SendBudgetExhaustedError -- the client saw the capacity error the rung exists to absorb.
+   * Accounting still happens at the call sites, which report the rung before dispatching it, and
+   * the rung count itself stays bounded by the delay list.
+   */
+  const rungFetch: ReplayableFetch = (recovery) => {
     sent += 1;
     const run = () => doFetch(recovery);
     return opts.onSendsConsumed?.execute ? opts.onSendsConsumed.execute(run) : run();
@@ -935,7 +953,10 @@ export async function fetchWithTransientRetry(
       attemptStart = Date.now();
       transientStatuses.push(res.status);
       try {
-        res = await fetchWithResetRetry(countedFetch, innerResetOptions(1), "transient-5xx");
+        // A rung is a send the ladder already authorized; report it, then dispatch it without
+        // asking the base allowance again (see rungFetch).
+        opts.onSendsConsumed?.(1);
+        res = await fetchWithResetRetry(rungFetch, innerResetOptions(1), "transient-5xx");
       } catch (err) {
         if (err instanceof SendBudgetExhaustedError) throw err;
         throw new UpstreamRetryEvidenceError(transientStatuses, err);
@@ -971,7 +992,8 @@ export async function fetchWithTransientRetry(
       attemptStart = Date.now();
       transientStatuses.push(res.status);
       try {
-        res = await fetchWithResetRetry(countedFetch, innerResetOptions(1), "transient-5xx");
+        opts.onSendsConsumed?.(1);
+        res = await fetchWithResetRetry(rungFetch, innerResetOptions(1), "transient-5xx");
       } catch (err) {
         if (err instanceof SendBudgetExhaustedError) throw err;
         throw new UpstreamRetryEvidenceError(transientStatuses, err);

@@ -785,4 +785,24 @@ describe("fetchWithTransientRetry: upstream 429 ladder", () => {
     expect(res.status).toBe(429);
     expect(calls.length).toBe(1);
   });
+
+  test("a capacity rung still dispatches after the shared base allowance is spent", async () => {
+    // The incident: ChatGPT answered "Our servers are currently overloaded" inside a 200 prelude,
+    // the 4s rung was authorized, and then the shared send gate refused it with
+    // SendBudgetExhaustedError. The client saw the capacity error the rung exists to absorb.
+    silenceWarn();
+    const { calls, doFetch } = mockDoFetch([
+      new Response("busy", { status: 503, headers: { "content-type": "application/json" } }),
+      new Response("ok", { status: 200, headers: { "content-type": "text/event-stream" } }),
+    ]);
+    let allowed = 1;
+    const reporter = Object.assign(() => {}, { beforeSend: () => allowed-- > 0 });
+    const res = await fetchWithTransientRetry(doFetch, {
+      attempts: 3,
+      retryCapacityDeferralsMs: [1],
+      onSendsConsumed: reporter,
+    });
+    expect(res.status).toBe(200);
+    expect(calls.length).toBe(2);
+  });
 });
