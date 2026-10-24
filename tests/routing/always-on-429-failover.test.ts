@@ -233,14 +233,17 @@ describe("Anthropic reactive 429 failover without the pool flag", () => {
     rotateAnthropicAccountOn429(config, ids[0]!, weekly);
     clearComboTargetCooldowns("waterfall");
     const controlAt = Date.now();
-    expect((await run()).status).toBe(429);
+    // Fork policy: a ladder that ends on a 429 answers its own 503 so the Codex client resends
+    // instead of reporting "exceeded retry limit, last status: 429". The subject here is the
+    // cooldown scope, which the assertions below still pin.
+    expect((await run()).status).toBe(503);
     expect(isComboTargetInCooldown("waterfall", target, controlAt + 10 * 60_000 + 1_000)).toBe(true);
 
     // Pool-held: every account cooled. The target still cools, but only for the local fallback.
     rotateAnthropicAccountOn429(config, ids[1]!, weekly);
     clearComboTargetCooldowns("waterfall");
     const heldAt = Date.now();
-    expect((await run()).status).toBe(429);
+    expect((await run()).status).toBe(503);
     expect(isComboTargetInCooldown("waterfall", target, heldAt + 1)).toBe(true);
     expect(isComboTargetInCooldown("waterfall", target, heldAt + 10 * 60_000 + 1_000)).toBe(false);
     clearComboTargetCooldowns("waterfall");

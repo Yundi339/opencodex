@@ -40,6 +40,8 @@ Chat Completions와 Messages 엔드포인트는 지연된 도구 카탈로그를
 
 별도로, 모든 인바운드 와이어에서 공급자의 `default.` 네임스페이스 호출은 요청이 선언한 원래 도구 이름으로 정규화됩니다(`default.Read` → `Read`).
 
+네이티브 Messages는 `tools: []`와 함께 제공된 시스템 메시지의 인라인 도구 정의도 인식합니다. 해당 이름은 영구적으로 제거될 때까지 호출할 수 있으며, 다른 클라이언트 도구를 허용하지는 않습니다. 호스팅된 MCP 호출과 서버 도구의 인수 스트림은 네이티브 형식을 유지합니다.
+
 ## 엔드포인트 개요
 
 | 클라이언트 표면 | 엔드포인트 | 성공한 비스트리밍 결과 | 성공한 스트리밍 또는 소켓 결과 |
@@ -297,7 +299,8 @@ call creation과 sideband join은 같은 OpenAI 계정으로 이루어져야 하
 계정 선택을 그 쌍에 묶어 두므로(프로세스 로컬) 프록시에 도착한 join은 통화를 만든 계정을 그대로 쓰고,
 Direct 모드는 두 요청 모두 호출자의 현재 bearer를 전달합니다. 릴레이되는 클라이언트 헤더는 정확히
 `openai-alpha`, `x-session-id`, `session-id`, `thread-id`, `originator`, `x-oai-attestation`,
-`x-codex-turn-metadata`(`src/server/live.ts`의 `LIVE_CLIENT_PROTOCOL_HEADERS`)이며, 각 헤더는
+`x-codex-turn-metadata`, `voice-session-id`(실시간 `x-session-id`와 별개인 클라이언트 음성 세션 id)
+(`src/server/live.ts`의 `LIVE_CLIENT_PROTOCOL_HEADERS`)이며, 각 헤더는
 호출자가 보낸 경우에만 전달되고 프록시가 만들어 내지 않습니다. `Authorization`과 ChatGPT 계정 id는
 ChatGPT 경로에서 프록시가 소유합니다(Pool은 저장된 계정으로 교체, Direct는 검증된 호출자 bearer를 전달).
 API 키 프로바이더는 자체 bearer를 씁니다. Codex가 join을 프록시로 보내는 것은

@@ -58,7 +58,7 @@ without running handlers is not covered by this forwarding mechanism.
 systemd unit. State and ownership resolve from those captured bytes. Each present regular file contributes SHA-256 content and bigint device, inode, size, nanosecond mtime/ctime,
 mode, uid and gid. The opened descriptor must be regular and match device/inode before any read. Each record is limited to 1 MiB, read in bounded chunks with growth beyond that limit
 refused. Descriptor stats bracket the read; a final pathname stat must agree. Symlinks, inconsistent reads, malformed state, unreadable candidates and membership drift
-refuse. Canonical directory aliases remain equivalent. Lock, PID and runtime records are excluded.
+refuse. Homes compare canonical path plus exact bigint `dev:ino` (`fileId`); rounded doubles merge NTFS ids above 2^53. Aliases stay equivalent. Lock, PID and runtime records are excluded.
 
 `src/cli/update-restart.ts` requires known versions and a detached POSIX target with PID-1
 parent, no ownership claim and no client/sibling role. An installed record without a claim
@@ -95,7 +95,7 @@ Windows, claimed, supervised and uncertain targets remain ineligible for this up
 
 Before service install/repair or a Windows Codex shim mutation, the selected Bun executable must create and remove an exclusive nonce-named directory inside the config root: admission runs that exact lexical path with `-e`, no shell, a hidden window and a five-second timeout, and only a matching nonce acknowledgment admits. Failure refuses with `OCX_RUNTIME_PREFLIGHT_FAILED` (`spawn`, `timeout`, `create`, `remove` or `protocol`) and never discovers another runtime; the Node launcher may pick a validated PATH Bun before CLI startup when bundled Bun is unusable, and durable admission only probes that resulting selection.
 The frozen selection feeds scheduler rendering, the WinSW entry and the install-state writer. `installServiceSafely` refuses live Desktop supervision before selection or admission, then admits once before cleanup and uses internal commit functions; repair refuses Desktop before diagnosis, checks ownership and auth before admission, and admits before native repair or scheduler stop; direct public installers keep their own admission gate.
-The fresh scheduler path captures root absence and freezes the runtime at entry, stages and registers its definition, removes staging and claims config ownership, then probes with `rootWasAbsent: false` immediately before `prepare()`; a refused probe rolls back the new registration before service-manager cleanup or asset/state publication. Healthy or disabled shims do not probe; refused automatic restore defers with guidance and startup continues. Non-Windows admission performs no spawn or filesystem work, selection stays pre-dotenv and `cliEntry` stays I/O-free.
+The fresh scheduler path captures root absence and freezes the runtime at entry, stages and registers its definition, removes staging and claims config ownership, then probes with `rootWasAbsent: false` immediately before `prepare()`; a refused probe rolls back the new registration before service-manager cleanup or asset/state publication. Healthy or disabled shims do not probe; refused automatic restore defers with guidance and startup continues. Non-Windows admission performs no spawn or filesystem work, selection stays pre-dotenv and `cliEntry` stays I/O-free. That cleanup (`prepareServiceInstall`) ends every recorded, conflicting and requested manager, then — Windows only — issues the same best-effort launcher/wrapper termination `ocx stop` performs, scoped to this install's canonical script and launcher tokens (an `schtasks /end` survivor can respawn the proxy mid-install; this layer guarantees neither that the wrapper actually exited nor that the new instance comes up), then stops the tracked standalone listener; a refused or unverifiable manager stop aborts before that cleanup runs.
 
 An absent root reaching admission is created with an exclusive non-recursive mode-0700 mkdir under an existing parent and left empty for later ownership claiming; the preflight never deletes the config root (refusal, concurrent creation, contents and replacements are all preserved). Existing roots must be real directories, not files or symlinks/junctions, and probe cleanup is non-recursive.
 A standalone selection is admitted in-process only when its path equals `process.execPath` exactly (standalone is executable packaging, not Desktop ownership); that path has neither child isolation nor a timeout, so synchronous filesystem operations may block, and other standalone selections refuse. Recovery is an operator-selected trusted `OPENCODEX_BUN_PATH` before launching ocx, or an `npm install -g @bitkyc08/opencodex` reinstall followed by retry; no runtime discovery or probe memo is added.
@@ -194,7 +194,7 @@ carried through; `bin/ocx.mjs` rediscovers bundled or validated PATH Bun, stampi
 `process` via `src/lib/bun-path-runtime.mjs`. The API-auth token remains file-backed and is loaded only by
 the service shell at start. On macOS, `start` and detailed `status` compare the live launchd job
 against `expectedLaunchdCommand`, which still follows a `launcherPath` recorded by a pre-pinning
-install rather than re-walking PATH, so such a job is never misreported as an older plist (#3464).
+install rather than re-walking PATH, so such a job is never misreported as an older plist (#3464). On macOS, `src/service/launchd.ts` waits up to 125 probes at 200 ms intervals for an evicted job to disappear before repair bootstraps its replacement. The bounded 25-second window accommodates the proxy drain and launchd shutdown; exhausted or unreadable registration retains the existing diagnostic failure path (`tests/service/launchd-repair.test.ts`).
 
 > Decision record: [ADR-0030](../decisions/ADR-0030-stable-service-launcher-launchd-and-systemd.md)
 > Decision record: [ADR-0100](../decisions/ADR-0100-stable-service-launcher-launchd-and-systemd.md)
@@ -454,16 +454,16 @@ mutating the port, because a claim could have landed during the now-unleased ref
 lease that stays claimed fails closed: nothing is started, and the job is marked failed, since
 the refresh before it produced no serving proxy; an ownership veto still ends as succeeded.
 
-On Windows, `src/update/npm-invocation.mjs` admits only the exact
-`%USERPROFILE%\scoop\apps\nodejs{,-lts}\current` and `current\bin` PATH entries
-from outside that Node installation. It resolves the home, junction, PATH entry, npm candidate,
-and cwd to physical paths; `current` must remain within its Scoop app directory and
-the npm candidate within the admitted entry. `current\bin` may point to the default
-`%USERPROFILE%\scoop\persist\nodejs{,-lts}\bin`; cwd inside that persistent bin
-is excluded too. The fixed persist suffix is appended to the physical home, accepting 8.3 home
-aliases without trusting a redirected persist subtree. Unreadable paths fail closed. Other Scoop apps, version-directory
-PATH entries (`NO_JUNCTION`), custom home-root Scoop installs, arbitrary descendants,
-and cwd inside the resolved Node installation are not admitted.
+On Windows, `src/update/npm-invocation.mjs` reads copied shell-location keys case-insensitively,
+with exact-key precedence, no ambiguous alias selection, and the same absolute-path checks.
+Scoop admits only `%USERPROFILE%\scoop\apps\nodejs{,-lts}\current` and `current\bin` PATH entries
+from outside the installation. Home, junction, PATH entry, npm candidate and cwd resolve to
+physical paths: `current` stays inside its Scoop app and npm inside the admitted entry.
+`current\bin` may resolve to `%USERPROFILE%\scoop\persist\nodejs{,-lts}\bin`; cwd inside that
+persistent bin is excluded too. The fixed persist suffix uses the physical home, accepting 8.3
+home aliases without trusting a redirected persist subtree. Unreadable paths fail closed.
+Other Scoop apps, version-directory entries (`NO_JUNCTION`), custom home-root Scoop installs,
+arbitrary descendants and cwd inside the resolved Node installation are not admitted.
 
 The npm transaction creates each staging directory exclusively and may clean that fresh path
 while the creating process still owns it. On POSIX it also creates the stage's `lib` directory,
@@ -574,7 +574,7 @@ waits for its replacement to answer, exits 1 when it never did, and falls back t
 when the listener recorded none. A supervised process (`OCX_SERVICE=1`) never spawns and exits 1
 for its supervisor. Coverage: `tests/server/restart-replacement.test.ts`,
 `tests/cli/cli-restart-handoff.test.ts`, `tests/server/system-restart.test.ts` and
-`tests/clients/client-runtime.test.ts`.
+`tests/clients/client-runtime.test.ts`. The client runtime's bound restart (OCX-6) keeps serving when its replacement fails, so it alone passes `notReady: "terminate"`: an unready replacement is stopped and `not_ready` returns only after its exit is observed (`tests/server/restart-replacement-not-ready.test.ts`; contract in [Remote Link](../remote-link.md)).
 
 A process the desktop app spawned spawns no replacement at all. The app sets
 `OCX_DESKTOP_SUPERVISED=1` on its sidecar; `handleStart` consumes it with the other start markers and

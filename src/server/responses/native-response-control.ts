@@ -4,6 +4,7 @@ import type { NativeSteeringReplayObserver } from "./native-steering-replay";
 import type { ProviderExecutedCallType } from "../responses-undeclared-tool-guard";
 
 import { isInjectionRequest } from "./native-injection-protocol";
+import { registerProviderResponseProvenance } from "../../providers/request-pacing";
 
 /** Shared transport ownership, not a shared steer/inject protocol state machine. */
 export interface NativeResponseControl {
@@ -25,15 +26,16 @@ export interface NativeResponseControl {
 
 export const OPENAI_API_RESPONSES_URL = "https://api.openai.com/v1/responses";
 
-const nativeControlResponses = new WeakSet<Response>();
+const nativeControlResponses = new WeakMap<Response, true>();
+registerProviderResponseProvenance(nativeControlResponses);
 /** Mark the exact response for multi-response delivery without serializing a wire field. */
-export function markNativeControlResponse(response: Response): Response { nativeControlResponses.add(response); return response; }
+export function markNativeControlResponse(response: Response): Response { nativeControlResponses.set(response, true); return response; }
 /** Recognize a marked native response by identity, not by caller-controlled content. */
 export function isNativeControlResponse(response: Response): boolean { return nativeControlResponses.has(response); }
 
 /** Carry the native-control identity onto the response that replaces this one. */
 export function carryNativeControlMarker(source: Response, rewrapped: Response): void {
-  if (nativeControlResponses.has(source)) nativeControlResponses.add(rewrapped);
+  if (nativeControlResponses.has(source)) nativeControlResponses.set(rewrapped, true);
 }
 
 /** Canonical ChatGPT needs its upstream WS enabled; only injection may use the separately billed public API. */

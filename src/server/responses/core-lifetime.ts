@@ -1,6 +1,7 @@
 import type { TranslatorBudget } from "../../lib/translator-budget";
+import { carryResponseToolOwnership } from "./response-tool-ownership";
 import { finalizeTranslatorBudgetResponse } from "../../lib/translator-budget";
-import { isNonReplayableResponse, markResponseNonReplayable } from "../../lib/upstream-retry";
+import { carryReplayRefusal, isNonReplayableResponse, markResponseNonReplayable } from "../../lib/upstream-retry";
 import {
   createTurnStateSniffer,
   observeTurnStateResponseHeaders,
@@ -105,11 +106,11 @@ export function finalizeOwnedTranslatorBudget(
     headers: response.headers,
   }));
   if (runTurnAdapterSseResponses.has(response)) runTurnAdapterSseResponses.add(finalizedResponse);
-  return finalizedResponse;
+  return carryResponseToolOwnership(response, finalizedResponse);
 }
 
 /** Release a serving-account slot when the client body ends, errors or is cancelled. */
-export function finalizeAccountLease(response: Response, release: () => void): Response {
+export function finalizeAccountLease(response: Response, release: () => void, onCancel?: () => void): Response {
   if (!response.body) { release(); return response; }
   const reader = response.body.getReader();
   let done = false;
@@ -125,6 +126,7 @@ export function finalizeAccountLease(response: Response, release: () => void): R
     async cancel(reason) {
       // Same ordering rule as the budget path: the slot must be released even when the
       // producer holds its cancel.
+      onCancel?.();
       finish();
       try { await reader.cancel(reason); } catch { /* slot already released */ }
     },
@@ -135,7 +137,7 @@ export function finalizeAccountLease(response: Response, release: () => void): R
     headers: response.headers,
   }));
   if (runTurnAdapterSseResponses.has(response)) runTurnAdapterSseResponses.add(wrapped);
-  return wrapped;
+  return carryResponseToolOwnership(response, wrapped);
 }
 
 

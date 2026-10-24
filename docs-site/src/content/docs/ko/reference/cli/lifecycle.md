@@ -106,7 +106,7 @@ dedicated-provider history도 포함됩니다. 상태를 백업하고 이 전체
 
 ### `ocx recover-history --ocx-compaction <thread-id> --yes`
 
-라우팅된 provider를 통해 압축된 작업을 native Codex에서 다시 열기 전에 해당 기록을 복구합니다. 이 명령은 UUID로 정확히 하나의 작업을 선택하고 비공개 바이트 단위 백업을 저장한 뒤, OpenCodeX가 소유한 `ocx1:` 압축 상태만 native Codex가 재생할 수 있는 일반 요약으로 변환합니다. native 암호화 콘텐츠와 다른 작업은 변경하지 않습니다. 실행 전에 선택한 작업을 닫으십시오. 처리 중 rollout이 변경되면 파일을 교체하지 않고 복구를 중단합니다.
+라우팅된 provider를 통해 압축된 작업을 native Codex에서 다시 열기 전에 해당 기록을 복구합니다. 이 명령은 UUID로 정확히 하나의 작업을 선택하고 비공개 바이트 단위 백업을 저장한 뒤, OpenCodeX가 소유한 `ocx1:`/`ocx2:` 압축 상태만 native Codex가 재생할 수 있는 일반 요약으로 변환합니다. native 암호화 콘텐츠와 다른 작업은 변경하지 않습니다. 실행 전에 선택한 작업을 닫으십시오. 처리 중 rollout이 변경되면 파일을 교체하지 않고 복구를 중단합니다.
 
 ### `ocx uninstall` · `ocx remove`
 
@@ -209,7 +209,7 @@ ocx status --json
 
 인증이 필요 없는 `GET /readyz` 엔드포인트로 동기화 후 준비 상태를 확인합니다. 준비되면 `200`,
 `pending` 또는 종단 상태인 `failed`이면 `Retry-After: 1`과 함께 `503`을 반환합니다. HTTP의 정제된
-식별 필드는 `{service, version, uptime, pid, port, status, protocol, minimumClientProtocol, managementUrl}`입니다. `protocol`은 허브의 현재 원격 프로토콜, `minimumClientProtocol`은 호환되는 최소 클라이언트 프로토콜, `managementUrl`은 브라우저에서 보이는 표준 관리 origin입니다. `/readyz`가 없는 이전 프록시는
+식별 필드는 `{service, version, uptime, pid, port, status, protocol, minimumClientProtocol, managementUrl, features}`입니다. `protocol`은 허브의 현재 원격 프로토콜, `minimumClientProtocol`은 호환되는 최소 클라이언트 프로토콜, `managementUrl`은 브라우저에서 보이는 표준 관리 origin입니다. `/readyz`가 없는 이전 프록시는
 `unreachable`로 fail-closed하며, `/healthz`는 준비 상태가 아닌 별도의 liveness 확인입니다. 기본값은 한 번의
 probe이며, `--wait`는 준비 또는 timeout까지 polling하지만 종단 `failed`를 확인하면 즉시 종료합니다.
 기본 timeout은 45초이며, `--timeout <seconds>`는 `--wait`와 함께 써야 하고 양의 정수인 1~300초 범위를 받습니다. CLI JSON은
@@ -237,6 +237,10 @@ single-flight/lock 파일을 만들 수 있는지, 건강하지 않은 OAuth 또
 ## 카탈로그 동기화
 
 ### `ocx sync [--restart-codex] [--restart-app-server-only]`
+
+> **Remote Link Child:** `ocx sync`는 Home의 Codex 설정도 적용하며, 클라이언트 런타임이 그 적용보다 먼저 시작되었으면 재시작 플래그 없이도 런타임을 재시작합니다. 재시작이 실패하면 이전 런타임이 계속 서비스하고 명령은 0이 아닌 코드로 끝납니다. `ocx status --json`과 `ocx link status --json`의 관련 필드는 [Remote Link apply parity](/reference/cli/lifecycle/#remote-link-apply-parity)(영문)를 참고하세요.
+
+재시작 플래그를 명시하면 카탈로그와 캐시 바이트가 같아도 `config.toml` 변경이 성공적으로 커밋된 뒤 재시작합니다. 설정만 다루는 작업이 변경 없음, 거부, 사전 검증 또는 롤백으로 끝나면 재시작하지 않습니다. 재시작 플래그가 없으면 sync는 Codex를 자동으로 재시작하지 않습니다.
 
 설정된 모든 공급자에서 라이브 모델 목록을 가져와 병합된 카탈로그를 Codex에 다시 주입합니다.
 공급자를 추가한 뒤나 사용 가능한 모델을 새로 고칠 때 실행합니다.

@@ -36,6 +36,20 @@ export function markResponseNonReplayable(response: Response): void {
   nonReplayableResponses.add(response);
 }
 
+/**
+ * A server-instructed wait longer than the retry budget: same-target 429 replay loops stop and
+ * return the original response, while key rotation and ordinary error delivery are unaffected.
+ */
+const sameTargetRetryHolds = new WeakSet<Response>();
+
+export function markSameTargetRetryHold(response: Response): void {
+  sameTargetRetryHolds.add(response);
+}
+
+export function isSameTargetRetryHold(response: Response): boolean {
+  return sameTargetRetryHolds.has(response);
+}
+
 export function isNonReplayableResponse(response: Response): boolean {
   return nonReplayableResponses.has(response);
 }
@@ -146,6 +160,7 @@ export function retainReplayRefusal<T extends Response>(response: T): T {
 
 /** Carry the verdict from a response onto the one that replaces it. */
 export function carryReplayRefusal<T extends Response>(source: Response, rewrapped: T): T {
+  if (sameTargetRetryHolds.has(source)) sameTargetRetryHolds.add(rewrapped);
   return isReplayRefusalResponse(source) ? retainReplayRefusal(rewrapped) : rewrapped;
 }
 
@@ -923,7 +938,10 @@ export async function fetchWithTransientRetry(
     // A 429 only enters this loop when the caller opted into a rate-limit ladder; without one it
     // keeps its old meaning (a non-transient status the caller owns) and returns here.
     const rateLimited = res.status === 429 && rateLimitDelays.length > 0;
-    if (res.ok || (!isTransientUpstreamStatus(res.status) && !rateLimited) || isNonReplayableResponse(res)) {
+    // An upstream that answers with the exact `x-should-retry: false` verdict has said the same
+    // thing about its own failure, so the ladder stops and hands the response back untouched.
+    if (res.ok || (!isTransientUpstreamStatus(res.status) && !rateLimited) || isNonReplayableResponse(res)
+      || res.headers.get(REPLAY_REFUSAL_NO_RETRY_HEADER) === REPLAY_REFUSAL_NO_RETRY_VALUE) {
       return wrapSseDeclineRetry(res);
     }
     // Checked before cancelResponseBodyBestEffort so an already-aborted caller never receives

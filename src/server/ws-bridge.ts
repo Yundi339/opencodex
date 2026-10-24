@@ -11,6 +11,8 @@ import { BoundedSseFrameBuffer } from "./sse-frame-buffer";
 import { sseDataPayload as parseSseBlock } from "./sse-payload-rewrite";
 import { safeResponseHeaders } from "./safe-response-headers";
 import type { AudioSocketTarget } from "./audio-dictation";
+import type { CodexWebSocketActivity } from "../codex/websocket-activity";
+import { AGENT_ASSERTION_HEADER } from "../lib/authorization-scheme";
 
 export { safeResponseHeaders } from "./safe-response-headers";
 
@@ -19,6 +21,7 @@ type ResponsesTerminalReporter = (status: ResponsesTerminalStatus) => void;
 type ResponsesPayloadObserver = (payload: string) => void;
 
 export interface WsData {
+  responsesActivity?: CodexWebSocketActivity;
   nativeControl?: NativeResponseControl;
   /** Content-free per-turn explanation; never a model capability assertion. */
   nativeSteeringUnavailable?: string;
@@ -129,6 +132,10 @@ export function selectForwardHeaders(
   if (codexOverride) {
     selected.set("authorization", `Bearer ${codexOverride.accessToken}`);
     selected.set("chatgpt-account-id", codexOverride.chatgptAccountId);
+  } else {
+    // Kept for the WS turn pipeline, which drops it again everywhere except first-party Direct.
+    const assertion = headers.get(AGENT_ASSERTION_HEADER);
+    if (assertion) selected.set(AGENT_ASSERTION_HEADER, assertion);
   }
   return selected;
 }

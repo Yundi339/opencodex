@@ -370,19 +370,32 @@ const commandRunners: Record<string, CommandRunner> = {
   },
   login: async deps => {
     const loginArgs = deps.args.slice(1);
+    // `--headless` is the only flag this command takes; the provider is the first bare word, so
+    // `ocx login --headless anthropic` and `ocx login anthropic --headless` mean the same thing.
+    // It is deliberately not `--code`: that name carries a secret value everywhere else in the
+    // CLI (`ocx account login <provider> --code <value>`) and its operand is scrubbed from stderr.
+    const codeMode = loginArgs.includes("--headless");
+    const positional = loginArgs.filter(arg => !arg.startsWith("--"));
     // 'ocx login codex' is the command people type first, and until now it answered with
     // the full provider wall because the Codex pool lives behind 'ocx account login'.
     // Route the three Codex spellings to that flow instead of making the user discover
     // a second noun. Everything else stays on the local OAuth/API-key path.
     const { isCodexAccountLoginName, handleAccountAuthCommand } = await import("./account-auth");
-    if (isCodexAccountLoginName(loginArgs[0] ?? "")) {
+    if (isCodexAccountLoginName(positional[0] ?? "")) {
+      // `--headless` is the OAuth code-display mode, which Codex does not have; account-auth
+      // would reject the flag as an unexpected argument. Codex's headless path is the device-code
+      // login, so point there instead.
+      if (codeMode) {
+        console.error("Codex has no code-display login. For a headless host use: ocx account login codex --device");
+        return 1;
+      }
       // null means "unknown subcommand", which "login" never is; the coalesce exists because
       // the shared signature serves callers that do pass an unknown one.
       const code = await handleAccountAuthCommand("login", loginArgs, { findLiveProxy: deps.findLiveProxy });
       return code ?? 1;
     }
     const { handleLogin } = await import("../oauth/login-cli");
-    await handleLogin(loginArgs[0]);
+    await handleLogin(positional[0], {}, { codeMode });
     return 0;
   },
   logout: async deps => {
@@ -424,6 +437,32 @@ const commandRunners: Record<string, CommandRunner> = {
           }
         }
         await handleConnectedSyncCatalogWrite(result, restartScope);
+        if (result.applyRecordFailed) {
+          console.error("The Home's Codex settings were applied, but the apply record could not be written; the client runtime was not restarted. Run 'ocx sync' again.");
+          process.exitCode = 1;
+        }
+        // OCX-6: a link Child's runtime must have started after the apply it serves under.
+        if (link && result.appliedRecord) {
+          const { applyRestartMessage, restartRuntimeAfterApply } = await import("./link-apply-restart");
+          const { sameClientConnectionOwner } = await import("../client/state");
+          const applied = clientState.value;
+          const outcome = await restartRuntimeAfterApply(result.appliedRecord, {
+            restart: startWhenStopped => deps.handleProxyRestart(startWhenStopped),
+            recoveryStart: recovering => deps.handleRestartStartWhenStopped(recovering),
+            connectionUnchanged: () => {
+              const current = readClientConnectionState();
+              return current.kind === "connected" && sameClientConnectionOwner(current.value, applied)
+                && current.value.link?.linkId === applied.link?.linkId;
+            },
+          });
+          const message = applyRestartMessage(outcome);
+          if (outcome.kind === "failed" || outcome.kind === "connection-changed") {
+            console.error(message);
+            process.exitCode = 1;
+          } else {
+            console.log(message);
+          }
+        }
         // `process.exitCode` rather than a literal 0, for the same reason every other
         // runner does it (tests/cli/cli-transport-honesty.test.ts): the catalog-write helper
         // drives app-server restarts, and one of those recording a failure must not be
@@ -461,11 +500,15 @@ const commandRunners: Record<string, CommandRunner> = {
       code = 1;
       console.error("Codex sync did not complete. Fix the reported Codex config issue and retry.");
     }
-    // Only warn/restart when a catalog or models_cache write actually happened. This is
+    // Catalog/model-cache writes retain their warning/restart handling. This is
     // deliberately not an `else`: refreshCodexModelCatalog runs before injectCodexConfig,
     // so a sync can fail (`ok: false`) after the catalog was already rewritten — which is
     // exactly when a long-lived app-server is holding the stale list.
-    if (synced.catalogWritten || synced.cacheSynced) {
+    // A configuration-only change also needs a reload, but only when explicitly
+    // requested. A successful no-op or refused write is never restart authority.
+    const requestedConfigRestart = (restartScope.appServers || restartScope.desktopApp)
+      && synced.ok && synced.configChanged === true;
+    if (synced.catalogWritten || synced.cacheSynced || requestedConfigRestart) {
       await handleRestartScopeAfterWrite(restartScope, console);
     }
     // `ocx sync` is a direct CLI path; it does not call the management
@@ -859,6 +902,10 @@ const commandRunners: Record<string, CommandRunner> = {
     const { handleEffortCommand } = await import("./effort");
     return await handleEffortCommand(deps.args.slice(1), { findLiveProxy: deps.findLiveProxy });
   },
+  fallback: async deps => {
+    const { handleFallbackCommand } = await import("./fallback");
+    return await handleFallbackCommand(deps.args.slice(1), { findLiveProxy: deps.findLiveProxy });
+  },
   agent: async deps => {
     const { handleAgentCommand } = await import("./agent");
     return await handleAgentCommand(deps.args.slice(1));
@@ -944,6 +991,10 @@ const commandRunners: Record<string, CommandRunner> = {
   lab: async deps => {
     const { handleLabCommand } = await import("./lab");
     return await handleLabCommand(deps.args.slice(1));
+  },
+  "codex-provider": async deps => {
+    const { handleCodexProviderCommand } = await import("./codex-provider");
+    return await handleCodexProviderCommand(deps.args.slice(1));
   },
   chatgpt: async deps => {
     const { handleChatgptCommand } = await import("./chatgpt-command");

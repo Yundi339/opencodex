@@ -1,3 +1,10 @@
+import { normalizeJevQuotaTiers, type ResolvedJevQuotaTiers } from "./jev-quota-config";
+import {
+  JEV_SESSION_PIN_TTL_MAX_MS,
+  JEV_SESSION_PIN_TTL_MIN_MS,
+  normalizeJevSessionPin,
+  type JevSessionPinConfig,
+} from "./jev-session-pin-config";
 import { isCodexReasoningEffort, isDeclaredReasoningEffort } from "../reasoning-effort";
 import { SUPPORTED_NATIVE_OPENAI_SLUGS } from "../codex/catalog/native-models";
 import type { OcxComboConfig, OcxComboCooldownWaitPolicy, OcxComboDefaultEffort, OcxComboDefaultEffortMode, OcxComboReasoningEffortMode, OcxComboStrategy, OcxComboTarget, OcxProviderConfig } from "../types";
@@ -40,6 +47,8 @@ export interface ComboValidationIssue {
 }
 
 export interface NormalizedComboConfig {
+  /** Operator consent, effective only on a loopback-only proxy. */
+  allowMeteredTargets?: boolean;
   strategy: OcxComboStrategy;
   stickyLimit: number;
   cooldownMs?: number;
@@ -64,12 +73,18 @@ export interface NormalizedComboConfig {
   nativeAlias: boolean;
   /** Display-only label for the catalog row, or null when unset. */
   displayName: string | null;
+  /** Display-only catalog row description; absent keeps the generated text (#7229). */
+  description?: string;
   /** JEV decision service provider id; absent means the canonical `jev` service. */
   decisionProvider?: string;
   /** Ordinary inference route used for JEV decisions. */
   decisionModel?: string;
   /** JEV decision deadline override; absent keeps the default four-second deadline. */
   decisionTimeoutMs?: number;
+  decisionQuotaSignals?: boolean;
+  decisionQuotaTiers?: ResolvedJevQuotaTiers;
+  /** JEV only, opt-in: keep a session on the target JEV chose for it (#7525). */
+  sessionPin?: JevSessionPinConfig;
   targets: NormalizedComboTarget[];
 }
 
@@ -133,6 +148,7 @@ export interface ComboValidationOptions {
   excludeComboId?: string;
 }
 
+/** Validate a raw combo definition against the configured providers and return every issue found, without mutating the input. */
 export function comboConfigIssues(
   id: string,
   raw: unknown,
@@ -164,6 +180,9 @@ export function comboConfigIssues(
   }
 
   const body = raw as Record<string, unknown>;
+  if (body.allowMeteredTargets !== undefined && typeof body.allowMeteredTargets !== "boolean") {
+    issues.push({ path: ["allowMeteredTargets"], message: "allowMeteredTargets must be a boolean" });
+  }
   if (typeof body.alias === "string") {
     const alias = body.alias.toLowerCase();
     for (const [providerName, provider] of Object.entries(providers)) {
@@ -303,6 +322,16 @@ export function comboConfigIssues(
       });
     }
   }
+  if (body.description !== undefined) {
+    if (typeof body.description !== "string") {
+      issues.push({ path: ["description"], message: "description must be a string" });
+    } else if (body.description.trim().length > 128 || /\p{Cc}/u.test(body.description)) {
+      issues.push({
+        path: ["description"],
+        message: "description must be at most 128 characters and contain no control characters",
+      });
+    }
+  }
   const alias = typeof body.alias === "string" ? body.alias.trim() : "";
   const nativeAlias = body.nativeAlias === true;
   if (nativeAlias && !SUPPORTED_NATIVE_OPENAI_SLUGS.has(alias)) {
@@ -313,6 +342,22 @@ export function comboConfigIssues(
   }
   if (nativeAlias && (typeof body.displayName !== "string" || body.displayName.trim().length === 0)) {
     issues.push({ path: ["displayName"], message: "displayName is required for native aliases" });
+  }
+  for (const field of ["decisionQuotaSignals", "decisionQuotaTiers"] as const) {
+    if (body[field] === undefined || body[field] === null) continue;
+    if (body.strategy !== "jev") issues.push({ path: [field], message: `${field} is only valid with strategy "jev"` });
+    if (field === "decisionQuotaSignals" ? typeof body[field] !== "boolean" : !normalizeJevQuotaTiers(body[field]))
+      issues.push({ path: [field], message: field === "decisionQuotaSignals" ? "decisionQuotaSignals must be a boolean" : "decisionQuotaTiers must contain finite 0..100 strictly ascending thresholds" });
+  }
+  if (body.sessionPin !== undefined && body.sessionPin !== null) {
+    if (body.strategy !== "jev") {
+      issues.push({ path: ["sessionPin"], message: 'sessionPin is only valid with strategy "jev"' });
+    } else if (!normalizeJevSessionPin(body.sessionPin)) {
+      issues.push({
+        path: ["sessionPin"],
+        message: `sessionPin must be { "ttlMs": <integer from ${JEV_SESSION_PIN_TTL_MIN_MS} to ${JEV_SESSION_PIN_TTL_MAX_MS}> }`,
+      });
+    }
   }
   if (body.decisionProvider !== undefined && body.decisionProvider !== null) {
     const decisionProvider = typeof body.decisionProvider === "string" ? body.decisionProvider.trim() : "";
@@ -460,6 +505,12 @@ export function comboConfigIssues(
         message: `targets[${i}].lastResort must be a boolean`,
       });
     }
+    if (target.metered !== undefined && typeof target.metered !== "boolean") {
+      issues.push({
+        path: ["targets", i, "metered"],
+        message: `targets[${i}].metered must be a boolean`,
+      });
+    }
     if (target.modelProfile !== undefined
       && (typeof target.modelProfile !== "string"
         || target.modelProfile.trim().length === 0
@@ -509,9 +560,11 @@ export function comboConfigError(
   return comboConfigIssues(id, raw, providers, options)[0]?.message ?? null;
 }
 
+/** Normalize a validated combo definition into its canonical form: trimmed strings, defaults and the opt-in quota signal fields. */
 export function normalizeComboConfig(raw: OcxComboConfig): NormalizedComboConfig {
   const alias = typeof raw.alias === "string" ? raw.alias.trim() : "";
   const displayName = typeof raw.displayName === "string" ? raw.displayName.trim() : "";
+  const description = typeof raw.description === "string" ? raw.description.trim() : "";
   const decisionProvider = typeof raw.decisionProvider === "string" ? raw.decisionProvider.trim() : "";
   const decisionModel = typeof raw.decisionModel === "string" ? raw.decisionModel.trim() : "";
   const defaultEffort = typeof raw.defaultEffort === "string" && isCodexReasoningEffort(raw.defaultEffort)
@@ -519,6 +572,7 @@ export function normalizeComboConfig(raw: OcxComboConfig): NormalizedComboConfig
     : null;
   return {
     strategy: raw.strategy ?? "failover",
+    ...(raw.allowMeteredTargets === true ? { allowMeteredTargets: true } : {}),
     stickyLimit: raw.stickyLimit ?? 1,
     cooldownMs: raw.cooldownMs,
     firstByteTimeoutMs: raw.firstByteTimeoutMs,
@@ -535,10 +589,14 @@ export function normalizeComboConfig(raw: OcxComboConfig): NormalizedComboConfig
     alias: alias || null,
     nativeAlias: raw.nativeAlias === true,
     displayName: displayName || null,
+    ...(description ? { description } : {}),
     // Explicit "jev" is the default and stays sparse.
     ...(decisionProvider && decisionProvider !== CANONICAL_JEV_DECISION_PROVIDER ? { decisionProvider } : {}),
     ...(decisionModel ? { decisionModel } : {}),
     ...(typeof raw.decisionTimeoutMs === "number" ? { decisionTimeoutMs: raw.decisionTimeoutMs } : {}),
+    ...(raw.strategy === "jev" && raw.decisionQuotaSignals === true ? { decisionQuotaSignals: true } : {}),
+    ...(raw.strategy === "jev" && normalizeJevQuotaTiers(raw.decisionQuotaTiers) ? { decisionQuotaTiers: normalizeJevQuotaTiers(raw.decisionQuotaTiers)! } : {}),
+    ...(raw.strategy === "jev" && normalizeJevSessionPin(raw.sessionPin) ? { sessionPin: normalizeJevSessionPin(raw.sessionPin)! } : {}),
     targets: raw.targets.map(target => ({
       provider: target.provider.trim(),
       model: target.model.trim(),
@@ -553,6 +611,7 @@ export function normalizeComboConfig(raw: OcxComboConfig): NormalizedComboConfig
       ...(target.firstByteTimeoutMs !== undefined
         ? { firstByteTimeoutMs: target.firstByteTimeoutMs }
         : {}),
+      metered: target.metered === true,
     })),
   };
 }

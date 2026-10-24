@@ -78,6 +78,8 @@ function fakeSession(socket: ReturnType<typeof fakeSocket>, crossTurn = false) {
     dispose() { socket.close(); },
     release() {},
     hasCompleted: () => false,
+    // Upstream 2.92 seeds the exchange metadata from the socket's upgrade headers.
+    upgradeHeaders: () => new Headers(),
   };
 }
 

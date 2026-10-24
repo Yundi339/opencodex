@@ -257,7 +257,7 @@ platform from the [latest release](https://github.com/lidge-jun/opencodex/releas
 | Platform | File | Notes |
 |---|---|---|
 | macOS 13+ (Apple Silicon and Intel) | `OpenCodex-<version>-macos.dmg` | Universal build, signed with a Developer ID and notarized |
-| Windows (x64) | `OpenCodex-<version>-windows-x64.msi` | Not code-signed yet: SmartScreen asks once, choose **More info → Run anyway** |
+| Windows (x64) | `OpenCodex-<version>-windows-x64.msi` | Code signing via SignPath Foundation is rolling out ([code signing policy](https://opencodex.me/reference/code-signing/)); until a release is signed, SmartScreen asks once: choose **More info → Run anyway** |
 | Linux (x86_64) | `OpenCodex-<version>-linux-x86_64.AppImage` or `-linux-amd64.deb` | The tray needs an AppIndicator-capable desktop |
 
 Every file has a `.sha256` next to it on the release page. On macOS 14+ the app also ships a
@@ -315,7 +315,7 @@ Docker Compose; a remote Git context needs Docker Compose. Neither path needs ho
 preparation step. Initialize the data-plane token once through stdin and start the hub:
 
 ```bash
-git clone https://github.com/lidge-jun/opencodex.git
+git clone https://github.com/skyhua0224/opencodex.git
 cd opencodex
 docker compose build
 openssl rand -hex 32 | docker compose run --rm -T hub bun run docker/bootstrap-token.ts
@@ -602,7 +602,7 @@ Source development requires the `bun` CLI on your `PATH`. The published npm pack
 Bun runtime for installed `ocx` commands; package scripts may also resolve Bun through that bundled dependency.
 
 ```bash
-git clone https://github.com/lidge-jun/opencodex.git
+git clone https://github.com/skyhua0224/opencodex.git
 cd opencodex
 bun install
 bun run typecheck

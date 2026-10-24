@@ -1,3 +1,5 @@
+import { readCodexWsUpgradeHeaders } from "./codex-ws-metadata";
+
 export const MAX_CODEX_WS_SESSION_EXCHANGES = 32;
 
 /** Owns one physical socket; request listeners belong to the exchange, not this object. */
@@ -20,10 +22,13 @@ export class CodexWsSession {
   onLifecycle?: (event: Record<string, unknown>) => void;
   private owner?: (reason: Error) => void;
   private readonly completedIds = new Set<string>();
+  private pendingUpgradeHeaders?: Headers;
+  private connectionHeaders?: Headers;
 
   constructor(url: string, headers: Record<string, string>, readonly retainable = false,
     private readonly changed: () => void = () => {}, proxy?: string) {
     this.socket = new WebSocket(url, { headers, ...(proxy ? { proxy } : {}) } as unknown as string[]);
+    this.socket.addEventListener("handshake", this.onHandshake);
     this.socket.addEventListener("open", this.onOpen);
     this.socket.addEventListener("message", this.onIdleMessage);
     this.socket.addEventListener("close", this.onClose);
@@ -33,6 +38,7 @@ export class CodexWsSession {
   get reused(): boolean { return this.completedIds.size > 0; }
   hasCompleted(id: string): boolean { return this.completedIds.has(id); }
   markCrossTurnReuse(): void { this.crossTurnReuse = true; }
+  upgradeHeaders(): Headers { return new Headers(this.opened && !this.closed ? this.connectionHeaders : undefined); }
 
   reserve(): boolean {
     if (this.closed || this.busy || (this.opened && this.socket.readyState !== undefined && this.socket.readyState !== 1)) return false;
@@ -98,7 +104,18 @@ export class CodexWsSession {
     try { this.onLifecycle?.(event); } catch { /* diagnostics must not affect a turn */ }
   }
 
-  private onOpen = (): void => { this.opened = true; };
+  private onHandshake = (event: Event): void => {
+    if (this.opened || this.closed) return;
+    this.pendingUpgradeHeaders = readCodexWsUpgradeHeaders((event as MessageEvent<unknown>).data);
+  };
+  private onOpen = (): void => {
+    if (this.closed) return;
+    // A 101 payload alone is not proof that Bun accepted the handshake.
+    this.connectionHeaders = this.pendingUpgradeHeaders;
+    this.pendingUpgradeHeaders = undefined;
+    this.socket.removeEventListener("handshake", this.onHandshake);
+    this.opened = true;
+  };
   private onIdleMessage = (): void => {
     if (!this.busy) this.dispose(new Error("codex websocket received unsolicited idle data"));
   };
@@ -114,6 +131,9 @@ export class CodexWsSession {
     // The active exchange's close listener retains pre-send fallback semantics.
   };
   private detach(): void {
+    this.pendingUpgradeHeaders = undefined;
+    this.connectionHeaders = undefined;
+    this.socket.removeEventListener("handshake", this.onHandshake);
     this.socket.removeEventListener("open", this.onOpen);
     this.socket.removeEventListener("message", this.onIdleMessage);
     this.socket.removeEventListener("close", this.onClose);
