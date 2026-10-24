@@ -112,6 +112,31 @@ instead, clone it and `npm install -g .` from the checkout; to pin one cut, inst
   anything about opencodex itself belongs upstream.
 - License: MIT, unchanged, with the original copyright notice (see `LICENSE`).
 
+### The 2.92 replay (October 2026)
+
+- The 2.86 import is a squashed tree with no upstream ancestry, so the replay grafts one on locally:
+  `git replace --graft <import-commit> upstream-v2.86.0`, then `git merge upstream-v2.92.0`. Git can
+  then compute a real three-way merge (base = pristine 2.86, ours = the fork, theirs = 2.92) instead
+  of applying a patch blind. The merge result is committed as a **single-parent** commit
+  (`git commit-tree <tree> -p HEAD`) so upstream's history never enters this repository's DAG; the
+  replace ref is deleted after the commit.
+- 2.87 through 2.92 touched 1743 files upstream; 26 files conflicted with the fork. Resolution policy:
+  keep the fork's combo ladder, capacity rungs and holds, degenerate guard, quota auto-refresh and
+  thread-affinity carry; layer upstream's new work on top — hard-locked main fallback routing, tool-loop
+  pin, JEV session pin, fallback policy, metered targets, Codex 0.164 controls, response tool ownership
+  and replay-refusal carry.
+- Two upstream expectations were adapted to fork policy rather than the code: a generic 413 stays
+  terminal (the fork's generic 413 hop was removed in favour of the structured target-cap rules), and a
+  combo ladder that ends on a 429 answers its own 503 so the Codex client resends instead of reporting
+  "exceeded retry limit, last status: 429".
+- Update-path compatibility was exercised end to end on a real 2.86.0-skyhua.2 install: `ocx update`
+  resolved the fork release, staged the tarball URL (never an npm registry spec), replaced the package,
+  re-injected the Codex routing and restarted the service. The service ownership protocol is still
+  version 1 and the 2.86 `config.json` loads under 2.92 with no diagnostics.
+- Known red after the replay: one new upstream JEV test (an invalid `NaN` reset header in the main
+  account's advisory quota pool) and the pre-existing fork/upstream test divergences the 2.86 replay
+  already carried.
+
 ### 6. Observability: what the origin actually served
 
 - **Repetition guard for native sessions** (`guardNativeDegenerateOutput` in
