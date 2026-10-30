@@ -44,7 +44,7 @@ import { isPlainObject } from "./internal";
 import { normalizeToolSchemas, promoteClientLoadedTools, stripUnsupportedHostedTools } from "./tool-schema";
 import { annotateEmptyResponsesToolOutputs, backfillWebSearchQueries, normalizeResponsesToolResultAdjacency, repairOrphanedInputItems, repairOversizedReplayCallIds, repairUnidentifiedToolOutputItems, restoreBridgedWebSearchCalls } from "./tool-output-recovery";
 import { bridgeSearchReplayScope } from "../../responses/bridge-search-replay-cache";
-import { applyTierDecisionToResponsesBody, normalizeCanonicalForwardContinuationEnvelope, normalizeCanonicalForwardPromptEnvelope, stripCanonicalForwardSamplingParams, stripPreviousResponseId, stripStatefulResponsesParams, stripUnsupportedForwardParams } from "./canonical-forward";
+import { applyTierDecisionToResponsesBody, normalizeCanonicalForwardContinuationEnvelope, normalizeCanonicalForwardPromptEnvelope, stripCanonicalForwardSamplingParams, stripPreviousResponseId, stripStatefulResponsesParams, stripUnsupportedForwardParams, stripUnsupportedResponsesIncludes } from "./canonical-forward";
 import { normalizeImageGenClientTools, preferConfiguredHostedTools } from "./image-gen";
 import { stripMuseSparkUnsupportedWebSearchFields, stripOpenAiOnlyWebSearchFields } from "./web-search";
 import { observeOutbound } from "../../usage/cache-diagnostic";
@@ -385,6 +385,7 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
           outBody = normalizeCanonicalForwardContinuationEnvelope(outBody);
         }
       } else {
+        outBody = stripUnsupportedResponsesIncludes(outBody);
         outBody = stripRejectedSamplingParams(outBody, provider, parsed.modelId);
         outBody = preferConfiguredHostedTools(
           outBody,

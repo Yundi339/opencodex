@@ -1,6 +1,7 @@
 import type { NativeResponseControl } from "./native-response-control";
 import type { CodexWsPreOutputRefusalHold } from "./codex-ws-wire";
 import type { Server } from "bun";
+import { prepareCodexHttpInit } from "./codex-ws-request";
 import {
   codexWsUpstreamFetch,
   currentBunRuntimeIdentity,
@@ -302,6 +303,7 @@ export function providerFetch(
   ) as typeof globalThis.fetch);
   const httpFetch = Object.assign(
     async (input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
+      if (typeof input === "string" && init) init = prepareCodexHttpInit(input, init);
       // Refuse before any dispatch side effect where that is sound. `beforeDispatch` commits
       // attempt accounting and consumes admission state, so a refusal firing after it would
       // charge an attempt for a send that never happens, and a throwing hook would mask the

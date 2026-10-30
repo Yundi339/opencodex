@@ -25,6 +25,72 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+
+/** ChatGPT's HTTP Responses parser rejects Codex's private `additional_tools` input item. */
+export function hoistCanonicalHttpAdditionalTools(body: unknown): unknown {
+  if (!isRecord(body) || !Array.isArray(body.input)) return body;
+  const input: unknown[] = [];
+  const promoted: unknown[] = [];
+  let changed = false;
+  for (const item of body.input) {
+    if (isRecord(item) && item.type === "additional_tools") {
+      changed = true;
+      if (Array.isArray(item.tools)) promoted.push(...item.tools);
+      continue;
+    }
+    input.push(item);
+  }
+  if (!changed) return body;
+  if (body.tools !== undefined && !Array.isArray(body.tools)) return { ...body, input };
+  const existing = Array.isArray(body.tools) ? body.tools : [];
+  const seen = new Set(existing.map(tool => JSON.stringify(tool)));
+  const tools = [...existing];
+  for (const tool of promoted) {
+    const key = JSON.stringify(tool);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    tools.push(tool);
+  }
+  return tools.length > 0 ? { ...body, input, tools } : { ...body, input };
+}
+
+/** Public Responses gateways reject Codex's private additional_tools input wrapper. */
+export function hoistHttpAdditionalTools(body: unknown): unknown {
+  if (!isRecord(body) || !Array.isArray(body.input)) return body;
+  const input: unknown[] = [];
+  const promoted: unknown[] = [];
+  let changed = false;
+  for (const item of body.input) {
+    if (isRecord(item) && item.type === "additional_tools") {
+      changed = true;
+      if (Array.isArray(item.tools)) promoted.push(...item.tools);
+      continue;
+    }
+    input.push(item);
+  }
+  if (!changed) return body;
+  if (body.tools !== undefined && !Array.isArray(body.tools)) return { ...body, input };
+  const existing = Array.isArray(body.tools) ? body.tools : [];
+  const seen = new Set(existing.map(tool => JSON.stringify(tool)));
+  const tools = [...existing];
+  for (const tool of promoted) {
+    const key = JSON.stringify(tool);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    tools.push(tool);
+  }
+  return { ...body, input, ...(tools.length > 0 ? { tools } : {}) };
+}
+
+function isResponsesHttpUrl(url: string): boolean {
+  try {
+    return new URL(url).pathname.endsWith("/responses");
+  } catch {
+    return false;
+  }
+}
+
+
 function applyLiteMetadata(body: Record<string, unknown>, headers: Headers): boolean {
   const metadata = body.client_metadata;
   // Native client metadata is a string map. Do not spread malformed input or
@@ -58,14 +124,17 @@ function applyLiteMetadata(body: Record<string, unknown>, headers: Headers): boo
   return true;
 }
 
-/** Pure preparation; null keeps malformed requests on the existing HTTP fallback path. */
+/** Prepare an HTTP Responses request for a public upstream; malformed bodies stay untouched. */
 export function prepareCodexHttpInit(url: string, init: RequestInit): RequestInit {
-  if (url !== CODEX_RESPONSES_HTTP_URL || typeof init.body !== "string") return init;
+  if (!isResponsesHttpUrl(url) || typeof init.body !== "string") return init;
   const headers = new Headers(init.headers);
   let body: unknown;
   try { body = JSON.parse(init.body); } catch { /* malformed body cannot authorize a hint */ }
-  applyCodexRoutingHint(headers, body);
-  return { ...init, headers };
+  if (url === CODEX_RESPONSES_HTTP_URL) applyCodexRoutingHint(headers, body);
+  const hoisted = hoistHttpAdditionalTools(body);
+  if (hoisted === body) return { ...init, headers };
+  headers.delete("content-length");
+  return { ...init, headers, body: JSON.stringify(hoisted) };
 }
 
 /** Null refuses only WS conversion; canonical HTTP normalization is independently reusable. */
@@ -81,7 +150,7 @@ export function prepareCodexWsRequest(url: string, init: RequestInit): PreparedC
       if (!applyLiteMetadata(body, httpHeaders)) return null;
       applyCodexRoutingHint(httpHeaders, body);
     }
-    const httpInit = { ...init, headers: httpHeaders };
+    const httpInit = prepareCodexHttpInit(url, { ...init, headers: httpHeaders });
     // WS is implicitly streaming; retain every other caller field except type.
     delete body.stream;
     const frameText = JSON.stringify({ ...body, type: "response.create" });

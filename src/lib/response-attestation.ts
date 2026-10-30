@@ -96,7 +96,13 @@ function record(entry: Record<string, unknown>): void {
 
 /** Compare two model ids the way a proxy must: exact after case folding and suffix trimming. */
 function sameModel(requested: string, reported: string): boolean {
-  const norm = (value: string) => value.trim().toLowerCase().replace(/-latest$/, "");
+  const norm = (value: string) => {
+    const normalized = value.trim().toLowerCase().replace(/-latest$/, "");
+    // xAI OAuth may report the serving lane (`grok-4.7-build` or
+    // `grok-4.7-build-fast`) while the caller and catalog use the logical
+    // `grok-4.7` model. These are wire aliases, not a model selection change.
+    return normalized.replace(/^(grok-4\.7)-build(?:-fast)?$/, "$1");
+  };
   return norm(requested) === norm(reported);
 }
 

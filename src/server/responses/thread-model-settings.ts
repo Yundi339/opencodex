@@ -9,6 +9,7 @@ import { peekConversationSelection } from "./conversation-selection";
 const STATE_FILE = "thread-model-settings.json";
 const STATE_VERSION = 1;
 const MAX_SETTINGS = 8_192;
+const SETTING_TTL_MS = 7 * 24 * 60 * 60_000;
 const MAX_SESSION_FILES = 32_768;
 const REFRESH_INTERVAL_MS = 2_000;
 
@@ -34,6 +35,10 @@ function statePath(): string {
   return join(getConfigDir(), STATE_FILE);
 }
 
+function nowMs(): number {
+  return Date.now();
+}
+
 function loadState(): void {
   if (loaded) return;
   loaded = true;
@@ -45,6 +50,7 @@ function loadState(): void {
       const record = value as { model?: unknown; lastSeenAt?: unknown };
       if (typeof record.model !== "string" || record.model.length === 0 || record.model.length > 512) continue;
       if (typeof record.lastSeenAt !== "number" || !Number.isFinite(record.lastSeenAt)) continue;
+      if (record.lastSeenAt <= nowMs() && nowMs() - record.lastSeenAt > SETTING_TTL_MS) continue;
       settings.set(threadId, { model: record.model, lastSeenAt: record.lastSeenAt });
     }
   } catch {
@@ -71,6 +77,7 @@ function timestampOf(value: unknown, fallback: number): number {
     const parsed = Date.parse(value);
     if (Number.isFinite(parsed)) return parsed;
   }
+
   return fallback;
 }
 
@@ -210,6 +217,14 @@ function refreshIndex(now: number, focusThreadIds: readonly string[] = []): void
   }
   for (const path of fileStamps.keys()) {
     if (!seenFiles.has(path)) fileStamps.delete(path);
+  }
+  const cutoff = now - SETTING_TTL_MS;
+  for (const [threadId, entry] of settings) {
+    if (entry.lastSeenAt <= now && entry.lastSeenAt < cutoff) {
+      settings.delete(threadId);
+      settingSources.delete(threadId);
+      changed = true;
+    }
   }
   while (settings.size > MAX_SETTINGS) {
     const oldest = [...settings.entries()].sort((a, b) => a[1].lastSeenAt - b[1].lastSeenAt)[0]?.[0];

@@ -258,7 +258,7 @@ describe("compact handoff route admission namespacing", () => {
         const rolloutDir = join(testDir, "sessions");
         mkdirSync(rolloutDir);
         writeFileSync(join(rolloutDir, "rollout-fixture.jsonl"), JSON.stringify({
-          timestamp: "2026-10-01T10:00:00.000Z", type: "event_msg",
+          timestamp: new Date().toISOString(), type: "event_msg",
           payload: { type: "thread_settings_applied", thread_settings: { thread_id: threadId, model: "fixture/current-model" } },
         }) + "\n");
       }
@@ -284,7 +284,7 @@ describe("compact handoff route admission namespacing", () => {
       const rolloutDir = join(testDir, "sessions", "2026", "10", "01");
       mkdirSync(rolloutDir, { recursive: true });
       writeFileSync(join(rolloutDir, "rollout-thread.jsonl"), `${JSON.stringify({
-        timestamp: "2026-10-01T10:00:00.000Z",
+        timestamp: new Date().toISOString(),
         type: "event_msg",
         payload: {
           type: "thread_settings_applied",

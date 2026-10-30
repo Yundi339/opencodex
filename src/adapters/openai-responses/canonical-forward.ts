@@ -87,6 +87,13 @@ export function stripUnsupportedForwardParams(body: unknown, canonical: boolean)
   return next;
 }
 
+/** Codex asks for provider-issued reasoning blobs through this include entry. Public gateways reject it. */
+export function stripUnsupportedResponsesIncludes(body: unknown): unknown {
+  if (!isPlainObject(body) || !Array.isArray(body.include)) return body;
+  const include = body.include.filter(value => value !== "output.encrypted_content");
+  return include.length === body.include.length ? body : { ...body, include };
+}
+
 /** Sampling controls the canonical ChatGPT backend rejects; other forward gateways accept them. */
 const CANONICAL_FORWARD_UNSUPPORTED_SAMPLING = ["temperature", "top_p", "stop", "user"] as const;
 

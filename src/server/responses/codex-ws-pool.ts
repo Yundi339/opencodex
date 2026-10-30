@@ -11,7 +11,10 @@ import { CodexWsSession } from "./codex-ws-session";
 export const CODEX_WS_POOL_MAX_SESSIONS = 32;
 export const CODEX_WS_POOL_IDLE_MS = 30_000;
 export const CODEX_WS_POOL_MAX_AGE_MS = 5 * 60_000;
-export const CODEX_WS_POOL_WAIT_MS = 750;
+// A same-turn resend must wait long enough for the original exchange to settle.
+// Dialling a second socket after 750ms lets one Codex turn run twice and interleave
+// two answers. Cross-turn reuse still has its own bounded socket age/idle limits.
+export const CODEX_WS_POOL_WAIT_MS = 8_000;
 /** Retained sockets per account+thread while cross-turn reuse is on. */
 export const CODEX_WS_POOL_SCOPE_LIMIT = 2;
 const CODEX_WS_POOL_WAIT_DEPTH = 2;
